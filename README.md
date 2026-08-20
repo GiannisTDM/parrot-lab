@@ -8,7 +8,7 @@ we have been using to reverse-engineer the platform.
 > **Beta:** this is experimental software for bench testing and development.
 > Do not use it as your only flight display or safety system.
 
-![Parrot Lab HUD preview](docs/images/parrot-lab-preview.png)
+![Parrot Lab HUD preview](docs/images/ParroLab.png)
 
 ## What works
 
