@@ -34,6 +34,9 @@ final class H264VideoView: NSView {
     private var extensionDumpHandle: FileHandle?
     private var dumpedExtensionAccessUnits = 0
     private var latestDecodedFrame: CGImage?
+    private let hardwareFrameLock = NSLock()
+    private var pendingHardwareFrame: CGImage?
+    private var hardwareFrameDeliveryScheduled = false
 
     private static let legacyFrameInfoUUID = Data([
         0x97, 0x77, 0x08, 0x83, 0xc8, 0xd3, 0x40, 0x2e,
@@ -164,6 +167,10 @@ final class H264VideoView: NSView {
         decompressionSession = nil
         softwareDecoder?.stop()
         softwareDecoder = nil
+        hardwareFrameLock.lock()
+        pendingHardwareFrame = nil
+        hardwareFrameDeliveryScheduled = false
+        hardwareFrameLock.unlock()
         videoLayer.contents = nil
         latestDecodedFrame = nil
         formatDescription = nil
@@ -339,19 +346,53 @@ final class H264VideoView: NSView {
             }
             return
         }
-        let image = CIImage(cvImageBuffer: imageBuffer)
-        guard let cgImage = ciContext.createCGImage(image, from: image.extent) else { return }
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            self.hardwareFallbackWorkItem?.cancel()
-            self.hardwareFallbackWorkItem = nil
-            self.latestDecodedFrame = cgImage
-            self.videoLayer.contents = cgImage
-            if !self.reportedFirstDecodedFrame {
-                self.reportedFirstDecodedFrame = true
-                self.onDebug?("First decoded video frame displayed: \(cgImage.width)x\(cgImage.height)")
-                self.onFrameReady?()
+        let cgImage = autoreleasepool { () -> CGImage? in
+            let image = CIImage(cvImageBuffer: imageBuffer)
+            return ciContext.createCGImage(image, from: image.extent)
+        }
+        guard let cgImage else { return }
+        enqueueLatestHardwareFrame(cgImage)
+    }
+
+    private func enqueueLatestHardwareFrame(_ image: CGImage) {
+        hardwareFrameLock.lock()
+        pendingHardwareFrame = image
+        let shouldSchedule = !hardwareFrameDeliveryScheduled
+        if shouldSchedule { hardwareFrameDeliveryScheduled = true }
+        hardwareFrameLock.unlock()
+
+        if shouldSchedule {
+            DispatchQueue.main.async { [weak self] in self?.deliverLatestHardwareFrame() }
+        }
+    }
+
+    private func deliverLatestHardwareFrame() {
+        hardwareFrameLock.lock()
+        let image = pendingHardwareFrame
+        pendingHardwareFrame = nil
+        hardwareFrameLock.unlock()
+
+        if let image {
+            hardwareFallbackWorkItem?.cancel()
+            hardwareFallbackWorkItem = nil
+            latestDecodedFrame = image
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            videoLayer.contents = image
+            CATransaction.commit()
+            if !reportedFirstDecodedFrame {
+                reportedFirstDecodedFrame = true
+                onDebug?("First decoded video frame displayed: \(image.width)x\(image.height)")
+                onFrameReady?()
             }
+        }
+
+        hardwareFrameLock.lock()
+        let shouldContinue = pendingHardwareFrame != nil
+        if !shouldContinue { hardwareFrameDeliveryScheduled = false }
+        hardwareFrameLock.unlock()
+        if shouldContinue {
+            DispatchQueue.main.async { [weak self] in self?.deliverLatestHardwareFrame() }
         }
     }
 

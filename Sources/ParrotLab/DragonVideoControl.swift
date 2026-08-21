@@ -85,6 +85,71 @@ struct DragonVideoProfile: Equatable {
             "sh /data/ftp/internal_000/parrotlab_dragon_video.sh apply lab1080 8000 constant LANDED; exit" &&
             profile.launchSummary == "1080P LAB · 8.0 Mbps LOCKED" &&
             DragonVideoProfile(resolution: .lab1080, bitrateKbps: 8_250, locksBitrate: false) == nil &&
-            DragonVideoProfile(resolution: .lab1080, bitrateKbps: 16_500, locksBitrate: false) == nil
+            DragonVideoProfile(resolution: .lab1080, bitrateKbps: 16_500, locksBitrate: false) == nil &&
+            DragonCustomLaunch.selfTest()
+    }
+}
+
+enum DragonCustomLaunchError: LocalizedError {
+    case empty
+    case tooLong
+    case tooManyArguments
+    case unsupportedCharacters
+
+    var errorDescription: String? {
+        switch self {
+        case .empty:
+            return "Enter at least one Dragon argument."
+        case .tooLong:
+            return "Custom Dragon arguments are limited to 512 UTF-8 bytes."
+        case .tooManyArguments:
+            return "Custom Dragon launches are limited to 64 whitespace-separated arguments."
+        case .unsupportedCharacters:
+            return "Use only letters, numbers, spaces, and these argument characters: - _ . / : + , = @"
+        }
+    }
+}
+
+struct DragonCustomLaunch: Equatable {
+    static let maximumBytes = 512
+    static let maximumArguments = 64
+
+    let arguments: String
+
+    init(arguments rawArguments: String) throws {
+        let normalized = rawArguments
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
+        guard !normalized.isEmpty else { throw DragonCustomLaunchError.empty }
+        guard normalized.utf8.count <= Self.maximumBytes else { throw DragonCustomLaunchError.tooLong }
+        guard normalized.split(separator: " ").count <= Self.maximumArguments else {
+            throw DragonCustomLaunchError.tooManyArguments
+        }
+
+        let allowed = CharacterSet(charactersIn:
+            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.:/+,=@ "
+        )
+        guard normalized.unicodeScalars.allSatisfy({ allowed.contains($0) }) else {
+            throw DragonCustomLaunchError.unsupportedCharacters
+        }
+        arguments = normalized
+    }
+
+    var applyCommand: String {
+        let payload = Data(arguments.utf8).base64EncodedString()
+        return "sh \(DragonVideoProfile.helperPath) custom \(payload) LANDED; exit"
+    }
+
+    static func selfTest() -> Bool {
+        guard let launch = try? DragonCustomLaunch(
+            arguments: "  -V 1  -f 30 -R off -S 0 -I off -o  "
+        ) else { return false }
+        return launch.arguments == "-V 1 -f 30 -R off -S 0 -I off -o" &&
+            launch.applyCommand.hasPrefix(
+                "sh /data/ftp/internal_000/parrotlab_dragon_video.sh custom "
+            ) &&
+            launch.applyCommand.hasSuffix(" LANDED; exit") &&
+            (try? DragonCustomLaunch(arguments: "-V 1; reboot")) == nil &&
+            (try? DragonCustomLaunch(arguments: String(repeating: "x", count: 513))) == nil
     }
 }

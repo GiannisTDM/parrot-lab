@@ -8,6 +8,7 @@ set -eu
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 PROJECT_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 DEFAULT_ZIP="$PROJECT_DIR/dist/Parrot-Lab-macOS-arm64.zip"
+FFMPEG_BUNDLER="$SCRIPT_DIR/bundle-ffmpeg-dependencies.sh"
 
 usage()
 {
@@ -58,6 +59,7 @@ trap '/bin/rm -rf "$STAGE_DIR"' EXIT HUP INT TERM
 # cloud/File Provider metadata and leaves the caller's source bundle alone.
 /usr/bin/ditto --noextattr --noqtn "$INPUT_APP" "$STAGE_APP"
 /usr/bin/xattr -cr "$STAGE_APP"
+"$FFMPEG_BUNDLER" "$STAGE_APP"
 
 # Temporary distribution identity: ad-hoc only. Do not replace '-' with a
 # paid identity unless the project deliberately adopts Developer ID signing.
@@ -91,6 +93,11 @@ mkdir -p "$VERIFY_DIR"
 /usr/bin/ditto -x -k "$STAGE_ZIP" "$VERIFY_DIR"
 [ -d "$VERIFY_DIR/Parrot Lab.app" ] || fail "release ZIP does not contain Parrot Lab.app"
 /usr/bin/codesign --verify --deep --strict --verbose=2 "$VERIFY_DIR/Parrot Lab.app"
+EXTRACTED_FFMPEG="$VERIFY_DIR/Parrot Lab.app/Contents/Resources/ffmpeg-parrotlab"
+[ -x "$EXTRACTED_FFMPEG" ] || fail "release ZIP does not contain executable FFmpeg"
+env -u DYLD_LIBRARY_PATH -u DYLD_FALLBACK_LIBRARY_PATH \
+    "$EXTRACTED_FFMPEG" -version >/dev/null 2>&1 || \
+    fail "FFmpeg cannot start after release ZIP extraction"
 
 mv -f "$STAGE_ZIP" "$OUTPUT_ZIP"
 

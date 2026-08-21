@@ -18,7 +18,8 @@ trap '/bin/rm -rf "$STAGE_DIR"' EXIT HUP INT TERM
 cd "$PROJECT_DIR"
 swift build -c release
 
-mkdir -p "$STAGE_APP/Contents/MacOS" "$STAGE_APP/Contents/Resources/DeviceTools" "$DIST_DIR" "$INSTALL_DIR"
+mkdir -p "$STAGE_APP/Contents/MacOS" "$STAGE_APP/Contents/Frameworks" \
+    "$STAGE_APP/Contents/Resources/DeviceTools" "$DIST_DIR" "$INSTALL_DIR"
 COPYFILE_DISABLE=1 cp "$PROJECT_DIR/.build/release/ParrotLab" "$STAGE_APP/Contents/MacOS/ParrotLab"
 COPYFILE_DISABLE=1 cp "$PROJECT_DIR/Resources/Info.plist" "$STAGE_APP/Contents/Info.plist"
 COPYFILE_DISABLE=1 cp "$PROJECT_DIR/Resources/ParrotLabIcon.png" "$STAGE_APP/Contents/Resources/ParrotLabIcon.png"
@@ -40,14 +41,37 @@ fi
 if [ -z "$FFMPEG_SOURCE" ] && [ -x "$LEGACY_APP_DIR/Contents/Resources/ffmpeg-parrotlab" ]; then
     FFMPEG_SOURCE="$LEGACY_APP_DIR/Contents/Resources/ffmpeg-parrotlab"
 fi
-if [ -n "$FFMPEG_SOURCE" ]; then
-    COPYFILE_DISABLE=1 cp "$FFMPEG_SOURCE" "$STAGE_APP/Contents/Resources/ffmpeg-parrotlab"
-    chmod 755 "$STAGE_APP/Contents/Resources/ffmpeg-parrotlab"
+if [ -z "$FFMPEG_SOURCE" ] && [ -x /opt/homebrew/bin/ffmpeg ]; then
+    FFMPEG_SOURCE=/opt/homebrew/bin/ffmpeg
 fi
+if [ -z "$FFMPEG_SOURCE" ] && [ -x /usr/local/bin/ffmpeg ]; then
+    FFMPEG_SOURCE=/usr/local/bin/ffmpeg
+fi
+if [ -z "$FFMPEG_SOURCE" ] || [ ! -x "$FFMPEG_SOURCE" ]; then
+    printf '%s\n' "Parrot Lab release requires an arm64 FFmpeg executable." >&2
+    printf '%s\n' "Set PARROTLAB_FFMPEG=/absolute/path/to/ffmpeg and rebuild." >&2
+    exit 1
+fi
+COPYFILE_DISABLE=1 cp -L "$FFMPEG_SOURCE" "$STAGE_APP/Contents/Resources/ffmpeg-parrotlab"
+chmod 755 "$STAGE_APP/Contents/Resources/ffmpeg-parrotlab"
+case "$FFMPEG_SOURCE" in
+    */Contents/Resources/ffmpeg-parrotlab)
+        FFMPEG_SOURCE_APP=${FFMPEG_SOURCE%/Contents/Resources/ffmpeg-parrotlab}
+        if [ -d "$FFMPEG_SOURCE_APP/Contents/Frameworks" ]; then
+            # A previously packaged dynamic FFmpeg already refers to its
+            # companion libraries inside the source app. Seed those libraries
+            # before the packager validates and rewrites the full closure.
+            /usr/bin/ditto --noextattr --noqtn \
+                "$FFMPEG_SOURCE_APP/Contents/Frameworks" \
+                "$STAGE_APP/Contents/Frameworks"
+        fi
+        ;;
+esac
 chmod 755 "$STAGE_APP/Contents/MacOS/ParrotLab"
 
-# Sign and package in clean temporary staging. The helper also exercises the
-# packaged executable, verifies ZIP integrity, and validates the extracted app.
+# Package in a clean temporary location. The helper ad-hoc signs, performs the
+# verbose strict verification, creates the ZIP, extracts it, and verifies the
+# archived app again.
 "$PACKAGE_SCRIPT" "$STAGE_APP" "$STAGE_ZIP"
 mkdir -p "$SIGNED_RELEASE_DIR"
 ditto -x -k "$STAGE_ZIP" "$SIGNED_RELEASE_DIR"
