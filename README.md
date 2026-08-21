@@ -31,6 +31,24 @@ replace the stock binary or persist the profile across a reboot.
 
 See the [changelog](CHANGELOG.md) for this beta's complete update summary.
 
+## Download the beta
+
+The ready-to-run Apple Silicon build is available from
+[GitHub Releases](https://github.com/GiannisTDM/parrot-lab/releases). It is
+ad-hoc signed and verified, but it is not Apple-notarized because the project
+does not currently use a paid Developer ID certificate.
+
+Extract the ZIP, move **Parrot Lab.app** to `/Applications`, then right-click
+the app and choose **Open**. If Gatekeeper still blocks this beta, advanced
+users can remove quarantine from this app only:
+
+```sh
+xattr -dr com.apple.quarantine "/Applications/Parrot Lab.app"
+```
+
+Do not disable Gatekeeper globally. The complete packaging and verification
+process is documented in [RELEASING.md](RELEASING.md).
+
 ## Tested setup
 
 - Apple Silicon Mac running macOS 13 or newer
@@ -105,8 +123,9 @@ swift build
 .build/debug/ParrotLab --self-test
 ```
 
-The build script creates an ad-hoc-signed app in `~/Applications` and a zip in
-`dist/`. FFmpeg is discovered from Homebrew at runtime. A custom executable
+The build script creates an ad-hoc-signed app in `~/Applications` and a
+release-ready, independently verified ZIP in `dist/`. FFmpeg is discovered
+from Homebrew at runtime. A custom executable
 can be embedded by setting `PARROTLAB_FFMPEG=/absolute/path/to/ffmpeg`; anyone
 redistributing such a bundle is responsible for complying with FFmpeg's
 license and the licenses of the enabled codecs.

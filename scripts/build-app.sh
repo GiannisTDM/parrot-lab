@@ -3,6 +3,7 @@ set -eu
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 PROJECT_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+PACKAGE_SCRIPT="$SCRIPT_DIR/package-macos-release.sh"
 DIST_DIR="$PROJECT_DIR/dist"
 LEGACY_APP_DIR="$DIST_DIR/Parrot Lab.app"
 INSTALL_DIR="${PARROTLAB_INSTALL_DIR:-$HOME/Applications}"
@@ -11,6 +12,7 @@ ZIP_PATH="$DIST_DIR/Parrot-Lab-macOS-arm64.zip"
 STAGE_DIR=$(/usr/bin/mktemp -d /tmp/parrotlab-build.XXXXXX)
 STAGE_APP="$STAGE_DIR/Parrot Lab.app"
 STAGE_ZIP="$STAGE_DIR/Parrot-Lab-macOS-arm64.zip"
+SIGNED_RELEASE_DIR="$STAGE_DIR/signed-release"
 trap '/bin/rm -rf "$STAGE_DIR"' EXIT HUP INT TERM
 
 cd "$PROJECT_DIR"
@@ -44,22 +46,19 @@ if [ -n "$FFMPEG_SOURCE" ]; then
 fi
 chmod 755 "$STAGE_APP/Contents/MacOS/ParrotLab"
 
-# Sign outside Documents: File Provider reapplies FinderInfo to .app bundles
-# there quickly enough to make codesign reject an otherwise clean bundle.
-xattr -cr "$STAGE_APP"
-codesign --force --deep --sign - "$STAGE_APP"
-codesign --verify --deep --strict "$STAGE_APP"
-
-(
-    cd "$STAGE_DIR"
-    /usr/bin/zip -qry -X "$STAGE_ZIP" "$(basename "$STAGE_APP")"
-)
+# Sign and package in clean temporary staging. The helper also exercises the
+# packaged executable, verifies ZIP integrity, and validates the extracted app.
+"$PACKAGE_SCRIPT" "$STAGE_APP" "$STAGE_ZIP"
+mkdir -p "$SIGNED_RELEASE_DIR"
+ditto -x -k "$STAGE_ZIP" "$SIGNED_RELEASE_DIR"
+SIGNED_APP="$SIGNED_RELEASE_DIR/Parrot Lab.app"
 
 PREVIOUS_APP="$STAGE_DIR/previous-Parrot-Lab.app"
 if [ -e "$APP_DIR" ]; then
     mv "$APP_DIR" "$PREVIOUS_APP"
 fi
-if ! ditto --noextattr --noqtn "$STAGE_APP" "$APP_DIR" || ! codesign --verify --deep --strict "$APP_DIR"; then
+if ! ditto --noextattr --noqtn "$SIGNED_APP" "$APP_DIR" || \
+   ! codesign --verify --deep --strict --verbose=2 "$APP_DIR"; then
     if [ -e "$APP_DIR" ]; then
         mv "$APP_DIR" "$STAGE_DIR/failed-Parrot-Lab.app"
     fi

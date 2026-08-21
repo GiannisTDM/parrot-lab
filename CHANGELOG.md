@@ -10,6 +10,8 @@
 - Integrated installers for Dragon Lab, the Bebop/SC2 RF-MOD Suite, and the
   SkyController 2 Apple-NCM driver patch.
 - A new application logo and expanded live video/HUD controls.
+- A verified ad-hoc-signed macOS distribution ZIP and reproducible release
+  packaging workflow.
 
 ### Improved
 
