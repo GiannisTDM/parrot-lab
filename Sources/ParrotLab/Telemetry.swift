@@ -207,20 +207,3 @@ final class SC2TelemetryParser {
         )
     }
 }
-
-enum DemoTelemetry {
-    static let lines = [
-        "I bcmevtlog (wifid): evt_accu: 1: rate: 65000: 65000: 65000: 65000",
-        "I bcmevtlog (wifid): extra_cnt: -42: -45: 0: 0: 1: 1: 1: 4: 1: 2: 0: -91: 49: 46: 4: 104: 0: 98: 0: 0",
-        "I mpp (mppd): rssi_mpp:-42, rssi:-44, state:FLYING, altitude:18.400000, latitude:0.001000, longitude:0.001000, roll:0.041000, pitch:-0.082000, yaw:1.870000",
-        "I proxy_drone (mppd): link_quality: tx_quality=96%, rx_quality=94%, rx_useful=98%",
-        "I mpp (mppd): cpu:55°C, battery:83% (DISCHARGING)",
-        "__PARROTLAB_DRONE_BATTERY__=74",
-        "I bcmevtlog (wifid): extra_cnt: -44: -46: 0: 0: 1: 1: 1: 5: 1: 2: 0: -92: 48: 46: 4: 104: 0: 97: 0: 0",
-        "I mpp (mppd): rssi_mpp:-44, rssi:-45, state:FLYING, altitude:19.100000, latitude:0.001200, longitude:0.001300, roll:-0.063000, pitch:0.035000, yaw:1.920000",
-        "I proxy_drone (mppd): link_quality: tx_quality=94%, rx_quality=92%, rx_useful=97%",
-        "I bcmevtlog (wifid): extra_cnt: -47: -49: 0: 0: 1: 1: 1: 6: 1: 3: 0: -92: 45: 43: 4: 104: 0: 95: 0: 0",
-        "I mpp (mppd): rssi_mpp:-47, rssi:-48, state:FLYING, altitude:21.600000, latitude:0.001500, longitude:0.001700, roll:0.092000, pitch:0.071000, yaw:2.010000",
-        "I proxy_drone (mppd): link_quality: tx_quality=91%, rx_quality=89%, rx_useful=95%"
-    ]
-}

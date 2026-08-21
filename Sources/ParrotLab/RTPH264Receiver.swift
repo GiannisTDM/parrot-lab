@@ -16,6 +16,9 @@ struct H264AccessUnit: Equatable {
 
 final class RTPH264Receiver {
     var onAccessUnit: ((H264AccessUnit) -> Void)?
+    /// Called on the receiver queue for every completed access unit, before the
+    /// live-preview path coalesces frames under UI pressure.
+    var onCompleteAccessUnit: ((H264AccessUnit) -> Void)?
     var onStats: ((RTPVideoStats) -> Void)?
     var onDebug: ((String) -> Void)?
 
@@ -111,6 +114,7 @@ final class RTPH264Receiver {
         stats.jitterMs = jitterSeconds * 1_000.0
 
         for accessUnit in assembler.consume(packet: packet) {
+            onCompleteAccessUnit?(accessUnit)
             enqueueLatestAccessUnit(accessUnit)
         }
 

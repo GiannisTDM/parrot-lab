@@ -14,7 +14,7 @@ final class FFmpegVideoDecoder {
     private let writeQueue = DispatchQueue(label: "parrotlab.ffmpeg-video.write")
     private let readQueue = DispatchQueue(label: "parrotlab.ffmpeg-video.read")
     private let stateLock = NSLock()
-    private var outputBuffer = Data()
+    private var outputAccumulator: FixedFrameAccumulator
     private var pendingInput = BoundedDataQueue(maxBytes: 50 * 1_024 * 1_024)
     private var pendingFrame = LatestDecodedFrameSlot()
     private var inputDrainScheduled = false
@@ -22,9 +22,13 @@ final class FFmpegVideoDecoder {
     private var running = false
 
     init?(width: Int, height: Int) {
-        guard let executable = Self.findExecutable() else { return nil }
+        let (pixelCount, pixelOverflow) = width.multipliedReportingOverflow(by: height)
+        let (byteCount, byteOverflow) = pixelCount.multipliedReportingOverflow(by: 4)
+        guard width > 0, height > 0, !pixelOverflow, !byteOverflow,
+              let executable = Self.findExecutable() else { return nil }
         self.width = width
         self.height = height
+        outputAccumulator = FixedFrameAccumulator(frameBytes: byteCount)
         process.executableURL = executable
         process.arguments = [
             "-hide_banner", "-loglevel", "fatal",
@@ -49,9 +53,8 @@ final class FFmpegVideoDecoder {
         stateLock.lock()
         running = true
         stateLock.unlock()
-        let frameBytes = width * height * 4
         readQueue.async { [weak self] in
-            self?.readOutput(frameBytes: frameBytes)
+            self?.readOutput()
         }
         process.terminationHandler = { [weak self] process in
             self?.onDebug?("FFmpeg video decoder exited with status \(process.terminationStatus)")
@@ -119,21 +122,23 @@ final class FFmpegVideoDecoder {
         }
     }
 
-    private func readOutput(frameBytes: Int) {
+    private func readOutput() {
         let handle = outputPipe.fileHandleForReading
         while isRunning {
             let data = handle.readData(ofLength: 256 * 1_024)
             if data.isEmpty { break }
             autoreleasepool {
-                outputBuffer.append(data)
-                while outputBuffer.count >= frameBytes {
-                    let frame = Data(outputBuffer.prefix(frameBytes))
-                    outputBuffer.removeFirst(frameBytes)
+                // Never use append/removeFirst as a byte stream here. At
+                // 1080p30 FFmpeg emits about 249 MB/s of RGBA, and Data can
+                // retain the consumed prefix/capacity even while its logical
+                // count remains small. This assembler owns exactly one fixed
+                // frame buffer and hands completed buffers downstream.
+                for frame in outputAccumulator.append(data) {
                     enqueueLatestFrame(frame)
                 }
             }
         }
-        outputBuffer.removeAll(keepingCapacity: false)
+        outputAccumulator.reset()
     }
 
     private var isRunning: Bool {
@@ -192,7 +197,16 @@ final class FFmpegVideoDecoder {
         var slot = LatestDecodedFrameSlot()
         slot.replace(with: DecodedFrame(data: Data([1]), width: 1, height: 1))
         slot.replace(with: DecodedFrame(data: Data([2]), width: 2, height: 2))
-        return slot.droppedFrames == 1 && slot.take()?.data == Data([2]) && slot.isEmpty
+        guard slot.droppedFrames == 1,
+              slot.take()?.data == Data([2]),
+              slot.isEmpty else { return false }
+
+        var accumulator = FixedFrameAccumulator(frameBytes: 4)
+        guard accumulator.append(Data([0, 1])).isEmpty else { return false }
+        let frames = accumulator.append(Data([2, 3, 4, 5, 6, 7, 8]))
+        return frames == [Data([0, 1, 2, 3]), Data([4, 5, 6, 7])]
+            && accumulator.bufferedByteCount == 1
+            && accumulator.allocatedByteCount == 4
     }
 
     private static func findExecutable() -> URL? {
@@ -204,6 +218,60 @@ final class FFmpegVideoDecoder {
         return candidates.compactMap { $0 }.first {
             FileManager.default.isExecutableFile(atPath: $0.path)
         }
+    }
+}
+
+private struct FixedFrameAccumulator {
+    let frameBytes: Int
+    private var buffer: Data
+    private var writeOffset = 0
+
+    var bufferedByteCount: Int { writeOffset }
+    var allocatedByteCount: Int { buffer.count }
+
+    init(frameBytes: Int) {
+        precondition(frameBytes > 0)
+        self.frameBytes = frameBytes
+        buffer = Data(count: frameBytes)
+    }
+
+    mutating func append(_ data: Data) -> [Data] {
+        guard !data.isEmpty else { return [] }
+        if buffer.count != frameBytes { buffer = Data(count: frameBytes) }
+
+        var completedFrames: [Data] = []
+        data.withUnsafeBytes { sourceBytes in
+            guard let sourceBase = sourceBytes.baseAddress else { return }
+            var sourceOffset = 0
+            while sourceOffset < sourceBytes.count {
+                let copyCount = min(
+                    frameBytes - writeOffset,
+                    sourceBytes.count - sourceOffset
+                )
+                buffer.withUnsafeMutableBytes { destinationBytes in
+                    destinationBytes.baseAddress!
+                        .advanced(by: writeOffset)
+                        .copyMemory(
+                            from: sourceBase.advanced(by: sourceOffset),
+                            byteCount: copyCount
+                        )
+                }
+                sourceOffset += copyCount
+                writeOffset += copyCount
+
+                if writeOffset == frameBytes {
+                    completedFrames.append(buffer)
+                    buffer = Data(count: frameBytes)
+                    writeOffset = 0
+                }
+            }
+        }
+        return completedFrames
+    }
+
+    mutating func reset() {
+        buffer.removeAll(keepingCapacity: false)
+        writeOffset = 0
     }
 }
 
