@@ -23,7 +23,7 @@ we have been using to reverse-engineer the platform.
 - Adjustable 1–16 Mbit/s adaptive or locked stream bitrate
 - Integrated, verified installers for Dragon Lab, the RF/MOD Suite and the
   SC2 Apple-NCM driver patch
-- Offline replay/demo and built-in self-tests
+
 
 RF/NVM changes are never applied automatically. Dragon Lab can make an
 explicit, landed-only runtime video change after confirmation; it does not
