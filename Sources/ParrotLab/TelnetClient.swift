@@ -16,6 +16,7 @@ final class TelnetClient {
 
     private let queue = DispatchQueue(label: "parrotlab.telnet")
     private var connection: NWConnection?
+    private var connectionID: UUID?
     private var lineBuffer = Data()
     private var state: State = .idle {
         didSet {
@@ -33,9 +34,11 @@ final class TelnetClient {
 
         state = .connecting
         let connection = NWConnection(host: NWEndpoint.Host(host), port: endpointPort, using: .tcp)
+        let connectionID = UUID()
         self.connection = connection
+        self.connectionID = connectionID
         connection.stateUpdateHandler = { [weak self, weak connection] newState in
-            guard let self, let connection else { return }
+            guard let self, let connection, self.connectionID == connectionID else { return }
             switch newState {
             case .ready:
                 self.state = .ready
@@ -65,6 +68,7 @@ final class TelnetClient {
     }
 
     func stop() {
+        connectionID = nil
         connection?.cancel()
         connection = nil
         lineBuffer.removeAll(keepingCapacity: false)
@@ -73,7 +77,7 @@ final class TelnetClient {
 
     private func receive(on connection: NWConnection) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { [weak self, weak connection] data, _, complete, error in
-            guard let self, let connection else { return }
+            guard let self, let connection, self.connection === connection else { return }
             if let data, !data.isEmpty {
                 let payload = self.processTelnet(data, on: connection)
                 self.consumeText(payload)

@@ -1,5 +1,36 @@
 # Changelog
 
+## 1.1.0 — 2026-08-21
+
+### Added
+
+- Added **Custom · modified binary** to Dragon Lab for validated custom Dragon
+  arguments while keeping the executable fixed to the bundled modified binary.
+- Added Base64 argument transport with matching validation on macOS and the
+  drone. Shell metacharacters are rejected, `eval` is never used, and custom
+  input cannot select another executable.
+- Added recovery-aware UI state: relay loss after a Dragon operation reports
+  as expected, and fresh telemetry confirms that the replacement recovered.
+
+### Changed
+
+- Preset, custom and stock-restore operations now queue a detached drone-side
+  worker before stopping Dragon. The worker survives the expected SC2/Telnet
+  relay loss and completes the replacement launch locally on the Bebop 2.
+- The release packager now bundles and rewrites FFmpeg's complete non-system
+  library closure so the distributed decoder is portable without Homebrew.
+
+> **Upgrade required:** run **Tools → Install/Update Dragon Lab on Bebop 2**
+> once after updating so the drone receives the new detached helper.
+
+### Fixed
+
+- Fixed the remaining live-stream memory growth. Video buffers are now bounded
+  and compacted while streaming instead of only releasing memory after the
+  stream stops.
+- Fixed Dragon restarts failing when killing Dragon also terminated the SC2
+  Telnet relay before the replacement launch command could be delivered.
+
 ## 1.0.0 beta — 2026-08-21
 
 ### Added

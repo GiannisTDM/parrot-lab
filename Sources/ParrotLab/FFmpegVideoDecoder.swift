@@ -125,9 +125,13 @@ final class FFmpegVideoDecoder {
     private func readOutput() {
         let handle = outputPipe.fileHandleForReading
         while isRunning {
-            let data = handle.readData(ofLength: 256 * 1_024)
-            if data.isEmpty { break }
-            autoreleasepool {
+            let receivedData = autoreleasepool { () -> Bool in
+                // FileHandle bridges an NSData for every read. The read must
+                // happen inside this pool—not immediately before it—or a
+                // long-lived decoder queue can retain hundreds of MB/s of
+                // autoreleased chunks until the stream is stopped.
+                let data = handle.readData(ofLength: 256 * 1_024)
+                guard !data.isEmpty else { return false }
                 // Never use append/removeFirst as a byte stream here. At
                 // 1080p30 FFmpeg emits about 249 MB/s of RGBA, and Data can
                 // retain the consumed prefix/capacity even while its logical
@@ -136,7 +140,9 @@ final class FFmpegVideoDecoder {
                 for frame in outputAccumulator.append(data) {
                     enqueueLatestFrame(frame)
                 }
+                return true
             }
+            if !receivedData { break }
         }
         outputAccumulator.reset()
     }
@@ -212,6 +218,8 @@ final class FFmpegVideoDecoder {
     private static func findExecutable() -> URL? {
         let candidates: [URL?] = [
             Bundle.main.resourceURL?.appendingPathComponent("ffmpeg-parrotlab"),
+            ProcessInfo.processInfo.environment["PARROTLAB_FFMPEG"]
+                .map { URL(fileURLWithPath: $0) },
             URL(fileURLWithPath: "/opt/homebrew/bin/ffmpeg"),
             URL(fileURLWithPath: "/usr/local/bin/ffmpeg")
         ]

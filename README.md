@@ -21,6 +21,7 @@ we have been using to reverse-engineer the platform.
 - Lossless H.264 recording and source-resolution PNG/JPEG photo capture
 - Selectable 480p, 720p and experimental 1080p Dragon profiles
 - Adjustable 1–16 Mbit/s adaptive or locked stream bitrate
+- Validated custom arguments for the fixed modified Dragon binary
 - Integrated, verified installers for Dragon Lab, the RF/MOD Suite and the
   SC2 Apple-NCM driver patch
 
@@ -30,6 +31,10 @@ explicit, landed-only runtime video change after confirmation; it does not
 replace the stock binary or persist the profile across a reboot.
 
 See the [changelog](CHANGELOG.md) for this beta's complete update summary.
+
+> **Upgrading to 1.1:** run **Tools → Install/Update Dragon Lab on Bebop 2**
+> once. Preset, custom and restore operations require the updated detached
+> helper to survive the expected SC2/Telnet relay interruption.
 
 ## Download the beta
 

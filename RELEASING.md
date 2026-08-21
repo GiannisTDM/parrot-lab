@@ -28,6 +28,48 @@ dist/Parrot-Lab-macOS-arm64.zip
 
 Upload `Parrot-Lab-macOS-arm64.zip` as the GitHub Release asset.
 
+### FFmpeg input and bundling
+
+Every release includes its recovery decoder at:
+
+```text
+Parrot Lab.app/Contents/Resources/ffmpeg-parrotlab
+```
+
+`build-app.sh` requires an arm64 FFmpeg executable. It searches in this order:
+
+1. `PARROTLAB_FFMPEG`, when set;
+2. the currently installed Parrot Lab app;
+3. a legacy app bundle under `dist`;
+4. `/opt/homebrew/bin/ffmpeg`;
+5. `/usr/local/bin/ffmpeg`.
+
+For a clean release machine, set the source explicitly:
+
+```sh
+PARROTLAB_FFMPEG=/absolute/path/to/arm64/ffmpeg ./scripts/build-app.sh
+```
+
+Before signing, `bundle-ffmpeg-dependencies.sh` recursively examines FFmpeg and
+each required Mach-O library with `otool`. It copies non-system dylibs into:
+
+```text
+Parrot Lab.app/Contents/Frameworks
+```
+
+FFmpeg references are rewritten to
+`@executable_path/../Frameworks/<library>`, dylib-to-dylib references to
+`@loader_path/<library>`, and bundled dylib IDs to `@rpath/<library>`. macOS
+libraries under `/System` and `/usr/lib` remain system references. The step
+rejects missing dependencies, non-arm64 dependencies, library-name collisions,
+and unresolved external paths, then starts the bundled FFmpeg with `DYLD_*`
+overrides removed.
+
+The FFmpeg binary used by the current release has its codec stack linked
+statically, so it currently needs zero non-system dylibs. The recursive path is
+still part of every release and supports a future dynamically linked build.
+Testers need neither Homebrew nor a system FFmpeg installation.
+
 ## Package an existing app bundle
 
 The release helper can package a previously assembled app:
@@ -43,23 +85,27 @@ The script copies the input app to a clean temporary directory, leaving the
 input unchanged, and then:
 
 1. removes extended attributes from the temporary copy;
-2. ad-hoc signs it with:
+2. bundles FFmpeg's complete non-system dylib dependency closure and rewrites
+   its Mach-O load paths;
+3. ad-hoc signs it with:
 
    ```sh
    codesign --force --deep --sign - "/path/to/Parrot Lab.app"
    ```
 
-3. verifies it with:
+4. verifies it with:
 
    ```sh
    codesign --verify --deep --strict --verbose=2 "/path/to/Parrot Lab.app"
    ```
 
-4. confirms that `codesign` reports `Signature=adhoc`;
-5. runs the offline application self-test;
-6. creates and integrity-tests the ZIP;
-7. extracts the ZIP and verifies the signature of the archived app again;
-8. prints the release ZIP's SHA-256 digest.
+5. confirms that `codesign` reports `Signature=adhoc` and
+   `TeamIdentifier=not set`;
+6. runs the offline application self-test;
+7. creates and integrity-tests the ZIP;
+8. extracts the ZIP and verifies the signature of the archived app again;
+9. launches FFmpeg from the extracted app without `DYLD_*` overrides;
+10. prints the release ZIP's SHA-256 digest.
 
 The script uses `set -eu` and does not publish an output archive unless every
 step succeeds.

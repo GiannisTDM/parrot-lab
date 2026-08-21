@@ -1,6 +1,18 @@
 import AppKit
 
 final class MainViewController: NSViewController {
+    private enum QueuedDragonOperation {
+        case launch(String)
+        case restore
+    }
+
+    private struct DragonControlEndpoint: Equatable {
+        let host: String
+        let port: UInt16
+        let label: String
+    }
+
+    private static let customDragonModeTag = 100
     private let parser = SC2TelemetryParser()
     private let telnet = TelnetClient()
     private let droneProbeTelnet = TelnetClient()
@@ -26,7 +38,15 @@ final class MainViewController: NSViewController {
     private var dragonCommandInFlight = false
     private var dragonCommandConnected = false
     private var dragonCommandSucceeded = false
-    private var pendingDragonProfile: DragonVideoProfile?
+    private var dragonCommandResponded = false
+    private var dragonCommandCanRetryAfterNoResult = false
+    private var pendingDragonCommand: String?
+    private var pendingDragonEndpoints: [DragonControlEndpoint] = []
+    private var activeDragonEndpoint: DragonControlEndpoint?
+    private var dragonCommandTimeoutTimer: Timer?
+    private var pendingDragonLaunchSummary: String?
+    private var queuedDragonOperation: QueuedDragonOperation?
+    private var queuedDragonTelemetryNotBefore: Date?
     private var pendingDragonInstall = false
     private var toolUploadInFlight = false
     private var sc2DriverInstallInFlight = false
@@ -52,6 +72,10 @@ final class MainViewController: NSViewController {
     private let dragonBitrateSlider = NSSlider(value: 8_000, minValue: 1_000, maxValue: 16_000, target: nil, action: nil)
     private let dragonBitrateValue = NSTextField(labelWithString: "8.0 Mbps")
     private let dragonLockRateButton = NSButton(checkboxWithTitle: "Lock bitrate", target: nil, action: nil)
+    private let dragonCustomArgumentsLabel = NSTextField(labelWithString: "CUSTOM ARGUMENTS")
+    private let dragonCustomArgumentsField = NSTextField(
+        string: "-V 1 -f 30 -R off -S 0 -I off -q 8000 -o"
+    )
     private let dragonApplyButton = NSButton(title: "Apply profile", target: nil, action: nil)
     private let dragonRestoreButton = NSButton(title: "Restore stock", target: nil, action: nil)
     private let dragonStatusLabel = NSTextField(labelWithString: "SC2 OFFLINE")
@@ -155,7 +179,7 @@ final class MainViewController: NSViewController {
         let title = NSTextField(labelWithString: "PARROT LAB")
         title.font = .systemFont(ofSize: 17, weight: .bold)
         title.textColor = .white
-        let version = NSTextField(labelWithString: "V1.0")
+        let version = NSTextField(labelWithString: "V1.1")
         version.font = .monospacedSystemFont(ofSize: 8.5, weight: .bold)
         version.textColor = LabVisualStyle.accent
         let titleRow = NSStackView()
@@ -378,6 +402,8 @@ final class MainViewController: NSViewController {
             dragonResolutionPopup.addItem(withTitle: resolution.menuTitle)
             dragonResolutionPopup.lastItem?.tag = resolution.rawValue
         }
+        dragonResolutionPopup.addItem(withTitle: "Custom · modified binary")
+        dragonResolutionPopup.lastItem?.tag = Self.customDragonModeTag
         dragonResolutionPopup.selectItem(withTag: DragonVideoResolution.lab1080.rawValue)
         dragonResolutionPopup.target = self
         dragonResolutionPopup.action = #selector(dragonResolutionChanged)
@@ -385,6 +411,20 @@ final class MainViewController: NSViewController {
         dragonResolutionPopup.font = .systemFont(ofSize: 12, weight: .medium)
         dragonResolutionPopup.widthAnchor.constraint(equalToConstant: 274).isActive = true
         stack.addArrangedSubview(dragonResolutionPopup)
+
+        dragonCustomArgumentsLabel.font = .systemFont(ofSize: 9.5, weight: .bold)
+        dragonCustomArgumentsLabel.textColor = LabVisualStyle.mutedText
+        dragonCustomArgumentsLabel.alignment = .center
+        dragonCustomArgumentsLabel.isHidden = true
+        stack.addArrangedSubview(dragonCustomArgumentsLabel)
+
+        styleTextField(dragonCustomArgumentsField, width: 274)
+        dragonCustomArgumentsField.alignment = .left
+        dragonCustomArgumentsField.font = .monospacedSystemFont(ofSize: 10.5, weight: .medium)
+        dragonCustomArgumentsField.placeholderString = "-V 1 -f 30 -R off …"
+        dragonCustomArgumentsField.toolTip = "Whitespace-separated arguments for the uploaded modified Dragon binary. Shell metacharacters are rejected."
+        dragonCustomArgumentsField.isHidden = true
+        stack.addArrangedSubview(dragonCustomArgumentsField)
 
         let bitrateRow = NSStackView()
         bitrateRow.orientation = .horizontal
@@ -429,7 +469,7 @@ final class MainViewController: NSViewController {
         dragonStatusLabel.widthAnchor.constraint(equalToConstant: 274).isActive = true
         stack.addArrangedSubview(dragonStatusLabel)
 
-        let warning = NSTextField(wrappingLabelWithString: "Requires LANDED. Restarting Dragon briefly interrupts flight, video and telemetry services.")
+        let warning = NSTextField(wrappingLabelWithString: "Requires LANDED. Restart is queued on the drone first; expect the SC2 link, video and telemetry to drop briefly.")
         warning.font = .systemFont(ofSize: 10, weight: .regular)
         warning.textColor = NSColor.systemOrange.withAlphaComponent(0.82)
         warning.maximumNumberOfLines = 3
@@ -680,9 +720,10 @@ final class MainViewController: NSViewController {
     }
 
     private func runDroneProbe(host: String) {
-        // Port 2324 is the read-only SC2 boot relay to the drone's Telnet
-        // service. Keeping this separate avoids nesting Telnet inside a shell.
-        droneProbeTelnet.connect(host: host, port: 2324, startupCommand: Self.droneBatteryProbeCommand)
+        // Direct Bebop Wi-Fi exposes Telnet on 23. Through an SC2, the
+        // controller's read-only boot relay is on 2324.
+        let port: UInt16 = host == BebopToolPackage.ftpHost ? 23 : 2324
+        droneProbeTelnet.connect(host: host, port: port, startupCommand: Self.droneBatteryProbeCommand)
     }
 
     private func stopDroneProbe() {
@@ -722,14 +763,20 @@ final class MainViewController: NSViewController {
         updateInterface()
     }
 
-    private var selectedDragonResolution: DragonVideoResolution {
-        DragonVideoResolution(rawValue: dragonResolutionPopup.selectedItem?.tag ?? -1) ?? .lab1080
+    private var selectedDragonResolution: DragonVideoResolution? {
+        DragonVideoResolution(rawValue: dragonResolutionPopup.selectedItem?.tag ?? -1)
+    }
+
+    private var customDragonModeSelected: Bool {
+        dragonResolutionPopup.selectedItem?.tag == Self.customDragonModeTag
     }
 
     @objc private func dragonResolutionChanged() {
-        let bitrate = selectedDragonResolution.recommendedBitrateKbps
-        dragonBitrateSlider.integerValue = bitrate
+        if let resolution = selectedDragonResolution {
+            dragonBitrateSlider.integerValue = resolution.recommendedBitrateKbps
+        }
         updateDragonBitrateLabel()
+        updateInterface()
     }
 
     @objc private func dragonBitrateChanged() {
@@ -753,11 +800,16 @@ final class MainViewController: NSViewController {
             )
             return
         }
-        guard let profile = DragonVideoProfile(
-            resolution: selectedDragonResolution,
-            bitrateKbps: dragonBitrateSlider.integerValue,
-            locksBitrate: dragonLockRateButton.state == .on
-        ) else {
+        if customDragonModeSelected {
+            applyCustomDragonArguments()
+            return
+        }
+        guard let resolution = selectedDragonResolution,
+              let profile = DragonVideoProfile(
+                resolution: resolution,
+                bitrateKbps: dragonBitrateSlider.integerValue,
+                locksBitrate: dragonLockRateButton.state == .on
+              ) else {
             appendLog("Dragon profile rejected: bitrate must be 1–16 Mbps in 0.5 Mbps steps")
             return
         }
@@ -765,7 +817,7 @@ final class MainViewController: NSViewController {
         let alert = NSAlert()
         alert.alertStyle = .critical
         alert.messageText = "Restart Dragon with \(profile.resolution.statusLabel)?"
-        alert.informativeText = "This stops and relaunches the drone's flight process with \(profile.bitrateLabel) \(profile.locksBitrate ? "locked bitrate" : "adaptive bitrate ceiling"). Keep the drone landed with props removed. The change is not persistent and a reboot restores normal startup."
+        alert.informativeText = "A detached worker is queued on the drone before the current process is stopped, so it can complete even while the SC2 relay is unavailable. It relaunches Dragon with \(profile.bitrateLabel) \(profile.locksBitrate ? "locked bitrate" : "adaptive bitrate ceiling"). Keep the drone landed with props removed. The change is not persistent and a reboot restores normal startup."
         alert.addButton(withTitle: "Restart Dragon")
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
@@ -775,8 +827,42 @@ final class MainViewController: NSViewController {
         hudView.videoView.receiveMode = profile.resolution.receiverMode
         videoFormatStatus = "FORMAT waiting"
         videoMetadataPresence = VideoMetadataPresence()
-        pendingDragonProfile = profile
+        queuedDragonOperation = nil
+        queuedDragonTelemetryNotBefore = nil
+        pendingDragonLaunchSummary = profile.launchSummary
         runDragonCommand(profile.applyCommand, status: "APPLYING · \(profile.launchSummary)")
+    }
+
+    private func applyCustomDragonArguments() {
+        let launch: DragonCustomLaunch
+        do {
+            launch = try DragonCustomLaunch(arguments: dragonCustomArgumentsField.stringValue)
+        } catch {
+            showDragonAlert(
+                title: "Custom arguments rejected",
+                message: error.localizedDescription
+            )
+            appendLog("Custom Dragon arguments rejected: \(error.localizedDescription)")
+            return
+        }
+
+        let alert = NSAlert()
+        alert.alertStyle = .critical
+        alert.messageText = "Restart the modified Dragon with custom arguments?"
+        alert.informativeText = "Executable:\n/data/ftp/internal_000/dragon-prog-1080p-mode1-30fps\n\nArguments:\n\(launch.arguments)\n\nA detached drone-side worker performs the stop and start even if the SC2 relay disconnects. The preview decoder mode is left unchanged. Keep the drone landed with props removed."
+        alert.addButton(withTitle: "Start Custom Dragon")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        if videoRunning { startVideo() }
+        queuedDragonOperation = nil
+        queuedDragonTelemetryNotBefore = nil
+        pendingDragonLaunchSummary = "CUSTOM LAB"
+        runDragonCommand(
+            launch.applyCommand,
+            status: "APPLYING · CUSTOM LAB",
+            logMessage: "Queueing modified Dragon with validated custom arguments: \(launch.arguments)"
+        )
     }
 
     @objc private func restoreStockDragon() {
@@ -791,13 +877,15 @@ final class MainViewController: NSViewController {
         let alert = NSAlert()
         alert.alertStyle = .critical
         alert.messageText = "Restore stock Dragon startup?"
-        alert.informativeText = "This stops the active Dragon process and relaunches /usr/bin/DragonStarter.sh. Keep the drone landed with props removed."
+        alert.informativeText = "A detached worker is queued before the active Dragon process is stopped, then relaunches /usr/bin/DragonStarter.sh even if the SC2 relay disconnects. Keep the drone landed with props removed."
         alert.addButton(withTitle: "Restore stock")
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
 
         if videoRunning { startVideo() }
-        pendingDragonProfile = nil
+        queuedDragonOperation = nil
+        queuedDragonTelemetryNotBefore = nil
+        pendingDragonLaunchSummary = nil
         runDragonCommand(DragonVideoProfile.restoreCommand, status: "RESTORING STOCK")
     }
 
@@ -809,7 +897,7 @@ final class MainViewController: NSViewController {
         guard canAdjustDragon else {
             showDragonAlert(
                 title: "Dragon Lab installation is locked",
-                message: "Connect to the SC2 and wait until live telemetry explicitly reports LANDED. The app uses the SC2 relay only to verify and mark the uploaded files executable."
+                message: "Connect to the Bebop 2 directly or through the SC2 and wait until live telemetry explicitly reports LANDED. The app uses direct Bebop Telnet first, then the SC2 relay as a fallback, only to verify and mark the uploaded files executable."
             )
             return
         }
@@ -827,7 +915,7 @@ final class MainViewController: NSViewController {
         dragonCommandInFlight = true
         dragonCommandConnected = false
         dragonCommandSucceeded = false
-        pendingDragonProfile = nil
+        pendingDragonLaunchSummary = nil
         pendingDragonInstall = true
         dragonRuntimeStatus = "UPLOADING LAB FILES"
         updateInterface()
@@ -847,7 +935,8 @@ final class MainViewController: NSViewController {
                 self.runDragonCommand(
                     command,
                     status: "VERIFYING LAB FILES",
-                    logMessage: "FTP transfer verified; marking the two app-owned files executable and checking their MD5 digests"
+                    logMessage: "FTP transfer verified; marking the two app-owned files executable and checking their MD5 digests",
+                    canRetryAfterNoResult: true
                 )
             case .failure(let error):
                 self.dragonRuntimeStatus = "ERROR · FTP INSTALL"
@@ -1107,34 +1196,131 @@ final class MainViewController: NSViewController {
     private func runDragonCommand(
         _ command: String,
         status: String,
-        logMessage: String = "Dragon control requested; runtime-only helper will validate the profile"
+        logMessage: String = "Dragon control requested; runtime-only helper will validate the profile",
+        canRetryAfterNoResult: Bool = false
     ) {
-        let host = hostField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !host.isEmpty else { return }
+        let sc2Host = hostField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         stopDroneProbe()
         dragonCommandInFlight = true
         dragonCommandConnected = false
         dragonCommandSucceeded = false
+        dragonCommandResponded = false
+        dragonCommandCanRetryAfterNoResult = canRetryAfterNoResult
+        pendingDragonCommand = command
+        pendingDragonEndpoints = [DragonControlEndpoint(
+            host: BebopToolPackage.ftpHost,
+            port: 23,
+            label: "Bebop direct"
+        )]
+        if !sc2Host.isEmpty, sc2Host != BebopToolPackage.ftpHost {
+            pendingDragonEndpoints.append(DragonControlEndpoint(
+                host: sc2Host,
+                port: 2324,
+                label: "SC2 relay"
+            ))
+        }
         dragonRuntimeStatus = status
         updateInterface()
         appendLog(logMessage)
-        dragonControlTelnet.connect(host: host, port: 2324, startupCommand: command)
+        startNextDragonControlEndpoint()
+    }
+
+    private func startNextDragonControlEndpoint(after failure: String? = nil) {
+        dragonCommandTimeoutTimer?.invalidate()
+        dragonCommandTimeoutTimer = nil
+        if let failure { appendLog(failure) }
+        guard dragonCommandInFlight, let command = pendingDragonCommand,
+              !pendingDragonEndpoints.isEmpty else {
+            dragonRuntimeStatus = "CONTROL ERROR · NO TELNET PATH"
+            appendLog("Dragon control failed: direct Bebop Telnet and the SC2 relay were unavailable")
+            finishDragonCommand()
+            return
+        }
+
+        let endpoint = pendingDragonEndpoints.removeFirst()
+        activeDragonEndpoint = endpoint
+        dragonCommandConnected = false
+        appendLog("Dragon control trying \(endpoint.label) at \(endpoint.host):\(endpoint.port)")
+        dragonControlTelnet.connect(
+            host: endpoint.host,
+            port: endpoint.port,
+            startupCommand: command
+        )
+        dragonCommandTimeoutTimer = Timer.scheduledTimer(withTimeInterval: 8, repeats: false) {
+            [weak self] _ in
+            guard let self, self.dragonCommandInFlight,
+                  self.activeDragonEndpoint == endpoint,
+                  !self.dragonCommandResponded else { return }
+            if self.dragonCommandConnected {
+                if self.dragonCommandCanRetryAfterNoResult,
+                   !self.pendingDragonEndpoints.isEmpty {
+                    self.startNextDragonControlEndpoint(
+                        after: "Dragon control received no result through \(endpoint.label); trying the fallback path"
+                    )
+                    return
+                }
+                self.dragonRuntimeStatus = "NO RESULT · \(endpoint.label.uppercased())"
+                self.appendLog("Dragon control connected through \(endpoint.label), but the device returned no result within 8 seconds")
+                self.finishDragonCommand()
+            } else {
+                self.startNextDragonControlEndpoint(
+                    after: "Dragon control could not connect through \(endpoint.label) within 8 seconds"
+                )
+            }
+        }
     }
 
     private func handleDragonControlState(_ state: TelnetClient.State) {
         switch state {
         case .ready:
             dragonCommandConnected = true
+            if let activeDragonEndpoint {
+                appendLog("Dragon control connected through \(activeDragonEndpoint.label)")
+            }
         case .failed(let message):
             guard dragonCommandInFlight else { return }
-            dragonRuntimeStatus = "CONTROL ERROR"
-            appendLog("Dragon control failed: \(message)")
-            finishDragonCommand()
+            if dragonCommandResponded {
+                if dragonCommandSucceeded {
+                    appendLog("Dragon control closed after confirming the request")
+                }
+                finishDragonCommand()
+                return
+            }
+            if dragonCommandConnected {
+                if dragonCommandCanRetryAfterNoResult,
+                   !pendingDragonEndpoints.isEmpty {
+                    let label = activeDragonEndpoint?.label ?? "current path"
+                    startNextDragonControlEndpoint(
+                        after: "Dragon control \(label) closed without a result; trying the fallback path"
+                    )
+                    return
+                }
+                dragonRuntimeStatus = "CONTROL ERROR · NO RESULT"
+                appendLog("Dragon control connection failed after the command was sent: \(message)")
+                finishDragonCommand()
+            } else {
+                let label = activeDragonEndpoint?.label ?? "current path"
+                startNextDragonControlEndpoint(after: "Dragon control \(label) failed: \(message)")
+            }
         case .stopped:
             // TelnetClient emits .stopped once while replacing an old
             // connection. Only treat closure after .ready as completion.
             guard dragonCommandInFlight, dragonCommandConnected else { return }
-            finishDragonCommand()
+            if dragonCommandResponded {
+                finishDragonCommand()
+            } else {
+                if dragonCommandCanRetryAfterNoResult,
+                   !pendingDragonEndpoints.isEmpty {
+                    let label = activeDragonEndpoint?.label ?? "current path"
+                    startNextDragonControlEndpoint(
+                        after: "Dragon control \(label) closed without a result; trying the fallback path"
+                    )
+                    return
+                }
+                dragonRuntimeStatus = "NO RESULT · CONNECTION CLOSED"
+                appendLog("Dragon control shell closed without returning a result marker")
+                finishDragonCommand()
+            }
         case .idle, .connecting:
             break
         }
@@ -1145,6 +1331,9 @@ final class MainViewController: NSViewController {
         if let marker = line.range(of: "__PARROTLAB_INSTALL__=") {
             let event = String(line[marker.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
             guard event == "READY" || event == "ERROR" else { return }
+            dragonCommandResponded = true
+            dragonCommandTimeoutTimer?.invalidate()
+            dragonCommandTimeoutTimer = nil
             if event == "READY" {
                 dragonCommandSucceeded = true
                 dragonRuntimeStatus = "LAB FILES READY"
@@ -1169,12 +1358,32 @@ final class MainViewController: NSViewController {
         let payload = String(line[marker.upperBound...])
         let fields = payload.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
         guard let event = fields.first else { return }
+        guard ["QUEUED", "RUNNING", "RESTORED", "STATUS", "ERROR"].contains(event) else {
+            appendLog("Dragon helper: \(payload)")
+            return
+        }
+        dragonCommandResponded = true
+        dragonCommandTimeoutTimer?.invalidate()
+        dragonCommandTimeoutTimer = nil
 
         switch event {
+        case "QUEUED":
+            dragonCommandSucceeded = true
+            let operation = fields.count > 1 ? fields[1] : "apply"
+            if operation == "restore" {
+                queuedDragonOperation = .restore
+                dragonRuntimeStatus = "RESTORE QUEUED · WAITING FOR LINK"
+            } else {
+                let summary = pendingDragonLaunchSummary ?? "DRAGON LAB"
+                queuedDragonOperation = .launch(summary)
+                dragonRuntimeStatus = "QUEUED · \(summary)"
+            }
+            queuedDragonTelemetryNotBefore = Date().addingTimeInterval(3)
+            appendLog("Detached Dragon worker accepted; the SC2 relay may drop until Dragon restarts")
         case "RUNNING":
             dragonCommandSucceeded = true
-            if let profile = pendingDragonProfile {
-                dragonRuntimeStatus = "RUNNING · \(profile.launchSummary)"
+            if let summary = pendingDragonLaunchSummary {
+                dragonRuntimeStatus = "RUNNING · \(summary)"
             } else {
                 dragonRuntimeStatus = "RUNNING"
             }
@@ -1192,7 +1401,7 @@ final class MainViewController: NSViewController {
             dragonRuntimeStatus = "ERROR · " + fields.dropFirst().joined(separator: " ")
             appendLog("Dragon helper error: \(fields.dropFirst().joined(separator: " | "))")
         default:
-            appendLog("Dragon helper: \(payload)")
+            break
         }
         updateInterface()
     }
@@ -1200,12 +1409,20 @@ final class MainViewController: NSViewController {
     private func finishDragonCommand() {
         guard dragonCommandInFlight else { return }
         if !dragonCommandSucceeded, !dragonRuntimeStatus.hasPrefix("ERROR"),
-           dragonRuntimeStatus != "CONTROL ERROR" {
+           !dragonRuntimeStatus.hasPrefix("CONTROL ERROR"),
+           !dragonRuntimeStatus.hasPrefix("NO RESULT") {
             dragonRuntimeStatus = "NO RESULT · CHECK HELPER"
         }
         dragonCommandInFlight = false
         dragonCommandConnected = false
-        pendingDragonProfile = nil
+        dragonCommandResponded = false
+        dragonCommandCanRetryAfterNoResult = false
+        dragonCommandTimeoutTimer?.invalidate()
+        dragonCommandTimeoutTimer = nil
+        pendingDragonCommand = nil
+        pendingDragonEndpoints.removeAll(keepingCapacity: false)
+        activeDragonEndpoint = nil
+        pendingDragonLaunchSummary = nil
         pendingDragonInstall = false
         updateInterface()
 
@@ -1312,7 +1529,25 @@ final class MainViewController: NSViewController {
 
     private func consume(line: String) {
         if parser.consume(line: line, into: &snapshot) {
-            if line.contains("state:") { lastFlightStateUpdate = Date() }
+            if line.contains("state:") {
+                let now = Date()
+                lastFlightStateUpdate = now
+                if let queuedDragonOperation,
+                   now >= (queuedDragonTelemetryNotBefore ?? .distantPast) {
+                    switch queuedDragonOperation {
+                    case .launch(let summary):
+                        dragonRuntimeStatus = "RUNNING · \(summary)"
+                        appendLog("Drone telemetry returned after the detached Dragon restart")
+                    case .restore:
+                        dragonRuntimeStatus = "STOCK RESTORED"
+                        videoModePopup.selectItem(withTag: VideoReceiveMode.compatibility.rawValue)
+                        hudView.videoView.receiveMode = .compatibility
+                        appendLog("Drone telemetry returned after restoring stock Dragon")
+                    }
+                    self.queuedDragonOperation = nil
+                    queuedDragonTelemetryNotBefore = nil
+                }
+            }
             updateInterface()
         }
     }
@@ -1362,9 +1597,14 @@ final class MainViewController: NSViewController {
         connectButton.isEnabled = !deviceOperationActive
         let controlsEnabled = connected && landed && !dragonCommandInFlight &&
             !toolUploadInFlight && !sc2DriverInstallInFlight
+        let customSelected = customDragonModeSelected
         dragonResolutionPopup.isEnabled = controlsEnabled
-        dragonBitrateSlider.isEnabled = controlsEnabled
-        dragonLockRateButton.isEnabled = controlsEnabled
+        dragonBitrateSlider.isEnabled = controlsEnabled && !customSelected
+        dragonLockRateButton.isEnabled = controlsEnabled && !customSelected
+        dragonCustomArgumentsLabel.isHidden = !customSelected
+        dragonCustomArgumentsField.isHidden = !customSelected
+        dragonCustomArgumentsField.isEnabled = controlsEnabled && customSelected
+        dragonApplyButton.title = customSelected ? "Start custom" : "Apply profile"
         dragonApplyButton.isEnabled = controlsEnabled
         dragonRestoreButton.isEnabled = controlsEnabled
 
