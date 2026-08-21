@@ -18,10 +18,18 @@ we have been using to reverse-engineer the platform.
 - Flight state, distance, altitude, roll, pitch and yaw
 - SkyController 2 and Bebop 2 battery telemetry
 - RTP bitrate, packet-loss and jitter diagnostics
+- Lossless H.264 recording and source-resolution PNG/JPEG photo capture
+- Selectable 480p, 720p and experimental 1080p Dragon profiles
+- Adjustable 1–16 Mbit/s adaptive or locked stream bitrate
+- Integrated, verified installers for Dragon Lab, the RF/MOD Suite and the
+  SC2 Apple-NCM driver patch
 - Offline replay/demo and built-in self-tests
 
-Parrot Lab is observational: it does not change RF, Dragon, or flight-control
-configuration automatically.
+RF/NVM changes are never applied automatically. Dragon Lab can make an
+explicit, landed-only runtime video change after confirmation; it does not
+replace the stock binary or persist the profile across a reboot.
+
+See the [changelog](CHANGELOG.md) for this beta's complete update summary.
 
 ## Tested setup
 
@@ -62,7 +70,8 @@ reboot
 ```
 
 The installer temporarily remounts `/` read/write, installs one short boxinit
-service named `plboot`, restores the root filesystem to read-only, and starts:
+service named `plboot`, and restores the root filesystem to read-only. On the
+next boot, that service starts:
 
 - the Apple-NCM module needed for Mac USB networking;
 - a TCP 2324 relay used only to read drone telemetry.
@@ -85,7 +94,9 @@ open "$HOME/Applications/Parrot Lab.app"
 ```
 
 In Parrot Lab, leave the SC2 address at `192.168.53.1`, connect, and start the
-video receiver on UDP port `55004`.
+video receiver on UDP port `55004`. The **Tools** menu installs or updates the
+bundled Dragon Lab, RF/MOD and SC2 driver components; uploads are downloaded
+again and verified before the app offers the next step.
 
 Developers can run the test suite directly:
 
@@ -106,7 +117,10 @@ license and the licenses of the enabled codecs.
 - Do the first test on the bench with props removed and the aircraft grounded.
 - Keep a working Telnet path until USB networking has been verified after a
   full reboot.
-- Run `/data/lib/parrotlab/uninstall.sh`, then reboot, to remove persistence.
+- Use Dragon Lab only while landed, preferably on the bench with props
+  removed; it restarts the live camera process.
+- Run `/data/lib/parrotlab/uninstall_sc2_apple_ncm.sh`, then reboot, to remove
+  persistence.
 - Loading a kernel module built for another kernel can crash the controller.
 
 ## Background and acknowledgements

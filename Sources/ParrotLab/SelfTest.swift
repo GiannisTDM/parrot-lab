@@ -69,13 +69,21 @@ enum ParrotLabSelfTest {
             return 1
         }
 
-        guard VideoReceiveMode.selfTest(), H264VideoView.metadataSelfTest() else {
-            fputs("Self-test failed: video mode/FrameInfo metadata\n", stderr)
+        guard VideoReceiveMode.selfTest(), DragonVideoProfile.selfTest(),
+              BebopToolInstaller.selfTest(),
+              H264VideoView.metadataSelfTest() else {
+            fputs("Self-test failed: video/Dragon mode or FrameInfo metadata\n", stderr)
             return 1
         }
 
         guard FFmpegVideoDecoder.bufferingSelfTest() else {
             fputs("Self-test failed: bounded video buffering\n", stderr)
+            return 1
+        }
+
+        guard MediaFileNamer.selfTest(), StillImageWriter.selfTest(),
+              H264StreamRecorder.selfTest() else {
+            fputs("Self-test failed: local media capture\n", stderr)
             return 1
         }
 

@@ -2,12 +2,14 @@ import AppKit
 import AVFoundation
 import CoreImage
 import CoreMedia
+import QuartzCore
 import VideoToolbox
 
 final class H264VideoView: NSView {
     var onDebug: ((String) -> Void)?
     var onFormat: ((Int, Int) -> Void)?
     var onMetadataPresence: ((VideoMetadataPresence) -> Void)?
+    var onFrameReady: (() -> Void)?
     var receiveMode: VideoReceiveMode = .compatibility {
         didSet {
             guard receiveMode != oldValue else { return }
@@ -16,6 +18,7 @@ final class H264VideoView: NSView {
     }
     private let videoLayer = CALayer()
     private let ciContext = CIContext(options: [.cacheIntermediates: false])
+    private let softwareColorSpace = CGColorSpaceCreateDeviceRGB()
     private var formatDescription: CMVideoFormatDescription?
     private var decompressionSession: VTDecompressionSession?
     private var softwareDecoder: FFmpegVideoDecoder?
@@ -30,6 +33,7 @@ final class H264VideoView: NSView {
     private var metadataPresence = VideoMetadataPresence()
     private var extensionDumpHandle: FileHandle?
     private var dumpedExtensionAccessUnits = 0
+    private var latestDecodedFrame: CGImage?
 
     private static let legacyFrameInfoUUID = Data([
         0x97, 0x77, 0x08, 0x83, 0xc8, 0xd3, 0x40, 0x2e,
@@ -161,6 +165,7 @@ final class H264VideoView: NSView {
         softwareDecoder?.stop()
         softwareDecoder = nil
         videoLayer.contents = nil
+        latestDecodedFrame = nil
         formatDescription = nil
         sps = nil
         pps = nil
@@ -340,10 +345,12 @@ final class H264VideoView: NSView {
             guard let self else { return }
             self.hardwareFallbackWorkItem?.cancel()
             self.hardwareFallbackWorkItem = nil
+            self.latestDecodedFrame = cgImage
             self.videoLayer.contents = cgImage
             if !self.reportedFirstDecodedFrame {
                 self.reportedFirstDecodedFrame = true
                 self.onDebug?("First decoded video frame displayed: \(cgImage.width)x\(cgImage.height)")
+                self.onFrameReady?()
             }
         }
     }
@@ -352,25 +359,43 @@ final class H264VideoView: NSView {
         // FFmpegVideoDecoder coalesces delivery onto the main queue, keeping at
         // most one not-yet-presented RGBA frame alive.
         dispatchPrecondition(condition: .onQueue(.main))
-        guard let provider = CGDataProvider(data: data as CFData),
-              let image = CGImage(
-                width: width,
-                height: height,
-                bitsPerComponent: 8,
-                bitsPerPixel: 32,
-                bytesPerRow: width * 4,
-                space: CGColorSpaceCreateDeviceRGB(),
-                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue).union(.byteOrder32Big),
-                provider: provider,
-                decode: nil,
-                shouldInterpolate: true,
-                intent: .defaultIntent
-              ) else { return }
-        videoLayer.contents = image
-        if !reportedFirstDecodedFrame {
-            reportedFirstDecodedFrame = true
-            onDebug?("First software-decoded video frame displayed: \(width)x\(height)")
+        autoreleasepool {
+            guard data.count == width * height * 4,
+                  let provider = CGDataProvider(data: data as CFData),
+                  let image = CGImage(
+                    width: width,
+                    height: height,
+                    bitsPerComponent: 8,
+                    bitsPerPixel: 32,
+                    bytesPerRow: width * 4,
+                    space: softwareColorSpace,
+                    bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue).union(.byteOrder32Big),
+                    provider: provider,
+                    decode: nil,
+                    shouldInterpolate: true,
+                    intent: .defaultIntent
+                  ) else { return }
+
+            // Commit each replacement explicitly so Core Animation does not
+            // accumulate full-resolution CGImages in an implicit transaction.
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            latestDecodedFrame = image
+            videoLayer.contents = image
+            CATransaction.commit()
+            if !reportedFirstDecodedFrame {
+                reportedFirstDecodedFrame = true
+                onDebug?("First software-decoded video frame displayed: \(width)x\(height)")
+                onFrameReady?()
+            }
         }
+    }
+
+    /// Returns the most recently decoded source frame without the HUD overlay.
+    /// The image is immutable and safe to hand to the background image writer.
+    func latestFrameImage() -> CGImage? {
+        dispatchPrecondition(condition: .onQueue(.main))
+        return latestDecodedFrame
     }
 
     private func captureAnnexB(_ nalUnits: [Data]) {

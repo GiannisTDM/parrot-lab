@@ -9,6 +9,13 @@ prebuilt `sc2/apple_mac_ncm.ko` is supplied under the 2-clause BSD option.
 
 The repository's MIT license does not replace that notice.
 
+## Patched Dragon research binary
+
+`patched/dragon-prog-1080p-mode1-30fps` is a modified firmware component for
+interoperability research on the Bebop 2. It is not covered by this
+repository's MIT license. Parrot and Dragon-related copyrights and trademarks
+remain with their respective owners.
+
 ## FFmpeg
 
 FFmpeg is not included in this repository. Parrot Lab can invoke an FFmpeg

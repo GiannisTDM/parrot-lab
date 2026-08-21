@@ -19,7 +19,7 @@ After rebooting the SC2:
 ```sh
 grep '^apple_mac_ncm ' /proc/modules
 netstat -ltn | grep ':2324 '
-cat /tmp/parrotlab-boot.log
+cat /tmp/parrotlab-apple-ncm.log
 ```
 
 The expected module state contains `apple_mac_ncm ... [permanent], Live`. Once

@@ -7,9 +7,11 @@ final class VideoHUDView: NSView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
-        layer?.cornerRadius = 12
+        layer?.cornerRadius = 16
         layer?.masksToBounds = true
         layer?.backgroundColor = NSColor(calibratedWhite: 0.025, alpha: 1).cgColor
+        layer?.borderWidth = 1
+        layer?.borderColor = NSColor.white.withAlphaComponent(0.10).cgColor
 
         videoView.translatesAutoresizingMaskIntoConstraints = false
         overlayView.translatesAutoresizingMaskIntoConstraints = false
@@ -69,8 +71,7 @@ final class HUDOverlayView: NSView {
     }
 
     private func drawConnectionHeader() {
-        let color: NSColor = snapshot.connectionLabel.contains("Live") ? .systemGreen :
-            snapshot.connectionLabel.contains("Replay") ? .systemCyan : .systemOrange
+        let color: NSColor = snapshot.connectionLabel.contains("Live") ? .systemGreen : .systemOrange
         drawPill(snapshot.connectionLabel.uppercased(), at: CGPoint(x: 18, y: bounds.height - 36), color: color)
         drawText(
             "PARROT LAB  •  SC2 DIRECT",
