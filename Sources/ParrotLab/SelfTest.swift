@@ -31,6 +31,15 @@ enum ParrotLabSelfTest {
         }
 
         _ = parser.consume(
+            line: "I battery (dragon): Battery percentage : 63",
+            into: &snapshot
+        )
+        guard snapshot.droneBatteryPercent == 63 else {
+            fputs("Self-test failed: native drone battery telemetry\n", stderr)
+            return 1
+        }
+
+        _ = parser.consume(
             line: "I bcmevtlog (wifid): extra_cnt: -37: -44: 0: 0: 1: 1: 1: 4: 1: 2: 0: -92: 22: 21: 4: 104: 0: 100: 0: 0",
             into: &snapshot
         )
@@ -78,6 +87,19 @@ enum ParrotLabSelfTest {
 
         guard FFmpegVideoDecoder.bufferingSelfTest() else {
             fputs("Self-test failed: bounded video buffering\n", stderr)
+            return 1
+        }
+
+        let telnetMarker = "__PARROTLAB_TELNET__="
+        guard SC2TelemetryParser.deviceMarkerPayload(
+            telnetMarker,
+            in: "__PARROTLAB_TELNET__=INSTALLED"
+        ) == "INSTALLED",
+        SC2TelemetryParser.deviceMarkerPayload(
+            telnetMarker,
+            in: "if bad; then echo __PARROTLAB_TELNET__=ERROR_DIGEST; elif good"
+        ) == nil else {
+            fputs("Self-test failed: echoed device-result marker rejection\n", stderr)
             return 1
         }
 

@@ -24,6 +24,8 @@ we have been using to reverse-engineer the platform.
 - Validated custom arguments for the fixed modified Dragon binary
 - Integrated, verified installers for Dragon Lab, the RF/MOD Suite and the
   SC2 Apple-NCM driver patch
+- A verified, reversible persistent Telnet/ADB installer for Bebop 2 firmware
+  4.4.2
 
 
 RF/NVM changes are never applied automatically. Dragon Lab can make an
@@ -135,6 +137,28 @@ can be embedded by setting `PARROTLAB_FFMPEG=/absolute/path/to/ffmpeg`; anyone
 redistributing such a bundle is responsible for complying with FFmpeg's
 license and the licenses of the enabled codecs.
 
+## Enable persistent Bebop 2 Telnet
+
+With temporary Telnet already active on a Bebop 2 running firmware 4.4.2,
+choose **Tools → Enable Persistent Telnet on Bebop 2…**. Parrot Lab uploads and
+verifies the installer, makes the stock developer-network script run during
+boot, and leaves the root filesystem read-only when it finishes. Telnet and
+ADB will then return automatically after a reboot.
+
+The system partition is full on the tested firmware, so the installer moves
+the verified stock `tcpdump` binary to the writable `internal_000` storage and
+leaves a working symlink at its original path. Both the firmware files and the
+resulting edits are checked against known digests; unknown versions are
+rejected instead of modified.
+
+> **Security warning:** this enables passwordless root Telnet on the aircraft
+> network. Use it only on trusted private networks. To remove the boot change,
+> connect to the drone and run:
+
+```sh
+sh /data/ftp/internal_000/install_bebop2_persistent_telnet.sh uninstall
+```
+
 ## Safety and recovery
 
 - Back up the SC2 before installing or editing system files.
@@ -144,7 +168,7 @@ license and the licenses of the enabled codecs.
 - Use Dragon Lab only while landed, preferably on the bench with props
   removed; it restarts the live camera process.
 - Run `/data/lib/parrotlab/uninstall_sc2_apple_ncm.sh`, then reboot, to remove
-  persistence.
+  SC2 persistence.
 - Loading a kernel module built for another kernel can crash the controller.
 
 ## Background and acknowledgements

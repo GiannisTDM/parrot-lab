@@ -26,11 +26,13 @@ COPYFILE_DISABLE=1 cp "$PROJECT_DIR/Resources/ParrotLabIcon.png" "$STAGE_APP/Con
 COPYFILE_DISABLE=1 cp "$PROJECT_DIR/Resources/ParrotLab.icns" "$STAGE_APP/Contents/Resources/ParrotLab.icns"
 COPYFILE_DISABLE=1 cp "$PROJECT_DIR/patched/dragon-prog-1080p-mode1-30fps" "$STAGE_APP/Contents/Resources/DeviceTools/dragon-prog-1080p-mode1-30fps"
 COPYFILE_DISABLE=1 cp "$PROJECT_DIR/tools/parrotlab_dragon_video.sh" "$STAGE_APP/Contents/Resources/DeviceTools/parrotlab_dragon_video.sh"
+COPYFILE_DISABLE=1 cp "$PROJECT_DIR/tools/install_bebop2_persistent_telnet.sh" "$STAGE_APP/Contents/Resources/DeviceTools/install_bebop2_persistent_telnet.sh"
 COPYFILE_DISABLE=1 cp "$PROJECT_DIR/tools/parrot_rf_lab.sh" "$STAGE_APP/Contents/Resources/DeviceTools/parrot_rf_lab.sh"
 COPYFILE_DISABLE=1 cp "$PROJECT_DIR/sc2/install.sh" "$STAGE_APP/Contents/Resources/DeviceTools/install_sc2_apple_ncm.sh"
 COPYFILE_DISABLE=1 cp "$PROJECT_DIR/sc2/apple_mac_ncm.ko" "$STAGE_APP/Contents/Resources/DeviceTools/apple_mac_ncm.ko"
 chmod 755 "$STAGE_APP/Contents/Resources/DeviceTools/dragon-prog-1080p-mode1-30fps" \
     "$STAGE_APP/Contents/Resources/DeviceTools/parrotlab_dragon_video.sh" \
+    "$STAGE_APP/Contents/Resources/DeviceTools/install_bebop2_persistent_telnet.sh" \
     "$STAGE_APP/Contents/Resources/DeviceTools/parrot_rf_lab.sh" \
     "$STAGE_APP/Contents/Resources/DeviceTools/install_sc2_apple_ncm.sh"
 chmod 644 "$STAGE_APP/Contents/Resources/DeviceTools/apple_mac_ncm.ko"

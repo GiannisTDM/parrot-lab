@@ -37,6 +37,13 @@ let installDragonItem = NSMenuItem(
 )
 installDragonItem.target = delegate
 toolsMenu.addItem(installDragonItem)
+let enableBebopTelnetItem = NSMenuItem(
+    title: "Enable Persistent Telnet on Bebop 2…",
+    action: #selector(AppDelegate.enablePersistentTelnetOnBebop2(_:)),
+    keyEquivalent: ""
+)
+enableBebopTelnetItem.target = delegate
+toolsMenu.addItem(enableBebopTelnetItem)
 let uploadRFBebopItem = NSMenuItem(
     title: "Upload RF/MOD Suite",
     action: #selector(AppDelegate.uploadRFModSuiteToBebop2(_:)),

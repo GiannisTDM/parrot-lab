@@ -3,6 +3,7 @@ import Foundation
 
 enum BebopToolPackage: String {
     case dragonLab
+    case persistentTelnet
     case rfModSuite
     case sc2DriverPatch
 
@@ -13,6 +14,7 @@ enum BebopToolPackage: String {
     var displayName: String {
         switch self {
         case .dragonLab: return "Dragon Lab"
+        case .persistentTelnet: return "Persistent Bebop Telnet"
         case .rfModSuite: return "RF/MOD Suite"
         case .sc2DriverPatch: return "SC2 Driver Patch"
         }
@@ -29,6 +31,13 @@ enum BebopToolPackage: String {
                 BebopToolAsset(
                     sourceRelativePath: "tools/parrotlab_dragon_video.sh",
                     remoteName: "parrotlab_dragon_video.sh"
+                )
+            ]
+        case .persistentTelnet:
+            return [
+                BebopToolAsset(
+                    sourceRelativePath: "tools/install_bebop2_persistent_telnet.sh",
+                    remoteName: "install_bebop2_persistent_telnet.sh"
                 )
             ]
         case .rfModSuite:
@@ -292,6 +301,7 @@ final class BebopToolInstaller: @unchecked Sendable {
             return false
         }
         return BebopToolPackage.dragonLab.assets.allSatisfy { (try? resolve($0)) != nil } &&
+            BebopToolPackage.persistentTelnet.assets.allSatisfy { (try? resolve($0)) != nil } &&
             BebopToolPackage.rfModSuite.assets.allSatisfy { (try? resolve($0)) != nil } &&
             BebopToolPackage.sc2DriverPatch.assets.allSatisfy { (try? resolve($0)) != nil }
     }

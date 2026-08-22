@@ -17,6 +17,7 @@ final class MainViewController: NSViewController {
     private let telnet = TelnetClient()
     private let droneProbeTelnet = TelnetClient()
     private let dragonControlTelnet = TelnetClient()
+    private let bebopSystemTelnet = TelnetClient()
     private let sc2DriverTelnet = TelnetClient()
     private let restreamProbe = RestreamProbe()
     private let rtpReceiver = RTPH264Receiver()
@@ -24,6 +25,10 @@ final class MainViewController: NSViewController {
     private let toolInstaller = BebopToolInstaller()
     private var snapshot = TelemetrySnapshot()
     private var droneProbeTimer: Timer?
+    private var droneProbeTimeoutTimer: Timer?
+    private var pendingDroneProbeEndpoints: [DragonControlEndpoint] = []
+    private var activeDroneProbeEndpoint: DragonControlEndpoint?
+    private var droneProbeResponded = false
     private var telemetryFreshnessTimer: Timer?
     private var lastFlightStateUpdate: Date?
     private var videoRunning = false
@@ -49,6 +54,9 @@ final class MainViewController: NSViewController {
     private var queuedDragonTelemetryNotBefore: Date?
     private var pendingDragonInstall = false
     private var toolUploadInFlight = false
+    private var persistentTelnetInstallInFlight = false
+    private var persistentTelnetConnected = false
+    private var persistentTelnetTimeoutTimer: Timer?
     private var sc2DriverInstallInFlight = false
     private var sc2DriverTelnetConnected = false
     private var sc2DriverInstallSucceeded = false
@@ -623,15 +631,12 @@ final class MainViewController: NSViewController {
         }
         telnet.onLine = { [weak self] line in self?.consume(line: line) }
         telnet.onDebug = { [weak self] message in self?.appendLog(message) }
-        droneProbeTelnet.onLine = { [weak self] line in
-            guard let self else { return }
-            if line.contains("__PARROTLAB_DRONE_BATTERY__=") {
-                self.appendLog("Battery probe reply: \(SC2TelemetryParser.stripANSI(from: line))")
-            }
-            self.consume(line: line)
-        }
+        droneProbeTelnet.onLine = { [weak self] line in self?.handleDroneProbeLine(line) }
         droneProbeTelnet.onDebug = { [weak self] message in
             self?.appendLog("Battery probe: \(message)")
+        }
+        droneProbeTelnet.onState = { [weak self] state in
+            self?.handleDroneProbeState(state)
         }
         dragonControlTelnet.onLine = { [weak self] line in
             self?.handleDragonControlLine(line)
@@ -641,6 +646,15 @@ final class MainViewController: NSViewController {
         }
         dragonControlTelnet.onState = { [weak self] state in
             self?.handleDragonControlState(state)
+        }
+        bebopSystemTelnet.onLine = { [weak self] line in
+            self?.handlePersistentTelnetLine(line)
+        }
+        bebopSystemTelnet.onDebug = { [weak self] message in
+            self?.appendLog("Persistent Telnet: \(message)")
+        }
+        bebopSystemTelnet.onState = { [weak self] state in
+            self?.handlePersistentTelnetState(state)
         }
         sc2DriverTelnet.onLine = { [weak self] line in
             self?.handleSC2DriverInstallLine(line)
@@ -712,7 +726,7 @@ final class MainViewController: NSViewController {
     private func startDroneProbe(host: String) {
         stopDroneProbe()
         guard !host.isEmpty, !dragonCommandInFlight, !toolUploadInFlight,
-              !sc2DriverInstallInFlight else { return }
+              !persistentTelnetInstallInFlight, !sc2DriverInstallInFlight else { return }
         runDroneProbe(host: host)
         droneProbeTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
             self?.runDroneProbe(host: host)
@@ -720,15 +734,80 @@ final class MainViewController: NSViewController {
     }
 
     private func runDroneProbe(host: String) {
-        // Direct Bebop Wi-Fi exposes Telnet on 23. Through an SC2, the
-        // controller's read-only boot relay is on 2324.
-        let port: UInt16 = host == BebopToolPackage.ftpHost ? 23 : 2324
-        droneProbeTelnet.connect(host: host, port: port, startupCommand: Self.droneBatteryProbeCommand)
+        droneProbeTimeoutTimer?.invalidate()
+        droneProbeTimeoutTimer = nil
+        pendingDroneProbeEndpoints.removeAll(keepingCapacity: true)
+        if host != BebopToolPackage.ftpHost {
+            pendingDroneProbeEndpoints.append(DragonControlEndpoint(
+                host: host,
+                port: 2324,
+                label: "SC2 relay"
+            ))
+        }
+        pendingDroneProbeEndpoints.append(DragonControlEndpoint(
+            host: BebopToolPackage.ftpHost,
+            port: 23,
+            label: "Bebop direct fallback"
+        ))
+        startNextDroneProbeEndpoint()
+    }
+
+    private func startNextDroneProbeEndpoint() {
+        droneProbeTimeoutTimer?.invalidate()
+        droneProbeTimeoutTimer = nil
+        guard let endpoint = pendingDroneProbeEndpoints.first else {
+            activeDroneProbeEndpoint = nil
+            droneProbeTelnet.stop()
+            return
+        }
+        pendingDroneProbeEndpoints.removeFirst()
+        activeDroneProbeEndpoint = endpoint
+        droneProbeResponded = false
+        droneProbeTelnet.connect(
+            host: endpoint.host,
+            port: endpoint.port,
+            startupCommand: Self.droneBatteryProbeCommand
+        )
+        droneProbeTimeoutTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: false) {
+            [weak self] _ in
+            guard let self, self.activeDroneProbeEndpoint == endpoint,
+                  !self.droneProbeResponded else { return }
+            self.startNextDroneProbeEndpoint()
+        }
+    }
+
+    private func handleDroneProbeLine(_ rawLine: String) {
+        guard let value = SC2TelemetryParser.deviceMarkerPayload(
+            "__PARROTLAB_DRONE_BATTERY__=",
+            in: rawLine
+        ) else { return }
+        if value == "NA" {
+            startNextDroneProbeEndpoint()
+            return
+        }
+        droneProbeResponded = true
+        droneProbeTimeoutTimer?.invalidate()
+        droneProbeTimeoutTimer = nil
+        if let endpoint = activeDroneProbeEndpoint {
+            appendLog("Battery probe reply through \(endpoint.label): \(value)%")
+        }
+        consume(line: "__PARROTLAB_DRONE_BATTERY__=\(value)")
+    }
+
+    private func handleDroneProbeState(_ state: TelnetClient.State) {
+        guard case .failed = state, !droneProbeResponded,
+              activeDroneProbeEndpoint != nil else { return }
+        startNextDroneProbeEndpoint()
     }
 
     private func stopDroneProbe() {
         droneProbeTimer?.invalidate()
         droneProbeTimer = nil
+        droneProbeTimeoutTimer?.invalidate()
+        droneProbeTimeoutTimer = nil
+        pendingDroneProbeEndpoints.removeAll(keepingCapacity: false)
+        activeDroneProbeEndpoint = nil
+        droneProbeResponded = false
         droneProbeTelnet.stop()
     }
 
@@ -890,14 +969,14 @@ final class MainViewController: NSViewController {
     }
 
     func installDragonLabOnBebop2() {
-        guard !toolUploadInFlight else {
+        guard !toolUploadInFlight, !persistentTelnetInstallInFlight else {
             showToolAlert(title: "Upload already running", message: "Wait for the current FTP transfer to finish.")
             return
         }
         guard canAdjustDragon else {
             showDragonAlert(
                 title: "Dragon Lab installation is locked",
-                message: "Connect to the Bebop 2 directly or through the SC2 and wait until live telemetry explicitly reports LANDED. The app uses direct Bebop Telnet first, then the SC2 relay as a fallback, only to verify and mark the uploaded files executable."
+                message: "Connect through the SC2 and wait until live telemetry explicitly reports LANDED. The app uses the SC2 relay for drone commands, with direct Bebop Telnet only as a bench fallback."
             )
             return
         }
@@ -947,6 +1026,74 @@ final class MainViewController: NSViewController {
         }
     }
 
+    func enablePersistentTelnetOnBebop2() {
+        guard !toolUploadInFlight, !dragonCommandInFlight,
+              !persistentTelnetInstallInFlight, !sc2DriverInstallInFlight else {
+            showToolAlert(
+                title: "Tool operation already running",
+                message: "Wait for the current transfer or device operation to finish."
+            )
+            return
+        }
+        guard connectButton.title == "Disconnect", hasFreshLandedTelemetry else {
+            showToolAlert(
+                title: "Persistent Telnet installation is locked",
+                message: "Connect Parrot Lab and wait until live telemetry explicitly reports LANDED. Manually enable Bebop Telnet for this first installation."
+            )
+            return
+        }
+
+        let alert = NSAlert()
+        alert.alertStyle = .critical
+        alert.messageText = "Permanently enable root Telnet on this Bebop 2?"
+        alert.informativeText = "This one-time operation requires Telnet to be manually enabled now. Because the Bebop system partition is full, Parrot Lab first backs up /usr/sbin/tcpdump to internal_000 and replaces it with a symlink. It then briefly remounts the Bebop 2 4.4.2 system partition writable and adds /bin/usbnetwork.sh immediately before exit 0 in /etc/init.d/rcS. Future boots will start the stock developer network services, including no-password root Telnet and ADB.\n\nAnyone on the aircraft network will have root shell access. Use this only on a trusted private network. No reboot is performed."
+        alert.addButton(withTitle: "Enable Permanently")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        stopDroneProbe()
+        toolUploadInFlight = true
+        persistentTelnetInstallInFlight = true
+        persistentTelnetConnected = false
+        dragonRuntimeStatus = "ENABLING PERSISTENT TELNET"
+        updateInterface()
+        appendLog("Uploading the persistent Telnet installer to Bebop 2 FTP 192.168.42.1:21/internal_000")
+
+        toolInstaller.install(.persistentTelnet) { [weak self] result in
+            guard let self else { return }
+            self.toolUploadInFlight = false
+            switch result {
+            case .success(let install):
+                self.appendVerifiedAssets(install)
+                guard let command = self.persistentTelnetInstallCommand(install) else {
+                    self.finishPersistentTelnetInstall(
+                        success: false,
+                        message: "The persistent Telnet installer manifest is incomplete."
+                    )
+                    return
+                }
+                self.appendLog("FTP verification passed; connecting directly to Bebop Telnet at 192.168.42.1:23")
+                self.bebopSystemTelnet.connect(
+                    host: BebopToolPackage.ftpHost,
+                    port: 23,
+                    startupCommand: command
+                )
+                self.persistentTelnetTimeoutTimer = Timer.scheduledTimer(
+                    withTimeInterval: 15,
+                    repeats: false
+                ) { [weak self] _ in
+                    guard let self, self.persistentTelnetInstallInFlight else { return }
+                    self.finishPersistentTelnetInstall(
+                        success: false,
+                        message: "Bebop Telnet did not confirm installation within 15 seconds. Manually enable Telnet, stay connected to the aircraft network, and try again."
+                    )
+                }
+            case .failure(let error):
+                self.finishPersistentTelnetInstall(success: false, message: error.localizedDescription)
+            }
+        }
+    }
+
     func uploadRFModSuiteToBebop2() {
         uploadRFModSuite(
             host: BebopToolPackage.ftpHost,
@@ -965,7 +1112,8 @@ final class MainViewController: NSViewController {
     }
 
     func installSC2DriverPatch() {
-        guard !toolUploadInFlight, !dragonCommandInFlight, !sc2DriverInstallInFlight else {
+        guard !toolUploadInFlight, !dragonCommandInFlight,
+              !persistentTelnetInstallInFlight, !sc2DriverInstallInFlight else {
             showToolAlert(title: "Tool operation already running", message: "Wait for the current transfer or device operation to finish.")
             return
         }
@@ -1023,7 +1171,8 @@ final class MainViewController: NSViewController {
     }
 
     private func uploadRFModSuite(host: String, targetName: String, devicePath: String) {
-        guard !toolUploadInFlight, !dragonCommandInFlight, !sc2DriverInstallInFlight else {
+        guard !toolUploadInFlight, !dragonCommandInFlight,
+              !persistentTelnetInstallInFlight, !sc2DriverInstallInFlight else {
             showToolAlert(title: "Tool operation already running", message: "Wait for the current transfer or Dragon operation to finish.")
             return
         }
@@ -1082,6 +1231,88 @@ final class MainViewController: NSViewController {
             "then echo __PARROTLAB_INSTALL__=READY; else echo __PARROTLAB_INSTALL__=ERROR; fi; exit"
     }
 
+    private func persistentTelnetInstallCommand(_ result: BebopToolInstallResult) -> String? {
+        guard let script = result.assets.first(where: {
+            $0.remoteName == "install_bebop2_persistent_telnet.sh"
+        }) else { return nil }
+        return "chmod 755 \(script.devicePath); " +
+            "S=$(md5sum \(script.devicePath)); S=${S%% *}; " +
+            "if [ \"$S\" != \"\(script.md5)\" ]; " +
+            "then echo __PARROTLAB_TELNET__=ERROR_DIGEST; " +
+            "elif sh \(script.devicePath) install; then :; " +
+            "else echo __PARROTLAB_TELNET__=ERROR_INSTALLER; fi; exit"
+    }
+
+    private func handlePersistentTelnetLine(_ rawLine: String) {
+        guard let event = SC2TelemetryParser.deviceMarkerPayload(
+            "__PARROTLAB_TELNET__=",
+            in: rawLine
+        ) else { return }
+        if event == "INSTALLED" {
+            appendLog("Bebop confirmed usbnetwork.sh is enabled in rcS at boot")
+            finishPersistentTelnetInstall(success: true, message: nil)
+        } else if event.hasPrefix("ERROR") {
+            appendLog("Persistent Telnet installer reported: \(event)")
+            finishPersistentTelnetInstall(
+                success: false,
+                message: "The Bebop installer reported \(event). The system partition was returned to read-only."
+            )
+        }
+    }
+
+    private func handlePersistentTelnetState(_ state: TelnetClient.State) {
+        switch state {
+        case .ready:
+            persistentTelnetConnected = true
+        case .failed(let message):
+            guard persistentTelnetInstallInFlight else { return }
+            finishPersistentTelnetInstall(
+                success: false,
+                message: "Direct Bebop Telnet failed: \(message). Manually enable Telnet for this one-time installation."
+            )
+        case .stopped:
+            guard persistentTelnetInstallInFlight, persistentTelnetConnected else { return }
+            finishPersistentTelnetInstall(
+                success: false,
+                message: "The Bebop shell closed without confirming the persistent boot trigger."
+            )
+        case .idle, .connecting:
+            break
+        }
+    }
+
+    private func finishPersistentTelnetInstall(success: Bool, message: String?) {
+        guard persistentTelnetInstallInFlight else { return }
+        toolUploadInFlight = false
+        persistentTelnetInstallInFlight = false
+        persistentTelnetConnected = false
+        persistentTelnetTimeoutTimer?.invalidate()
+        persistentTelnetTimeoutTimer = nil
+        bebopSystemTelnet.stop()
+        dragonRuntimeStatus = success ? "PERSISTENT TELNET ENABLED" : "READY · LANDED ONLY"
+        updateInterface()
+
+        if success {
+            showToolAlert(
+                title: "Persistent Bebop Telnet enabled",
+                message: "The stock developer network script will now run automatically on every boot, enabling Telnet and ADB. tcpdump remains available through /usr/sbin/tcpdump via its verified internal_000 backup. No reboot was performed.\n\nTo remove the rcS boot call later, run:\nsh /data/ftp/internal_000/install_bebop2_persistent_telnet.sh uninstall",
+                style: .informational
+            )
+        } else {
+            showToolAlert(
+                title: "Persistent Bebop Telnet was not enabled",
+                message: message ?? "The aircraft did not confirm installation."
+            )
+        }
+
+        if connectButton.title == "Disconnect" {
+            let host = hostField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+                self?.startDroneProbe(host: host)
+            }
+        }
+    }
+
     private func sc2DriverInstallCommand(_ result: BebopToolInstallResult) -> String? {
         guard let script = result.assets.first(where: { $0.remoteName == "install_sc2_apple_ncm.sh" }),
               let module = result.assets.first(where: { $0.remoteName == "apple_mac_ncm.ko" }) else {
@@ -1101,12 +1332,16 @@ final class MainViewController: NSViewController {
     }
 
     private func handleSC2DriverInstallLine(_ rawLine: String) {
-        let line = SC2TelemetryParser.stripANSI(from: rawLine)
-        if line.contains("__PARROTLAB_SC2_DRIVER_SCRIPT__=INSTALLED") {
+        if SC2TelemetryParser.deviceMarkerPayload(
+            "__PARROTLAB_SC2_DRIVER_SCRIPT__=",
+            in: rawLine
+        ) == "INSTALLED" {
             appendLog("SC2 installer confirmed the persistent plboot configuration")
         }
-        guard let marker = line.range(of: "__PARROTLAB_SC2_DRIVER__=") else { return }
-        let event = String(line[marker.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let event = SC2TelemetryParser.deviceMarkerPayload(
+            "__PARROTLAB_SC2_DRIVER__=",
+            in: rawLine
+        ) else { return }
         guard ["INSTALLED_REBOOTING", "ERROR_DIGEST", "ERROR_INSTALLER"].contains(event) else { return }
         if event == "INSTALLED_REBOOTING" {
             sc2DriverInstallSucceeded = true
@@ -1185,6 +1420,7 @@ final class MainViewController: NSViewController {
             hasFreshLandedTelemetry &&
             !dragonCommandInFlight &&
             !toolUploadInFlight &&
+            !persistentTelnetInstallInFlight &&
             !sc2DriverInstallInFlight
     }
 
@@ -1207,11 +1443,7 @@ final class MainViewController: NSViewController {
         dragonCommandResponded = false
         dragonCommandCanRetryAfterNoResult = canRetryAfterNoResult
         pendingDragonCommand = command
-        pendingDragonEndpoints = [DragonControlEndpoint(
-            host: BebopToolPackage.ftpHost,
-            port: 23,
-            label: "Bebop direct"
-        )]
+        pendingDragonEndpoints.removeAll(keepingCapacity: true)
         if !sc2Host.isEmpty, sc2Host != BebopToolPackage.ftpHost {
             pendingDragonEndpoints.append(DragonControlEndpoint(
                 host: sc2Host,
@@ -1219,6 +1451,11 @@ final class MainViewController: NSViewController {
                 label: "SC2 relay"
             ))
         }
+        pendingDragonEndpoints.append(DragonControlEndpoint(
+            host: BebopToolPackage.ftpHost,
+            port: 23,
+            label: "Bebop direct fallback"
+        ))
         dragonRuntimeStatus = status
         updateInterface()
         appendLog(logMessage)
@@ -1232,7 +1469,7 @@ final class MainViewController: NSViewController {
         guard dragonCommandInFlight, let command = pendingDragonCommand,
               !pendingDragonEndpoints.isEmpty else {
             dragonRuntimeStatus = "CONTROL ERROR · NO TELNET PATH"
-            appendLog("Dragon control failed: direct Bebop Telnet and the SC2 relay were unavailable")
+            appendLog("Dragon control failed: the SC2 relay and direct Bebop fallback were unavailable")
             finishDragonCommand()
             return
         }
@@ -1327,9 +1564,10 @@ final class MainViewController: NSViewController {
     }
 
     private func handleDragonControlLine(_ rawLine: String) {
-        let line = SC2TelemetryParser.stripANSI(from: rawLine)
-        if let marker = line.range(of: "__PARROTLAB_INSTALL__=") {
-            let event = String(line[marker.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        if let event = SC2TelemetryParser.deviceMarkerPayload(
+            "__PARROTLAB_INSTALL__=",
+            in: rawLine
+        ) {
             guard event == "READY" || event == "ERROR" else { return }
             dragonCommandResponded = true
             dragonCommandTimeoutTimer?.invalidate()
@@ -1354,8 +1592,10 @@ final class MainViewController: NSViewController {
             updateInterface()
             return
         }
-        guard let marker = line.range(of: "__PARROTLAB_DRAGON__=") else { return }
-        let payload = String(line[marker.upperBound...])
+        guard let payload = SC2TelemetryParser.deviceMarkerPayload(
+            "__PARROTLAB_DRAGON__=",
+            in: rawLine
+        ) else { return }
         let fields = payload.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
         guard let event = fields.first else { return }
         guard ["QUEUED", "RUNNING", "RESTORED", "STATUS", "ERROR"].contains(event) else {
@@ -1592,11 +1832,13 @@ final class MainViewController: NSViewController {
 
         let connected = connectButton.title == "Disconnect"
         let landed = hasFreshLandedTelemetry
-        let deviceOperationActive = toolUploadInFlight || dragonCommandInFlight || sc2DriverInstallInFlight
+        let deviceOperationActive = toolUploadInFlight || dragonCommandInFlight ||
+            persistentTelnetInstallInFlight || sc2DriverInstallInFlight
         hostField.isEnabled = !deviceOperationActive
         connectButton.isEnabled = !deviceOperationActive
         let controlsEnabled = connected && landed && !dragonCommandInFlight &&
-            !toolUploadInFlight && !sc2DriverInstallInFlight
+            !toolUploadInFlight && !persistentTelnetInstallInFlight &&
+            !sc2DriverInstallInFlight
         let customSelected = customDragonModeSelected
         dragonResolutionPopup.isEnabled = controlsEnabled
         dragonBitrateSlider.isEnabled = controlsEnabled && !customSelected
@@ -1758,6 +2000,7 @@ final class MainViewController: NSViewController {
 
     func prepareForTermination() {
         toolInstaller.cancel()
+        bebopSystemTelnet.stop()
         sc2DriverTelnet.stop()
         recordingTimer?.invalidate()
         recordingTimer = nil

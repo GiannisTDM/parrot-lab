@@ -67,6 +67,9 @@ final class SC2TelemetryParser {
     private let droneBatteryExpression = try! NSRegularExpression(
         pattern: #"__PARROTLAB_DRONE_BATTERY__\s*=\s*(\d{1,3})"#
     )
+    private let nativeDroneBatteryExpression = try! NSRegularExpression(
+        pattern: #"Battery percentage\s*:\s*(\d{1,3})"#
+    )
 
     func reset() {
         homePosition = nil
@@ -107,6 +110,10 @@ final class SC2TelemetryParser {
 
         if let groups = captures(droneBatteryExpression, in: clean), groups.count == 1,
            let battery = Self.validPercent(groups[0]) {
+            snapshot.droneBatteryPercent = battery
+            changed = true
+        } else if let groups = captures(nativeDroneBatteryExpression, in: clean),
+                  groups.count == 1, let battery = Self.validPercent(groups[0]) {
             snapshot.droneBatteryPercent = battery
             changed = true
         }
@@ -205,5 +212,17 @@ final class SC2TelemetryParser {
             with: "",
             options: .regularExpression
         )
+    }
+
+    /// Device shells echo commands before executing them. Accept a result
+    /// marker only when it begins the returned line, never when it merely
+    /// appears inside an echoed `if ... echo MARKER ...` command.
+    static func deviceMarkerPayload(_ prefix: String, in line: String) -> String? {
+        let clean = stripANSI(from: line)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard clean.hasPrefix(prefix) else { return nil }
+        let payload = clean.dropFirst(prefix.count)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return payload.isEmpty ? nil : payload
     }
 }
