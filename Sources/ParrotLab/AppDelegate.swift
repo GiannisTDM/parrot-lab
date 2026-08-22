@@ -31,6 +31,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         controller?.installDragonLabOnBebop2()
     }
 
+    @objc func enablePersistentTelnetOnBebop2(_ sender: Any?) {
+        controller?.enablePersistentTelnetOnBebop2()
+    }
+
     @objc func uploadRFModSuiteToBebop2(_ sender: Any?) {
         controller?.uploadRFModSuiteToBebop2()
     }

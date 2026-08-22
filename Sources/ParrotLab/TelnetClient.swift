@@ -48,7 +48,10 @@ final class TelnetClient {
                     self.send("\r\n", on: connection)
                 }
                 self.queue.asyncAfter(deadline: .now() + 0.45) {
-                    self.send("export TERM=dumb; \(startupCommand)\r\n", on: connection)
+                    self.send(
+                        "export TERM=dumb; export PATH=/usr/bin:/bin:/usr/sbin:/sbin; \(startupCommand)\r\n",
+                        on: connection
+                    )
                 }
             case .failed(let error):
                 self.state = .failed(error.localizedDescription)

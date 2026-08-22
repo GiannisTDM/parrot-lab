@@ -1,6 +1,12 @@
 #!/bin/sh
 set -eu
 
+# Bebop's manually enabled Telnet shell can start with a minimal PATH that
+# omits /usr/bin. Dragon's stock firmware keeps setsid, ulogcat, readlink,
+# head, tail, tr and wc there, so make the firmware command set explicit.
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+
 # Parrot Lab's non-persistent Dragon launcher for Bebop 2 firmware 4.4.2.
 # Install this file and the optional patched binary in /data/ftp/internal_000.
 # It never changes persist.dragon-prog.post_cmd or overwrites /usr/bin files.
@@ -16,6 +22,19 @@ LOG_FILE="/tmp/parrotlab-dragon-video.log"
 WORKER_LOG="/tmp/parrotlab-dragon-worker.log"
 WORKER_TOKEN="PARROTLAB_DETACHED_V1"
 WORKER_ACTIVE=0
+
+resolve_setsid()
+{
+    for candidate in /usr/bin/setsid /bin/setsid /sbin/setsid; do
+        if [ -x "$candidate" ]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    command -v setsid 2>/dev/null || true
+}
+
+SETSID_BIN=$(resolve_setsid)
 
 case "$0" in
     /*) SELF_PATH=$0 ;;
@@ -170,10 +189,10 @@ queue_worker()
     worker_action=$1
     shift
     [ -r "$SELF_PATH" ] || fail "HELPER_NOT_READABLE|$SELF_PATH"
-    command -v setsid >/dev/null 2>&1 || fail "SETSID_NOT_AVAILABLE"
+    [ -n "$SETSID_BIN" ] || fail "SETSID_NOT_AVAILABLE"
 
     : > "$WORKER_LOG"
-    setsid sh "$SELF_PATH" "$worker_action" "$@" \
+    "$SETSID_BIN" sh "$SELF_PATH" "$worker_action" "$@" \
         >> "$WORKER_LOG" 2>&1 < /dev/null &
     queued_worker_pid=$!
     usleep 100000
@@ -191,10 +210,10 @@ start_profile()
     stop_dragon
     : > "$LOG_FILE"
     if [ "$rate_mode" = "constant" ]; then
-        setsid "$profile_binary" -V "$profile_video_mode" -f 30 -R off -S 0 -I off \
+        "$SETSID_BIN" "$profile_binary" -V "$profile_video_mode" -f 30 -R off -S 0 -I off \
             -q "$bitrate" -s -o >> "$LOG_FILE" 2>&1 < /dev/null &
     else
-        setsid "$profile_binary" -V "$profile_video_mode" -f 30 -R off -S 0 -I off \
+        "$SETSID_BIN" "$profile_binary" -V "$profile_video_mode" -f 30 -R off -S 0 -I off \
             -q "$bitrate" -o >> "$LOG_FILE" 2>&1 < /dev/null &
     fi
     new_pid=$!
@@ -212,7 +231,7 @@ start_custom()
     : > "$LOG_FILE"
 
     set -- $custom_arguments
-    setsid "$CUSTOM_1080" "$@" >> "$LOG_FILE" 2>&1 < /dev/null &
+    "$SETSID_BIN" "$CUSTOM_1080" "$@" >> "$LOG_FILE" 2>&1 < /dev/null &
     new_pid=$!
 
     sleep 2
@@ -226,7 +245,7 @@ restore_stock()
     [ -x /usr/bin/DragonStarter.sh ] || fail "STOCK_STARTER_NOT_EXECUTABLE"
     stop_dragon
     : > "$LOG_FILE"
-    setsid /usr/bin/DragonStarter.sh -out2null >> "$LOG_FILE" 2>&1 < /dev/null &
+    "$SETSID_BIN" /usr/bin/DragonStarter.sh -out2null >> "$LOG_FILE" 2>&1 < /dev/null &
     starter_pid=$!
 
     count=0

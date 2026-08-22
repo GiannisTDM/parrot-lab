@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.1.0 build 6 — 2026-08-22
+
+### Added
+
+- Added **Tools → Enable Persistent Telnet on Bebop 2** for firmware 4.4.2.
+  The verified, reversible installer enables the stock developer-network
+  startup path so Telnet and ADB return after a reboot.
+
+### Improved
+
+- Improved the Bebop- and SC2-side installers so profile uploads and device
+  completion markers are handled reliably rather than being confused with
+  echoed shell input.
+- Improved direct-Bebop and SC2-relay connection probing and added support for
+  the Bebop's native battery-percentage log format.
+
+### Fixed
+
+- Fixed Dragon profile launches in the Bebop's minimal Telnet environment by
+  resolving the firmware `setsid` executable explicitly before starting the
+  detached worker.
+
+> **Security warning:** persistent Bebop Telnet provides passwordless root
+> access to devices on the aircraft network. Use it only on trusted private
+> networks. The app displays removal instructions after installation.
+
 ## 1.1.0 — 2026-08-21
 
 ### Added
