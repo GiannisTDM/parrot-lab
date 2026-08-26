@@ -136,8 +136,10 @@ struct DragonCustomLaunch: Equatable {
     }
 
     var applyCommand: String {
-        let payload = Data(arguments.utf8).base64EncodedString()
-        return "sh \(DragonVideoProfile.helperPath) custom \(payload) LANDED; exit"
+        // Validation above excludes quotes and shell metacharacters, so a
+        // single quoted argument is safe and works on stock BusyBox without
+        // requiring a base64 executable on the drone.
+        return "sh \(DragonVideoProfile.helperPath) custom '\(arguments)' LANDED; exit"
     }
 
     static func selfTest() -> Bool {

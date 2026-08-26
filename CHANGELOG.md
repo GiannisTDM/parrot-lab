@@ -1,5 +1,52 @@
 # Changelog
 
+## 1.2.0 — 2026-08-26
+
+### Added
+
+- Added a persistent ARSDK connection through the SkyController 2 for
+  structured drone/controller battery, flight state, attitude, GPS fix,
+  satellite count, speed and last-known GPS coordinates.
+- Added direct stock-camera **4K fisheye** capture. Parrot Lab requests the
+  original full-sensor JPEG through ARSDK and downloads the unmodified image
+  from the drone.
+- Added the **Image Enhancement** menu with source, denoise, clarity,
+  low-light cleanup, high-quality 2× upscale and 2× upscale + clarity modes.
+- Added guided SC2 address discovery through the Bebop, local USB-network
+  discovery, and automatic discovery fallback during SC2 driver installation.
+- Added a guarded RF power workflow for applying the tested profile to both
+  devices or restoring their preserved stock baselines, with backups,
+  verification and controlled reboots.
+- Added detailed encoded, decoded and display frame-rate diagnostics plus RTP
+  duplicate-packet accounting.
+
+### Improved
+
+- Expanded and reorganized the native Tools menu for Dragon Lab, persistent
+  Telnet, RF/MOD deployment, RF profile control, SC2 discovery and the SC2
+  Apple-NCM driver patch.
+- Replaced periodic drone-battery Telnet scraping with persistent ARSDK state
+  delivery at controller RF range.
+- Hardened Bebop and SC2 uploads with device-aware paths, digest validation,
+  explicit executable permissions and clearer completion markers.
+
+### Fixed
+
+- Fixed several installer failures caused by BusyBox command differences,
+  incomplete PATH values, incorrect permission handling and ambiguous root
+  mount-state detection.
+- Fixed macOS-side video decoding issues involving FFmpeg pipe shutdown,
+  duplicate RTP pictures, cyclic-intra-refresh frame delivery and diagnostic
+  captures missing SPS/PPS parameter sets.
+- Fixed RF Lab non-interactive profile application, stock-baseline recovery
+  and reliable operation on the BusyBox environments used by both devices.
+
+> **Known 1.2 limitation:** the custom modified-binary mode and patched 1080p
+> Dragon profile are not functional in this release and should not be used.
+> Unified Bebop firmware support for 4.4.2 and 4.7.1 is being developed for
+> version 1.3. Stock video, telemetry, media capture and the other tools remain
+> available.
+
 ## 1.1.0 build 6 — 2026-08-22
 
 ### Added

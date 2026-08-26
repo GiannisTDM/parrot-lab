@@ -17,15 +17,19 @@ we have been using to reverse-engineer the platform.
 - RF chain RSSI, average RSSI, noise, SNR, link quality and PHY rate
 - Flight state, distance, altitude, roll, pitch and yaw
 - SkyController 2 and Bebop 2 battery telemetry
+- Persistent ARSDK navigation telemetry: GPS fix, satellites, speed and last
+  known coordinates
 - RTP bitrate, packet-loss and jitter diagnostics
 - Lossless H.264 recording and source-resolution PNG/JPEG photo capture
-- Selectable 480p, 720p and experimental 1080p Dragon profiles
+- Original full-sensor 4K fisheye JPEG capture directly from the drone
+- Mac-side denoise, clarity, low-light cleanup and high-quality 2× enhancement
+- Selectable stock 480p and 720p Dragon profiles
 - Adjustable 1–16 Mbit/s adaptive or locked stream bitrate
-- Validated custom arguments for the fixed modified Dragon binary
 - Integrated, verified installers for Dragon Lab, the RF/MOD Suite and the
   SC2 Apple-NCM driver patch
-- A verified, reversible persistent Telnet/ADB installer for Bebop 2 firmware
-  4.4.2
+- Guided SC2 bridge/USB address discovery and RF power-profile controls
+- A verified, reversible persistent Telnet/ADB installer for supported Bebop
+  firmware files
 
 
 RF/NVM changes are never applied automatically. Dragon Lab can make an
@@ -34,9 +38,10 @@ replace the stock binary or persist the profile across a reboot.
 
 See the [changelog](CHANGELOG.md) for this beta's complete update summary.
 
-> **Upgrading to 1.1:** run **Tools → Install/Update Dragon Lab on Bebop 2**
-> once. Preset, custom and restore operations require the updated detached
-> helper to survive the expected SC2/Telnet relay interruption.
+> **Version 1.2 limitation:** the patched 1080p profile and **Custom · modified
+> binary** mode are currently non-functional. Do not use them in this release.
+> Unified Bebop 2 firmware support for 4.4.2 and 4.7.1 is planned for version
+> 1.3.
 
 ## Download the beta
 
@@ -120,7 +125,8 @@ open "$HOME/Applications/Parrot Lab.app"
 
 In Parrot Lab, leave the SC2 address at `192.168.53.1`, connect, and start the
 video receiver on UDP port `55004`. The **Tools** menu installs or updates the
-bundled Dragon Lab, RF/MOD and SC2 driver components; uploads are downloaded
+bundled Dragon Lab, RF/MOD and SC2 driver components, discovers changing SC2
+addresses, and exposes the guarded RF profile workflow. Uploads are downloaded
 again and verified before the app offers the next step.
 
 Developers can run the test suite directly:
@@ -139,7 +145,7 @@ license and the licenses of the enabled codecs.
 
 ## Enable persistent Bebop 2 Telnet
 
-With temporary Telnet already active on a Bebop 2 running firmware 4.4.2,
+With temporary Telnet already active on a supported Bebop 2 firmware build,
 choose **Tools → Enable Persistent Telnet on Bebop 2…**. Parrot Lab uploads and
 verifies the installer, makes the stock developer-network script run during
 boot, and leaves the root filesystem read-only when it finishes. Telnet and
@@ -167,6 +173,8 @@ sh /data/ftp/internal_000/install_bebop2_persistent_telnet.sh uninstall
   full reboot.
 - Use Dragon Lab only while landed, preferably on the bench with props
   removed; it restarts the live camera process.
+- Treat RF profile changes as experimental and verify local EIRP rules before
+  enabling them.
 - Run `/data/lib/parrotlab/uninstall_sc2_apple_ncm.sh`, then reboot, to remove
   SC2 persistence.
 - Loading a kernel module built for another kernel can crash the controller.

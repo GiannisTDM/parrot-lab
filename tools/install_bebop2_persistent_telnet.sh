@@ -1,7 +1,8 @@
 #!/bin/sh
 set -eu
 
-# Enable the stock developer-network script at boot on Bebop 2 firmware 4.4.2.
+# Enable the stock developer-network script at boot on supported Bebop 2
+# firmware 4.4.2 and 4.7.1.
 # The full system UBIFS gets headroom by relocating tcpdump to the writable
 # eMMC. The rcS edit is reversible and / is always returned to read-only.
 
@@ -73,10 +74,9 @@ validate_firmware()
 {
     grep -q '^ro.parrot.build.product=ardrone3$' /etc/build.prop || \
         fail NOT_BEBOP2_FIRMWARE
-    grep -q '^ro.parrot.build.version=4\.4\.2$' /etc/build.prop || \
+    grep -qE '^ro\.parrot\.build\.version=(4\.4\.2|4\.7\.1)$' /etc/build.prop || \
         fail UNSUPPORTED_FIRMWARE
     [ -f "$RCS_FILE" ] || fail RCS_NOT_FOUND
-    [ -x /bin/usbnetwork.sh ] || fail USBNETWORK_NOT_FOUND
     [ -x /usr/bin/pstart ] || fail PSTART_NOT_AVAILABLE
 }
 

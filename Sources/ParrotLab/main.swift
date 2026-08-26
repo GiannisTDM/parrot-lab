@@ -58,7 +58,28 @@ let uploadRFSC2Item = NSMenuItem(
 )
 uploadRFSC2Item.target = delegate
 toolsMenu.addItem(uploadRFSC2Item)
+let configureRFPowerItem = NSMenuItem(
+    title: "Enable/Disable RF Power Mod…",
+    action: #selector(AppDelegate.configureRFPowerMod(_:)),
+    keyEquivalent: ""
+)
+configureRFPowerItem.target = delegate
+toolsMenu.addItem(configureRFPowerItem)
 toolsMenu.addItem(NSMenuItem.separator())
+let findSC2HostItem = NSMenuItem(
+    title: "Find SC2 IP through Bebop 2…",
+    action: #selector(AppDelegate.findSC2HostThroughBebop(_:)),
+    keyEquivalent: ""
+)
+findSC2HostItem.target = delegate
+toolsMenu.addItem(findSC2HostItem)
+let findSC2USBHostItem = NSMenuItem(
+    title: "Find SC2 USB Networking IP…",
+    action: #selector(AppDelegate.findSC2USBHost(_:)),
+    keyEquivalent: ""
+)
+findSC2USBHostItem.target = delegate
+toolsMenu.addItem(findSC2USBHostItem)
 let installSC2DriverItem = NSMenuItem(
     title: "Install/Update SC2 Driver Patch",
     action: #selector(AppDelegate.installSC2DriverPatch(_:)),
@@ -68,6 +89,22 @@ installSC2DriverItem.target = delegate
 toolsMenu.addItem(installSC2DriverItem)
 toolsItem.submenu = toolsMenu
 menu.addItem(toolsItem)
+
+let enhancementItem = NSMenuItem(title: "Image Enhancement", action: nil, keyEquivalent: "")
+let enhancementMenu = NSMenu(title: "Image Enhancement")
+for preset in VideoEnhancementPreset.allCases {
+    let item = NSMenuItem(
+        title: preset.menuTitle,
+        action: #selector(AppDelegate.selectVideoEnhancement(_:)),
+        keyEquivalent: ""
+    )
+    item.tag = preset.rawValue
+    item.target = delegate
+    item.state = preset == .off ? .on : .off
+    enhancementMenu.addItem(item)
+}
+enhancementItem.submenu = enhancementMenu
+menu.addItem(enhancementItem)
 application.mainMenu = menu
 
 application.run()

@@ -3,7 +3,7 @@
 # Runs on the stock BusyBox ash shell of both Parrot Bebop 2 and
 # SkyController 2. No Python or third-party packages are required.
 
-VERSION="0.3.1"
+VERSION="0.4.0"
 WL_BIN="${WL_BIN:-/usr/sbin/bcmwl}"
 INTERVAL="${RF_LAB_INTERVAL:-1}"
 REQUESTED_PEER="${RF_LAB_PEER:-}"
@@ -969,7 +969,12 @@ root_rw()
 
 root_is_rw()
 {
-    mount 2>/dev/null | awk '$3 == "/" && $0 ~ /\(rw[,)]/ { found=1 } END { exit(found ? 0 : 1) }'
+    # BusyBox may list the synthetic rootfs as rw before the real UBIFS root
+    # mount as ro. The last entry for / is the effective backing filesystem.
+    mount 2>/dev/null | awk '
+        $3 == "/" { writable = ($0 ~ /\(rw[,)]/) }
+        END { exit(writable ? 0 : 1) }
+    '
 }
 
 root_ro()
@@ -984,15 +989,17 @@ apply_stage()
         return 0
     fi
     validate_stage || return 1
-    printf '\n%sPending changes:%s\n' "$BOLD" "$RESET"
-    show_stage_diff
-    printf '\n%sThis edits only the active filesystem NVM. Factory/OTP data is never touched.%s\n' "$YELLOW" "$RESET"
-    printf 'Type %sAPPLY%s to create a recovery backup and write the file: ' "$BOLD" "$RESET"
-    IFS= read -r _apply_answer
-    [ "$_apply_answer" = "APPLY" ] || {
-        printf 'Cancelled.\n'
-        return 0
-    }
+    if [ "${RF_LAB_NONINTERACTIVE:-0}" != "1" ]; then
+        printf '\n%sPending changes:%s\n' "$BOLD" "$RESET"
+        show_stage_diff
+        printf '\n%sThis edits only the active filesystem NVM. Factory/OTP data is never touched.%s\n' "$YELLOW" "$RESET"
+        printf 'Type %sAPPLY%s to create a recovery backup and write the file: ' "$BOLD" "$RESET"
+        IFS= read -r _apply_answer
+        [ "$_apply_answer" = "APPLY" ] || {
+            printf 'Cancelled.\n'
+            return 0
+        }
+    fi
 
     mkdir -p "$BACKUP_DIR" 2>/dev/null || {
         printf '%sCannot create backup directory: %s%s\n' "$RED" "$BACKUP_DIR" "$RESET"
@@ -1027,6 +1034,83 @@ apply_stage()
             "$RED" "$_backup_path" "$RESET"
     fi
     [ "$_root_was_rw" -eq 1 ] || root_ro
+    return 1
+}
+
+apply_profile_noninteractive()
+{
+    _profile="$1"
+    case "$_profile" in
+        epa2_pd16_m80|stock) ;;
+        *)
+            printf '__PARROTLAB_RF_PROFILE__=ERROR:UNSUPPORTED_PROFILE\n' >&2
+            return 2
+            ;;
+    esac
+
+    [ -f "$ACTIVE_NVM" ] || {
+        printf '__PARROTLAB_RF_PROFILE__=ERROR:ACTIVE_NVM_MISSING\n' >&2
+        return 1
+    }
+    mkdir -p "$BACKUP_DIR" 2>/dev/null || {
+        printf '__PARROTLAB_RF_PROFILE__=ERROR:BACKUP_DIRECTORY\n' >&2
+        return 1
+    }
+
+    STAGE_FILE="/tmp/parrot_rf_lab.$$.nvm"
+    cp "$ACTIVE_NVM" "$STAGE_FILE" || {
+        printf '__PARROTLAB_RF_PROFILE__=ERROR:STAGE_COPY\n' >&2
+        return 1
+    }
+
+    _baseline_path="${BACKUP_DIR}/${DEVICE}-parrotlab-original.nvm"
+    _restore_source="device-stock"
+    if [ "$_profile" = "epa2_pd16_m80" ]; then
+        # Preserve the first unmodified file seen by the guided workflow. If
+        # the tested profile is already active, do not mislabel it as stock.
+        if [ ! -s "$_baseline_path" ] &&
+           { [ "$(nvm_get epagain2g "$ACTIVE_NVM")" != "2" ] ||
+             [ "$(nvm_get pdgain2g "$ACTIVE_NVM")" != "16" ] ||
+             [ "$(nvm_get maxp2ga0 "$ACTIVE_NVM")" != "80" ] ||
+             [ "$(nvm_get maxp2ga1 "$ACTIVE_NVM")" != "80" ]; }; then
+            cp -p "$ACTIVE_NVM" "$_baseline_path" 2>/dev/null || cp "$ACTIVE_NVM" "$_baseline_path" || {
+                printf '__PARROTLAB_RF_PROFILE__=ERROR:BASELINE_BACKUP\n' >&2
+                return 1
+            }
+            sync
+        fi
+        stage_preset epa2_pd16_m80 || {
+            printf '__PARROTLAB_RF_PROFILE__=ERROR:STAGE_PROFILE\n' >&2
+            return 1
+        }
+    elif [ -s "$_baseline_path" ]; then
+        cp "$_baseline_path" "$STAGE_FILE" || {
+            printf '__PARROTLAB_RF_PROFILE__=ERROR:BASELINE_READ\n' >&2
+            return 1
+        }
+        if ! validate_stage; then
+            printf '__PARROTLAB_RF_PROFILE__=ERROR:BASELINE_IDENTITY\n' >&2
+            return 1
+        fi
+        _restore_source="preserved-original"
+    else
+        stage_preset stock || {
+            printf '__PARROTLAB_RF_PROFILE__=ERROR:STAGE_STOCK\n' >&2
+            return 1
+        }
+    fi
+
+    RF_LAB_NONINTERACTIVE=1
+    export RF_LAB_NONINTERACTIVE
+    if apply_stage; then
+        if [ "$_profile" = "epa2_pd16_m80" ]; then
+            printf '__PARROTLAB_RF_PROFILE__=OK:%s:ENABLED:epa2_pd16_m80\n' "$DEVICE"
+        else
+            printf '__PARROTLAB_RF_PROFILE__=OK:%s:DISABLED:%s\n' "$DEVICE" "$_restore_source"
+        fi
+        return 0
+    fi
+    printf '__PARROTLAB_RF_PROFILE__=ERROR:APPLY_FAILED\n' >&2
     return 1
 }
 
@@ -1263,12 +1347,13 @@ usage()
 {
     printf '%s\n' \
         "Parrot RF Lab ${VERSION}" \
-        "Usage: $0 [menu|monitor|log LABEL|snapshot|export|config|help|self-test]" \
+        "Usage: $0 [menu|monitor|log LABEL|snapshot|export|config|apply-profile PROFILE|help|self-test]" \
         "" \
         "Environment:" \
         "  RF_LAB_INTERVAL=N      sample interval in whole seconds (default 1)" \
         "  RF_LAB_PEER=MAC        force peer MAC" \
         "  RF_LAB_DEVICE=auto|bebop2|sc2" \
+        "  apply-profile accepts epa2_pd16_m80 or stock (non-interactive)" \
         "  NO_COLOR=1             disable ANSI color" \
         "  RF_LAB_NO_CLEAR=1      do not clear screen between samples"
 }
@@ -1306,6 +1391,7 @@ case "${1:-menu}" in
     snapshot) snapshot ;;
     export) export_snapshot ;;
     config) config_menu ;;
+    apply-profile) apply_profile_noninteractive "${2:-}" ;;
     help) parameter_help ;;
     *) usage; exit 2 ;;
 esac

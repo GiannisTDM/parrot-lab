@@ -43,8 +43,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         controller?.uploadRFModSuiteToSkyController2()
     }
 
+    @objc func configureRFPowerMod(_ sender: Any?) {
+        controller?.configureRFPowerMod()
+    }
+
+    @objc func selectVideoEnhancement(_ sender: Any?) {
+        guard let selectedItem = sender as? NSMenuItem else { return }
+        controller?.setVideoEnhancement(rawValue: selectedItem.tag)
+        if let items = selectedItem.menu?.items {
+            for item in items where item.action == #selector(AppDelegate.selectVideoEnhancement(_:)) {
+                item.state = item === selectedItem ? .on : .off
+            }
+        }
+    }
+
     @objc func installSC2DriverPatch(_ sender: Any?) {
         controller?.installSC2DriverPatch()
+    }
+
+    @objc func findSC2HostThroughBebop(_ sender: Any?) {
+        controller?.findSC2HostThroughBebop()
+    }
+
+    @objc func findSC2USBHost(_ sender: Any?) {
+        controller?.findSC2USBHost()
     }
 
     func applicationWillTerminate(_ notification: Notification) {

@@ -5,20 +5,71 @@ import CoreMedia
 import QuartzCore
 import VideoToolbox
 
+struct VideoPipelineStats: Equatable {
+    let decodedFPS: Double
+    let displayRefreshFPS: Double
+}
+
+enum VideoEnhancementPreset: Int, CaseIterable {
+    case off
+    case denoise
+    case clarity
+    case lowLight
+    case upscale2x
+    case upscaleClarity2x
+
+    var menuTitle: String {
+        switch self {
+        case .off: return "Off · Source Image"
+        case .denoise: return "Denoise"
+        case .clarity: return "Clarity"
+        case .lowLight: return "Low-Light Cleanup"
+        case .upscale2x: return "High-Quality 2× Upscale"
+        case .upscaleClarity2x: return "2× Upscale + Clarity"
+        }
+    }
+
+    var statusLabel: String {
+        switch self {
+        case .off: return "OFF"
+        case .denoise: return "DENOISE"
+        case .clarity: return "CLARITY"
+        case .lowLight: return "LOW LIGHT"
+        case .upscale2x: return "2X UPSCALE"
+        case .upscaleClarity2x: return "2X + CLARITY"
+        }
+    }
+}
+
 final class H264VideoView: NSView {
     var onDebug: ((String) -> Void)?
     var onFormat: ((Int, Int) -> Void)?
     var onMetadataPresence: ((VideoMetadataPresence) -> Void)?
     var onFrameReady: (() -> Void)?
+    var onPipelineStats: ((VideoPipelineStats) -> Void)?
     var receiveMode: VideoReceiveMode = .compatibility {
         didSet {
             guard receiveMode != oldValue else { return }
             reset()
         }
     }
+    var enhancementPreset: VideoEnhancementPreset {
+        get {
+            enhancementLock.lock()
+            defer { enhancementLock.unlock() }
+            return storedEnhancementPreset
+        }
+        set {
+            enhancementLock.lock()
+            storedEnhancementPreset = newValue
+            enhancementLock.unlock()
+        }
+    }
     private let videoLayer = CALayer()
     private let ciContext = CIContext(options: [.cacheIntermediates: false])
     private let softwareColorSpace = CGColorSpaceCreateDeviceRGB()
+    private let enhancementLock = NSLock()
+    private var storedEnhancementPreset = VideoEnhancementPreset.off
     private var formatDescription: CMVideoFormatDescription?
     private var decompressionSession: VTDecompressionSession?
     private var softwareDecoder: FFmpegVideoDecoder?
@@ -37,6 +88,10 @@ final class H264VideoView: NSView {
     private let hardwareFrameLock = NSLock()
     private var pendingHardwareFrame: CGImage?
     private var hardwareFrameDeliveryScheduled = false
+    private let frameRateLock = NSLock()
+    private var decodedFramesInWindow = 0
+    private var displayedFramesInWindow = 0
+    private var frameRateWindowStarted = Date()
 
     private static let legacyFrameInfoUUID = Data([
         0x97, 0x77, 0x08, 0x83, 0xc8, 0xd3, 0x40, 0x2e,
@@ -62,7 +117,6 @@ final class H264VideoView: NSView {
 
     func display(accessUnit: H264AccessUnit) {
         let nalUnits = accessUnit.nalUnits
-        captureAnnexB(nalUnits)
         captureRTPHeaderExtensions(accessUnit)
         observeMetadata(in: accessUnit)
         for nalu in nalUnits {
@@ -73,6 +127,7 @@ final class H264VideoView: NSView {
             default: break
             }
         }
+        captureAnnexB(nalUnits)
         if formatDescription == nil { rebuildFormatDescription() }
         guard let formatDescription else { return }
         softwareDecoder?.feed(nalUnits: nalUnits)
@@ -186,6 +241,11 @@ final class H264VideoView: NSView {
         try? extensionDumpHandle?.close()
         extensionDumpHandle = nil
         dumpedExtensionAccessUnits = 0
+        frameRateLock.lock()
+        decodedFramesInWindow = 0
+        displayedFramesInWindow = 0
+        frameRateWindowStarted = Date()
+        frameRateLock.unlock()
     }
 
     private func rebuildFormatDescription() {
@@ -265,6 +325,9 @@ final class H264VideoView: NSView {
         if let decoder = FFmpegVideoDecoder(width: width, height: height) {
             decoder.onDebug = { [weak self] message in
                 DispatchQueue.main.async { self?.onDebug?(message) }
+            }
+            decoder.onDecodedFrame = { [weak self] in
+                self?.recordFrameRate(decoded: 1, displayed: 0)
             }
             decoder.onFrame = { [weak self] data, width, height in
                 self?.handleSoftwareFrame(data: data, width: width, height: height)
@@ -346,9 +409,10 @@ final class H264VideoView: NSView {
             }
             return
         }
+        recordFrameRate(decoded: 1, displayed: 0)
         let cgImage = autoreleasepool { () -> CGImage? in
             let image = CIImage(cvImageBuffer: imageBuffer)
-            return ciContext.createCGImage(image, from: image.extent)
+            return renderEnhanced(image)
         }
         guard let cgImage else { return }
         enqueueLatestHardwareFrame(cgImage)
@@ -380,6 +444,7 @@ final class H264VideoView: NSView {
             CATransaction.setDisableActions(true)
             videoLayer.contents = image
             CATransaction.commit()
+            recordFrameRate(decoded: 0, displayed: 1)
             if !reportedFirstDecodedFrame {
                 reportedFirstDecodedFrame = true
                 onDebug?("First decoded video frame displayed: \(image.width)x\(image.height)")
@@ -417,19 +482,63 @@ final class H264VideoView: NSView {
                     intent: .defaultIntent
                   ) else { return }
 
+            let displayedImage: CGImage
+            if enhancementPreset == .off {
+                displayedImage = image
+            } else {
+                displayedImage = renderEnhanced(CIImage(cgImage: image)) ?? image
+            }
+
             // Commit each replacement explicitly so Core Animation does not
             // accumulate full-resolution CGImages in an implicit transaction.
             CATransaction.begin()
             CATransaction.setDisableActions(true)
-            latestDecodedFrame = image
-            videoLayer.contents = image
+            latestDecodedFrame = displayedImage
+            videoLayer.contents = displayedImage
             CATransaction.commit()
+            recordFrameRate(decoded: 0, displayed: 1)
             if !reportedFirstDecodedFrame {
                 reportedFirstDecodedFrame = true
-                onDebug?("First software-decoded video frame displayed: \(width)x\(height)")
+                onDebug?("First software-decoded video frame displayed: \(displayedImage.width)x\(displayedImage.height)")
                 onFrameReady?()
             }
         }
+    }
+
+    private func renderEnhanced(_ source: CIImage) -> CGImage? {
+        let preset = enhancementPreset
+        var image = source
+
+        func applying(_ name: String, values: [String: Any]) {
+            guard let filter = CIFilter(name: name) else { return }
+            filter.setValue(image, forKey: kCIInputImageKey)
+            for (key, value) in values { filter.setValue(value, forKey: key) }
+            if let output = filter.outputImage { image = output }
+        }
+
+        switch preset {
+        case .off:
+            break
+        case .denoise:
+            applying("CINoiseReduction", values: ["inputNoiseLevel": 0.025, "inputSharpness": 0.35])
+        case .clarity:
+            applying("CINoiseReduction", values: ["inputNoiseLevel": 0.012, "inputSharpness": 0.45])
+            applying("CISharpenLuminance", values: [kCIInputSharpnessKey: 0.38, kCIInputRadiusKey: 1.1])
+            applying("CIColorControls", values: [kCIInputContrastKey: 1.045, kCIInputSaturationKey: 1.02])
+        case .lowLight:
+            applying("CINoiseReduction", values: ["inputNoiseLevel": 0.035, "inputSharpness": 0.3])
+            applying("CIHighlightShadowAdjust", values: ["inputShadowAmount": 0.42, "inputHighlightAmount": 0.82])
+            applying("CIGammaAdjust", values: ["inputPower": 0.88])
+            applying("CISharpenLuminance", values: [kCIInputSharpnessKey: 0.22, kCIInputRadiusKey: 0.9])
+        case .upscale2x:
+            applying("CILanczosScaleTransform", values: [kCIInputScaleKey: 2.0, kCIInputAspectRatioKey: 1.0])
+        case .upscaleClarity2x:
+            applying("CINoiseReduction", values: ["inputNoiseLevel": 0.012, "inputSharpness": 0.45])
+            applying("CISharpenLuminance", values: [kCIInputSharpnessKey: 0.34, kCIInputRadiusKey: 1.0])
+            applying("CILanczosScaleTransform", values: [kCIInputScaleKey: 2.0, kCIInputAspectRatioKey: 1.0])
+        }
+
+        return ciContext.createCGImage(image, from: image.extent.integral)
     }
 
     /// Returns the most recently decoded source frame without the HUD overlay.
@@ -439,16 +548,41 @@ final class H264VideoView: NSView {
         return latestDecodedFrame
     }
 
+    private func recordFrameRate(decoded: Int, displayed: Int) {
+        frameRateLock.lock()
+        decodedFramesInWindow += decoded
+        displayedFramesInWindow += displayed
+        let elapsed = Date().timeIntervalSince(frameRateWindowStarted)
+        guard elapsed >= 1.0 else {
+            frameRateLock.unlock()
+            return
+        }
+        let stats = VideoPipelineStats(
+            decodedFPS: Double(decodedFramesInWindow) / elapsed,
+            displayRefreshFPS: Double(displayedFramesInWindow) / elapsed
+        )
+        decodedFramesInWindow = 0
+        displayedFramesInWindow = 0
+        frameRateWindowStarted = Date()
+        frameRateLock.unlock()
+        DispatchQueue.main.async { [weak self] in self?.onPipelineStats?(stats) }
+    }
+
     private func captureAnnexB(_ nalUnits: [Data]) {
         guard dumpedAccessUnits < 300 else { return }
         let url = URL(fileURLWithPath: "/tmp/parrotlab-capture.h264")
+        let startCode = Data([0, 0, 0, 1])
         if dumpHandle == nil {
+            guard let sps, let pps else { return }
             FileManager.default.createFile(atPath: url.path, contents: nil)
             dumpHandle = try? FileHandle(forWritingTo: url)
             try? dumpHandle?.truncate(atOffset: 0)
+            for parameterSet in [sps, pps] where !nalUnits.contains(parameterSet) {
+                try? dumpHandle?.write(contentsOf: startCode)
+                try? dumpHandle?.write(contentsOf: parameterSet)
+            }
             onDebug?("Capturing 300 H.264 access units to \(url.path)")
         }
-        let startCode = Data([0, 0, 0, 1])
         for nalu in nalUnits {
             try? dumpHandle?.write(contentsOf: startCode)
             try? dumpHandle?.write(contentsOf: nalu)

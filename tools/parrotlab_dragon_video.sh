@@ -7,7 +7,8 @@ set -eu
 PATH=/usr/bin:/bin:/usr/sbin:/sbin
 export PATH
 
-# Parrot Lab's non-persistent Dragon launcher for Bebop 2 firmware 4.4.2.
+# Parrot Lab's non-persistent Dragon launcher for supported Bebop 2 firmware
+# 4.4.2 and 4.7.1.
 # Install this file and the optional patched binary in /data/ftp/internal_000.
 # It never changes persist.dragon-prog.post_cmd or overwrites /usr/bin files.
 #
@@ -66,7 +67,7 @@ usage()
 Usage:
   parrotlab_dragon_video.sh status
   parrotlab_dragon_video.sh apply stock480|stock720|lab1080 BITRATE_KBPS adaptive|constant LANDED
-  parrotlab_dragon_video.sh custom BASE64_ARGUMENTS LANDED
+  parrotlab_dragon_video.sh custom 'DRAGON ARGUMENTS' LANDED
   parrotlab_dragon_video.sh restore LANDED
 
 Applying, starting custom Dragon, or restoring queues a detached worker before
@@ -159,15 +160,9 @@ validate_profile()
     esac
 }
 
-validate_custom_payload()
+validate_custom_arguments()
 {
-    encoded_arguments=$1
-    case "$encoded_arguments" in
-        ''|*[!A-Za-z0-9+/=]*) fail "INVALID_CUSTOM_ENCODING" ;;
-    esac
-    command -v base64 >/dev/null 2>&1 || fail "BASE64_NOT_AVAILABLE"
-    custom_arguments=$(printf '%s' "$encoded_arguments" | base64 -d 2>/dev/null) || \
-        fail "INVALID_CUSTOM_ENCODING"
+    custom_arguments=$1
     [ -n "$custom_arguments" ] || fail "CUSTOM_ARGUMENTS_EMPTY"
 
     argument_bytes=$(printf '%s' "$custom_arguments" | wc -c | tr -d ' ')
@@ -226,7 +221,7 @@ start_profile()
 
 start_custom()
 {
-    validate_custom_payload "$1"
+    validate_custom_arguments "$1"
     stop_dragon
     : > "$LOG_FILE"
 
@@ -294,7 +289,7 @@ case "${1:-}" in
         ;;
     custom)
         [ "$#" -eq 3 ] || { usage; exit 2; }
-        validate_custom_payload "$2"
+        validate_custom_arguments "$2"
         require_landed_confirmation "$3"
         queue_worker _worker_custom "$2" "$WORKER_TOKEN"
         record_state "queued|custom|$queued_worker_pid"
