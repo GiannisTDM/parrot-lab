@@ -3,8 +3,11 @@ import Network
 
 struct RTPVideoStats: Equatable {
     var packets: UInt64 = 0
+    var duplicatePackets: UInt64 = 0
     var packetsLost: UInt64 = 0
     var bitrateKbps: Int = 0
+    var encodedAUFPS: Double = 0
+    var uniqueTimestampFPS: Double = 0
     var jitterMs: Double = 0
 }
 
@@ -29,9 +32,15 @@ final class RTPH264Receiver {
     private var assembler = H264RTPAssembler()
     private var stats = RTPVideoStats()
     private var previousSequence: UInt16?
+    private var recentSequences = Set<UInt16>()
+    private var recentSequenceOrder: [UInt16] = []
+    private var recentSequenceHead = 0
+    private var lastCompletedTimestamp: UInt32?
     private var previousTransit: Double?
     private var jitterSeconds = 0.0
     private var bytesInWindow = 0
+    private var completedAUTimestampsInWindow = Set<UInt32>()
+    private var vclTimestampsInWindow = Set<UInt32>()
     private var windowStarted = Date()
     private var pendingAccessUnit: H264AccessUnit?
     private var accessUnitDeliveryScheduled = false
@@ -54,6 +63,12 @@ final class RTPH264Receiver {
             guard let self else { return }
             self.senderConnection?.cancel()
             self.senderConnection = connection
+            self.assembler.reset()
+            self.previousSequence = nil
+            self.recentSequences.removeAll(keepingCapacity: true)
+            self.recentSequenceOrder.removeAll(keepingCapacity: true)
+            self.recentSequenceHead = 0
+            self.lastCompletedTimestamp = nil
             self.debug("RTP sender connected: \(connection.endpoint)")
             connection.start(queue: self.queue)
             self.receive(on: connection)
@@ -69,9 +84,15 @@ final class RTPH264Receiver {
         assembler.reset()
         stats = RTPVideoStats()
         previousSequence = nil
+        recentSequences.removeAll(keepingCapacity: false)
+        recentSequenceOrder.removeAll(keepingCapacity: false)
+        recentSequenceHead = 0
+        lastCompletedTimestamp = nil
         previousTransit = nil
         jitterSeconds = 0
         bytesInWindow = 0
+        completedAUTimestampsInWindow.removeAll(keepingCapacity: false)
+        vclTimestampsInWindow.removeAll(keepingCapacity: false)
         windowStarted = Date()
         deliveryLock.lock()
         pendingAccessUnit = nil
@@ -80,7 +101,7 @@ final class RTPH264Receiver {
 
     private func receive(on connection: NWConnection) {
         connection.receiveMessage { [weak self, weak connection] data, _, _, error in
-            guard let self, let connection else { return }
+            guard let self, let connection, self.senderConnection === connection else { return }
             if let data { self.consume(packetData: data) }
             if let error {
                 self.debug("RTP receive error: \(error.localizedDescription)")
@@ -94,6 +115,13 @@ final class RTPH264Receiver {
         guard let packet = RTPPacket(data: packetData), packet.payloadType == 96 else { return }
         stats.packets += 1
         bytesInWindow += packetData.count
+        guard remember(sequence: packet.sequence) else {
+            stats.duplicatePackets += 1
+            return
+        }
+        if Self.payloadContainsVCL(packet.payload) {
+            vclTimestampsInWindow.insert(packet.timestamp)
+        }
 
         if let previousSequence {
             let expected = previousSequence &+ 1
@@ -114,6 +142,16 @@ final class RTPH264Receiver {
         stats.jitterMs = jitterSeconds * 1_000.0
 
         for accessUnit in assembler.consume(packet: packet) {
+            // ARStream2 may retransmit a completed timestamp after its marker
+            // packet. Never submit the same coded picture twice.
+            guard accessUnit.rtpTimestamp != lastCompletedTimestamp else { continue }
+            lastCompletedTimestamp = accessUnit.rtpTimestamp
+            if accessUnit.nalUnits.contains(where: { nalUnit in
+                guard let firstByte = nalUnit.first else { return false }
+                return (1...5).contains(Int(firstByte & 0x1f))
+            }) {
+                completedAUTimestampsInWindow.insert(accessUnit.rtpTimestamp)
+            }
             onCompleteAccessUnit?(accessUnit)
             enqueueLatestAccessUnit(accessUnit)
         }
@@ -121,15 +159,56 @@ final class RTPH264Receiver {
         let elapsed = Date().timeIntervalSince(windowStarted)
         if elapsed >= 1.0 {
             stats.bitrateKbps = Int((Double(bytesInWindow) * 8.0 / 1_000.0 / elapsed).rounded())
+            stats.encodedAUFPS = Double(completedAUTimestampsInWindow.count) / elapsed
+            stats.uniqueTimestampFPS = Double(vclTimestampsInWindow.count) / elapsed
             bytesInWindow = 0
+            completedAUTimestampsInWindow.removeAll(keepingCapacity: true)
+            vclTimestampsInWindow.removeAll(keepingCapacity: true)
             windowStarted = Date()
             let current = stats
             DispatchQueue.main.async { [weak self] in self?.onStats?(current) }
         }
     }
 
+    private func remember(sequence: UInt16) -> Bool {
+        guard recentSequences.insert(sequence).inserted else { return false }
+        recentSequenceOrder.append(sequence)
+        let maximumRememberedSequences = 4_096
+        if recentSequenceOrder.count - recentSequenceHead > maximumRememberedSequences {
+            recentSequences.remove(recentSequenceOrder[recentSequenceHead])
+            recentSequenceHead += 1
+            if recentSequenceHead >= maximumRememberedSequences {
+                recentSequenceOrder.removeFirst(recentSequenceHead)
+                recentSequenceHead = 0
+            }
+        }
+        return true
+    }
+
     private func debug(_ message: String) {
         DispatchQueue.main.async { [weak self] in self?.onDebug?(message) }
+    }
+
+    private static func payloadContainsVCL(_ payload: Data) -> Bool {
+        guard let firstByte = payload.first else { return false }
+        let nalType = Int(firstByte & 0x1f)
+        if (1...5).contains(nalType) { return true }
+
+        let bytes = [UInt8](payload)
+        if nalType == 28, bytes.count >= 2 { // FU-A
+            return (1...5).contains(Int(bytes[1] & 0x1f))
+        }
+        if nalType == 24 { // STAP-A
+            var offset = 1
+            while offset + 2 <= bytes.count {
+                let length = Int(bytes[offset]) << 8 | Int(bytes[offset + 1])
+                offset += 2
+                guard length > 0, offset + length <= bytes.count else { return false }
+                if (1...5).contains(Int(bytes[offset] & 0x1f)) { return true }
+                offset += length
+            }
+        }
+        return false
     }
 
     // A live view should never accumulate stale compressed frames while the UI
@@ -165,6 +244,12 @@ final class RTPH264Receiver {
     }
 
     static func assemblySelfTest() -> Bool {
+        guard payloadContainsVCL(Data([0x61, 0x01])),
+              !payloadContainsVCL(Data([0x06, 0x05])),
+              payloadContainsVCL(Data([0x7c, 0x81, 0xaa])),
+              payloadContainsVCL(Data([0x78, 0x00, 0x01, 0x06, 0x00, 0x01, 0x61])) else {
+            return false
+        }
         var assembler = H264RTPAssembler()
         guard let single = RTPPacket(data: makeTestPacket(sequence: 1, timestamp: 90_000, marker: true, payload: Data([0x65, 0x11, 0x22]))),
               assembler.consume(packet: single) == [H264AccessUnit(
@@ -200,6 +285,23 @@ final class RTPH264Receiver {
         )) else { return false }
         let expectedExtension = Data([0xbe, 0xde, 0x00, 0x01]) + extensionPayload
         guard assembler.consume(packet: extended).first?.rtpHeaderExtensions == [expectedExtension] else { return false }
+
+        // A relay can retransmit the same slice under a new sequence number.
+        assembler.reset()
+        guard let duplicateA = RTPPacket(data: makeTestPacket(
+            sequence: 7,
+            timestamp: 450_000,
+            marker: false,
+            payload: Data([0x61, 0x66])
+        )), let duplicateB = RTPPacket(data: makeTestPacket(
+            sequence: 8,
+            timestamp: 450_000,
+            marker: true,
+            payload: Data([0x61, 0x66])
+        )), assembler.consume(packet: duplicateA).isEmpty,
+            assembler.consume(packet: duplicateB).first?.nalUnits == [Data([0x61, 0x66])] else {
+            return false
+        }
         return true
     }
 
@@ -273,6 +375,7 @@ private struct RTPPacket {
 private struct H264RTPAssembler {
     private var timestamp: UInt32?
     private var nalUnits: [Data] = []
+    private var seenNALUnits = Set<Data>()
     private var fragmentedNAL: Data?
     private var headerExtensions: [Data] = []
     private var headerExtensionBytes = 0
@@ -280,6 +383,7 @@ private struct H264RTPAssembler {
     mutating func reset() {
         timestamp = nil
         nalUnits.removeAll(keepingCapacity: false)
+        seenNALUnits.removeAll(keepingCapacity: false)
         fragmentedNAL = nil
         headerExtensions.removeAll(keepingCapacity: false)
         headerExtensionBytes = 0
@@ -305,14 +409,14 @@ private struct H264RTPAssembler {
 
         switch type {
         case 1...23:
-            nalUnits.append(packet.payload)
+            appendNALIfNew(packet.payload)
         case 24:
             var offset = 1
             while offset + 2 <= bytes.count {
                 let length = Int(UInt16(bytes[offset]) << 8 | UInt16(bytes[offset + 1]))
                 offset += 2
                 guard length > 0, offset + length <= bytes.count else { break }
-                nalUnits.append(packet.payload.subdata(in: offset..<(offset + length)))
+                appendNALIfNew(packet.payload.subdata(in: offset..<(offset + length)))
                 offset += length
             }
         case 28:
@@ -327,7 +431,7 @@ private struct H264RTPAssembler {
                 fragmentedNAL?.append(packet.payload.dropFirst(2))
             }
             if end, let complete = fragmentedNAL {
-                nalUnits.append(complete)
+                appendNALIfNew(complete)
                 fragmentedNAL = nil
             }
         default:
@@ -340,9 +444,15 @@ private struct H264RTPAssembler {
         return completed
     }
 
+    private mutating func appendNALIfNew(_ nalUnit: Data) {
+        guard seenNALUnits.insert(nalUnit).inserted else { return }
+        nalUnits.append(nalUnit)
+    }
+
     private mutating func finishAccessUnit() -> H264AccessUnit? {
         guard let timestamp, !nalUnits.isEmpty else {
             nalUnits.removeAll(keepingCapacity: true)
+            seenNALUnits.removeAll(keepingCapacity: true)
             fragmentedNAL = nil
             headerExtensions.removeAll(keepingCapacity: true)
             headerExtensionBytes = 0
@@ -355,6 +465,7 @@ private struct H264RTPAssembler {
             rtpHeaderExtensions: headerExtensions
         )
         nalUnits.removeAll(keepingCapacity: true)
+        seenNALUnits.removeAll(keepingCapacity: true)
         fragmentedNAL = nil
         headerExtensions.removeAll(keepingCapacity: true)
         headerExtensionBytes = 0

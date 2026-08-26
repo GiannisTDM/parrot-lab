@@ -78,10 +78,20 @@ enum ParrotLabSelfTest {
             return 1
         }
 
-        guard VideoReceiveMode.selfTest(), DragonVideoProfile.selfTest(),
-              BebopToolInstaller.selfTest(),
-              H264VideoView.metadataSelfTest() else {
-            fputs("Self-test failed: video/Dragon mode or FrameInfo metadata\n", stderr)
+        guard VideoReceiveMode.selfTest() else {
+            fputs("Self-test failed: video receive mode\n", stderr)
+            return 1
+        }
+        guard DragonVideoProfile.selfTest() else {
+            fputs("Self-test failed: Dragon profile/custom launch\n", stderr)
+            return 1
+        }
+        guard BebopToolInstaller.selfTest() else {
+            fputs("Self-test failed: bundled device tools\n", stderr)
+            return 1
+        }
+        guard H264VideoView.metadataSelfTest() else {
+            fputs("Self-test failed: FrameInfo metadata\n", stderr)
             return 1
         }
 
@@ -104,7 +114,9 @@ enum ParrotLabSelfTest {
         }
 
         guard MediaFileNamer.selfTest(), StillImageWriter.selfTest(),
-              H264StreamRecorder.selfTest() else {
+              H264StreamRecorder.selfTest(), ARSDKPhotoCaptureSelfTest.run(),
+              ARSDKTelemetryReducer.selfTest(),
+              DroneMediaFTP.selfTest() else {
             fputs("Self-test failed: local media capture\n", stderr)
             return 1
         }

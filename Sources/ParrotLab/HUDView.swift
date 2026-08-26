@@ -173,7 +173,7 @@ final class HUDOverlayView: NSView {
     private func drawVideoPanel() {
         let y: CGFloat = 22
         let text = "RTP \(snapshot.videoBitrateKbps.map { "\($0) kbps" } ?? "waiting")   " +
-            "PKT \(snapshot.videoPackets)   LOST \(snapshot.videoPacketsLost)   " +
+            "PKT \(snapshot.videoPackets)   DUP \(snapshot.videoDuplicatePackets)   LOST \(snapshot.videoPacketsLost)   " +
             "JIT \(snapshot.videoJitterMs.map { String(format: "%.1f ms", $0) } ?? "—")"
         drawText(text, at: CGPoint(x: 18, y: y), font: mono(11), color: NSColor.white.withAlphaComponent(0.78))
     }

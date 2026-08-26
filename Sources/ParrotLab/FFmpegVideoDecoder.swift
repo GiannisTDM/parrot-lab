@@ -2,6 +2,9 @@ import Foundation
 
 final class FFmpegVideoDecoder {
     var onFrame: ((Data, Int, Int) -> Void)?
+    /// Fired for every complete raw frame emitted by FFmpeg, before the
+    /// latest-frame slot can coalesce frames waiting for the main thread.
+    var onDecodedFrame: (() -> Void)?
     var onDebug: ((String) -> Void)?
 
     private let width: Int
@@ -50,6 +53,10 @@ final class FFmpegVideoDecoder {
             onDebug?("Could not start FFmpeg decoder: \(error.localizedDescription)")
             return false
         }
+        // The child owns duplicated copies of these ends after launch. Closing
+        // the unused parent copies lets stdout deliver EOF when FFmpeg exits.
+        try? inputPipe.fileHandleForReading.close()
+        try? outputPipe.fileHandleForWriting.close()
         stateLock.lock()
         running = true
         stateLock.unlock()
@@ -93,7 +100,14 @@ final class FFmpegVideoDecoder {
         stateLock.unlock()
         try? inputPipe.fileHandleForWriting.close()
         if process.isRunning { process.terminate() }
-        try? outputPipe.fileHandleForReading.close()
+        // Do not close stdout from underneath readOutput(). FileHandle raises
+        // an Objective-C exception when a blocking read races a close. Queue
+        // the close behind the reader, which will leave after FFmpeg exits and
+        // the pipe reports EOF.
+        let outputHandle = outputPipe.fileHandleForReading
+        readQueue.async {
+            try? outputHandle.close()
+        }
     }
 
     deinit { stop() }
@@ -130,7 +144,13 @@ final class FFmpegVideoDecoder {
                 // happen inside this pool—not immediately before it—or a
                 // long-lived decoder queue can retain hundreds of MB/s of
                 // autoreleased chunks until the stream is stopped.
-                let data = handle.readData(ofLength: 256 * 1_024)
+                let data: Data
+                do {
+                    data = try handle.read(upToCount: 256 * 1_024) ?? Data()
+                } catch {
+                    onDebug?("FFmpeg output ended: \(error.localizedDescription)")
+                    return false
+                }
                 guard !data.isEmpty else { return false }
                 // Never use append/removeFirst as a byte stream here. At
                 // 1080p30 FFmpeg emits about 249 MB/s of RGBA, and Data can
@@ -138,6 +158,7 @@ final class FFmpegVideoDecoder {
                 // count remains small. This assembler owns exactly one fixed
                 // frame buffer and hands completed buffers downstream.
                 for frame in outputAccumulator.append(data) {
+                    onDecodedFrame?()
                     enqueueLatestFrame(frame)
                 }
                 return true

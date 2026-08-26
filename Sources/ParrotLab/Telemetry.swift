@@ -33,6 +33,7 @@ struct TelemetrySnapshot: Equatable {
     var horizontalSpeed: Double?
     var distanceFromHome: Double?
     var satelliteCount: Int?
+    var gpsFixed: Bool?
 
     var sc2BatteryPercent: Int?
     var droneBatteryPercent: Int?
@@ -40,8 +41,12 @@ struct TelemetrySnapshot: Equatable {
     var sc2PowerState: String?
 
     var videoBitrateKbps: Int?
-    var videoFPS: Double?
+    var videoEncodedAUFPS: Double?
+    var videoUniqueTimestampFPS: Double?
+    var videoDecodedFPS: Double?
+    var videoDisplayRefreshFPS: Double?
     var videoPackets: UInt64 = 0
+    var videoDuplicatePackets: UInt64 = 0
     var videoPacketsLost: UInt64 = 0
     var videoJitterMs: Double?
 
@@ -49,6 +54,140 @@ struct TelemetrySnapshot: Equatable {
 
     mutating func markUpdated() {
         updatedAt = Date()
+    }
+}
+
+struct ARSDKTelemetryReducer {
+    private var homePosition: (latitude: Double, longitude: Double)?
+
+    mutating func reset() {
+        homePosition = nil
+    }
+
+    @discardableResult
+    mutating func consume(_ event: ARSDKTelemetryEvent, into snapshot: inout TelemetrySnapshot) -> Bool {
+        switch event {
+        case .droneBattery(let percent):
+            guard (0...100).contains(percent) else { return false }
+            snapshot.droneBatteryPercent = percent
+
+        case .controllerBattery(let percent):
+            if (0...100).contains(percent) {
+                snapshot.sc2BatteryPercent = percent
+            } else if percent == 255 {
+                snapshot.sc2PowerState = "CHARGING"
+            } else {
+                return false
+            }
+
+        case .controllerBatteryState(let rawState):
+            let states = ["CHARGING", "CHARGED", "DISCHARGING", "LOW BATTERY", "CRITICAL BATTERY"]
+            guard Int(rawState) < states.count else { return false }
+            snapshot.sc2PowerState = states[Int(rawState)]
+
+        case .flyingState(let rawState):
+            let states = [
+                "LANDED", "TAKING OFF", "HOVERING", "FLYING", "LANDING",
+                "EMERGENCY", "USER TAKEOFF", "MOTOR RAMPING", "EMERGENCY LANDING"
+            ]
+            guard Int(rawState) < states.count else { return false }
+            snapshot.flightState = states[Int(rawState)]
+
+        case .gpsPosition(let latitude, let longitude):
+            guard latitude.isFinite, longitude.isFinite,
+                  (-90...90).contains(latitude), (-180...180).contains(longitude) else { return false }
+            snapshot.latitude = latitude
+            snapshot.longitude = longitude
+            if homePosition == nil { homePosition = (latitude, longitude) }
+            if let homePosition {
+                snapshot.distanceFromHome = Self.greatCircleDistance(
+                    latitude1: homePosition.latitude,
+                    longitude1: homePosition.longitude,
+                    latitude2: latitude,
+                    longitude2: longitude
+                )
+            }
+
+        case .homePosition(let latitude, let longitude):
+            guard latitude.isFinite, longitude.isFinite,
+                  (-90...90).contains(latitude), (-180...180).contains(longitude) else { return false }
+            homePosition = (latitude, longitude)
+            if let currentLatitude = snapshot.latitude, let currentLongitude = snapshot.longitude {
+                snapshot.distanceFromHome = Self.greatCircleDistance(
+                    latitude1: latitude,
+                    longitude1: longitude,
+                    latitude2: currentLatitude,
+                    longitude2: currentLongitude
+                )
+            }
+
+        case .altitude(let altitude):
+            guard altitude.isFinite, abs(altitude) < 10_000 else { return false }
+            snapshot.altitude = altitude
+
+        case .speed(let north, let east, _):
+            guard north.isFinite, east.isFinite else { return false }
+            snapshot.horizontalSpeed = hypot(Double(north), Double(east))
+
+        case .attitude(let roll, let pitch, let yaw):
+            guard roll.isFinite, pitch.isFinite, yaw.isFinite else { return false }
+            snapshot.roll = Double(roll)
+            snapshot.pitch = Double(pitch)
+            snapshot.yaw = Double(yaw)
+
+        case .gpsFix(let fixed):
+            snapshot.gpsFixed = fixed
+
+        case .satelliteCount(let count):
+            snapshot.satelliteCount = count
+        }
+        snapshot.markUpdated()
+        return true
+    }
+
+    private static func greatCircleDistance(
+        latitude1: Double,
+        longitude1: Double,
+        latitude2: Double,
+        longitude2: Double
+    ) -> Double {
+        let radians = Double.pi / 180
+        let deltaLatitude = (latitude2 - latitude1) * radians
+        let deltaLongitude = (longitude2 - longitude1) * radians
+        let a = pow(sin(deltaLatitude / 2), 2) +
+            cos(latitude1 * radians) * cos(latitude2 * radians) *
+            pow(sin(deltaLongitude / 2), 2)
+        return 6_371_000 * 2 * atan2(sqrt(a), sqrt(max(0, 1 - a)))
+    }
+
+    static func selfTest() -> Bool {
+        var reducer = ARSDKTelemetryReducer()
+        var snapshot = TelemetrySnapshot()
+        guard reducer.consume(.droneBattery(74), into: &snapshot),
+              reducer.consume(.controllerBattery(83), into: &snapshot),
+              reducer.consume(.controllerBatteryState(2), into: &snapshot),
+              reducer.consume(.flyingState(0), into: &snapshot),
+              reducer.consume(.gpsFix(true), into: &snapshot),
+              reducer.consume(.satelliteCount(12), into: &snapshot),
+              reducer.consume(.homePosition(latitude: 38.1, longitude: 21.7), into: &snapshot),
+              reducer.consume(.gpsPosition(latitude: 38.1, longitude: 21.7), into: &snapshot),
+              reducer.consume(.gpsPosition(latitude: 38.101, longitude: 21.7), into: &snapshot),
+              reducer.consume(.altitude(14.5), into: &snapshot),
+              reducer.consume(.speed(north: 3, east: 4, down: 0), into: &snapshot),
+              reducer.consume(.attitude(roll: 0.1, pitch: -0.2, yaw: 1.5), into: &snapshot),
+              snapshot.droneBatteryPercent == 74,
+              snapshot.sc2BatteryPercent == 83,
+              snapshot.sc2PowerState == "DISCHARGING",
+              snapshot.flightState == "LANDED",
+              snapshot.gpsFixed == true,
+              snapshot.satelliteCount == 12,
+              snapshot.altitude == 14.5,
+              snapshot.horizontalSpeed == 5,
+              snapshot.roll != nil,
+              let distance = snapshot.distanceFromHome,
+              (110...112).contains(distance) else { return false }
+        return !reducer.consume(.droneBattery(255), into: &snapshot) &&
+            !reducer.consume(.gpsPosition(latitude: 500, longitude: 500), into: &snapshot)
     }
 }
 

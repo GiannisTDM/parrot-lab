@@ -5,6 +5,7 @@ enum BebopToolPackage: String {
     case dragonLab
     case persistentTelnet
     case rfModSuite
+    case sc2Discovery
     case sc2DriverPatch
 
     static let ftpHost = "192.168.42.1"
@@ -16,6 +17,7 @@ enum BebopToolPackage: String {
         case .dragonLab: return "Dragon Lab"
         case .persistentTelnet: return "Persistent Bebop Telnet"
         case .rfModSuite: return "RF/MOD Suite"
+        case .sc2Discovery: return "SC2 Address Discovery"
         case .sc2DriverPatch: return "SC2 Driver Patch"
         }
     }
@@ -25,7 +27,7 @@ enum BebopToolPackage: String {
         case .dragonLab:
             return [
                 BebopToolAsset(
-                    sourceRelativePath: "patched/dragon-prog-1080p-mode1-30fps",
+                    sourceRelativePath: "patched/dpd1830",
                     remoteName: "dragon-prog-1080p-mode1-30fps"
                 ),
                 BebopToolAsset(
@@ -45,6 +47,13 @@ enum BebopToolPackage: String {
                 BebopToolAsset(
                     sourceRelativePath: "tools/parrot_rf_lab.sh",
                     remoteName: "parrot_rf_lab.sh"
+                )
+            ]
+        case .sc2Discovery:
+            return [
+                BebopToolAsset(
+                    sourceRelativePath: "tools/parrotlab_find_sc2_ip.sh",
+                    remoteName: "parrotlab_find_sc2_ip.sh"
                 )
             ]
         case .sc2DriverPatch:
@@ -68,6 +77,7 @@ private struct BebopToolAsset {
 }
 
 struct BebopInstalledAsset {
+    let assetName: String
     let remoteName: String
     let byteCount: Int
     let sha256: String
@@ -179,18 +189,21 @@ final class BebopToolInstaller: @unchecked Sendable {
             }
             let sourceSHA256 = Self.hex(SHA256.hash(data: sourceData))
             let sourceMD5 = Self.hex(Insecure.MD5.hash(data: sourceData))
-            let remoteURL = try Self.ftpURL(host: host, remoteName: asset.remoteName)
+            let remoteName = asset.remoteName
+            let remoteURL = try Self.ftpURL(host: host, remoteName: remoteName)
 
-            report("Uploading \(index + 1)/\(package.assets.count): \(asset.remoteName)")
-            try runCurl([
+            let uploadArguments = [
                 "--fail", "--silent", "--show-error", "--ftp-pasv",
                 "--connect-timeout", "8", "--max-time", "180",
                 "--upload-file", localURL.path, remoteURL.absoluteString
-            ])
+            ]
+
+            report("Uploading \(index + 1)/\(package.assets.count): \(asset.remoteName)")
+            try runCurl(uploadArguments)
 
             try checkCancellation()
             report("Verifying \(index + 1)/\(package.assets.count): \(asset.remoteName)")
-            let verificationURL = temporaryDirectory.appendingPathComponent(asset.remoteName)
+            let verificationURL = temporaryDirectory.appendingPathComponent(remoteName)
             try runCurl([
                 "--fail", "--silent", "--show-error", "--ftp-pasv",
                 "--connect-timeout", "8", "--max-time", "180",
@@ -202,7 +215,8 @@ final class BebopToolInstaller: @unchecked Sendable {
                 throw BebopToolInstallerError.verificationFailed(asset.remoteName)
             }
             installed.append(BebopInstalledAsset(
-                remoteName: asset.remoteName,
+                assetName: asset.remoteName,
+                remoteName: remoteName,
                 byteCount: sourceData.count,
                 sha256: sourceSHA256,
                 md5: sourceMD5
@@ -303,6 +317,7 @@ final class BebopToolInstaller: @unchecked Sendable {
         return BebopToolPackage.dragonLab.assets.allSatisfy { (try? resolve($0)) != nil } &&
             BebopToolPackage.persistentTelnet.assets.allSatisfy { (try? resolve($0)) != nil } &&
             BebopToolPackage.rfModSuite.assets.allSatisfy { (try? resolve($0)) != nil } &&
+            BebopToolPackage.sc2Discovery.assets.allSatisfy { (try? resolve($0)) != nil } &&
             BebopToolPackage.sc2DriverPatch.assets.allSatisfy { (try? resolve($0)) != nil }
     }
 }

@@ -16,6 +16,11 @@ enum PreviewRenderer {
         snapshot.flightState = "FLYING"
         snapshot.altitude = 19.1
         snapshot.distanceFromHome = 47
+        snapshot.horizontalSpeed = 6.4
+        snapshot.satelliteCount = 14
+        snapshot.gpsFixed = true
+        snapshot.latitude = 38.246639
+        snapshot.longitude = 21.734574
         snapshot.roll = -0.063
         snapshot.pitch = 0.035
         snapshot.yaw = 1.92
@@ -24,8 +29,13 @@ enum PreviewRenderer {
         snapshot.sc2TemperatureC = 55
         snapshot.sc2PowerState = "DISCHARGING"
         snapshot.videoBitrateKbps = 4_860
-        snapshot.videoPackets = 18_442
-        snapshot.videoPacketsLost = 3
+        snapshot.videoEncodedAUFPS = 29.9
+        snapshot.videoUniqueTimestampFPS = 30.0
+        snapshot.videoDecodedFPS = 29.8
+        snapshot.videoDisplayRefreshFPS = 29.5
+    snapshot.videoPackets = 18_442
+    snapshot.videoDuplicatePackets = 127
+    snapshot.videoPacketsLost = 3
         snapshot.videoJitterMs = 2.7
         hud.update(snapshot: snapshot)
         hud.displayIfNeeded()
