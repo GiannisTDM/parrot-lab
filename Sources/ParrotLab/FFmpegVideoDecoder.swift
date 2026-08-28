@@ -1,7 +1,8 @@
 import Foundation
+import CoreMedia
 
 final class FFmpegVideoDecoder {
-    var onFrame: ((Data, Int, Int) -> Void)?
+    var onFrame: ((Data, Int, Int, VideoFrameTiming, VerifiedVideoFrameMotion?) -> Void)?
     /// Fired for every complete raw frame emitted by FFmpeg, before the
     /// latest-frame slot can coalesce frames waiting for the main thread.
     var onDecodedFrame: (() -> Void)?
@@ -20,6 +21,9 @@ final class FFmpegVideoDecoder {
     private var outputAccumulator: FixedFrameAccumulator
     private var pendingInput = BoundedDataQueue(maxBytes: 50 * 1_024 * 1_024)
     private var pendingFrame = LatestDecodedFrameSlot()
+    private var pendingTimings: [(VideoFrameTiming, VerifiedVideoFrameMotion?)] = []
+    private var pendingTimingHead = 0
+    private var lastOutputTiming: VideoFrameTiming?
     private var inputDrainScheduled = false
     private var frameDeliveryScheduled = false
     private var running = false
@@ -28,7 +32,7 @@ final class FFmpegVideoDecoder {
         let (pixelCount, pixelOverflow) = width.multipliedReportingOverflow(by: height)
         let (byteCount, byteOverflow) = pixelCount.multipliedReportingOverflow(by: 4)
         guard width > 0, height > 0, !pixelOverflow, !byteOverflow,
-              let executable = Self.findExecutable() else { return nil }
+              let executable = BundledFFmpeg.executableURL() else { return nil }
         self.width = width
         self.height = height
         outputAccumulator = FixedFrameAccumulator(frameBytes: byteCount)
@@ -70,7 +74,11 @@ final class FFmpegVideoDecoder {
         return true
     }
 
-    func feed(nalUnits: [Data]) {
+    func feed(
+        nalUnits: [Data],
+        timing: VideoFrameTiming? = nil,
+        motion: VerifiedVideoFrameMotion? = nil
+    ) {
         var annexB = Data()
         let startCode = Data([0, 0, 0, 1])
         for nalu in nalUnits {
@@ -83,6 +91,17 @@ final class FFmpegVideoDecoder {
             return
         }
         pendingInput.append(annexB)
+        if let timing {
+            pendingTimings.append((timing, motion))
+            let maximumPendingTimings = 300
+            if pendingTimings.count - pendingTimingHead > maximumPendingTimings {
+                pendingTimingHead += 1
+                if pendingTimingHead >= 256 {
+                    pendingTimings.removeFirst(pendingTimingHead)
+                    pendingTimingHead = 0
+                }
+            }
+        }
         let shouldSchedule = !inputDrainScheduled && !pendingInput.isEmpty
         if shouldSchedule { inputDrainScheduled = true }
         stateLock.unlock()
@@ -97,6 +116,9 @@ final class FFmpegVideoDecoder {
         running = false
         pendingInput.removeAll()
         pendingFrame.removeAll()
+        pendingTimings.removeAll(keepingCapacity: false)
+        pendingTimingHead = 0
+        lastOutputTiming = nil
         stateLock.unlock()
         try? inputPipe.fileHandleForWriting.close()
         if process.isRunning { process.terminate() }
@@ -153,13 +175,14 @@ final class FFmpegVideoDecoder {
                 }
                 guard !data.isEmpty else { return false }
                 // Never use append/removeFirst as a byte stream here. At
-                // 1080p30 FFmpeg emits about 249 MB/s of RGBA, and Data can
+                // High-resolution FFmpeg output can emit hundreds of MB/s of RGBA, and Data can
                 // retain the consumed prefix/capacity even while its logical
                 // count remains small. This assembler owns exactly one fixed
                 // frame buffer and hands completed buffers downstream.
                 for frame in outputAccumulator.append(data) {
                     onDecodedFrame?()
-                    enqueueLatestFrame(frame)
+                    let timing = takeNextOutputTiming()
+                    enqueueLatestFrame(frame, timing: timing.0, motion: timing.1)
                 }
                 return true
             }
@@ -174,13 +197,48 @@ final class FFmpegVideoDecoder {
         return running
     }
 
-    private func enqueueLatestFrame(_ data: Data) {
+    private func takeNextOutputTiming() -> (VideoFrameTiming, VerifiedVideoFrameMotion?) {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        if pendingTimingHead < pendingTimings.count {
+            let value = pendingTimings[pendingTimingHead]
+            pendingTimingHead += 1
+            if pendingTimingHead >= 256, pendingTimingHead * 2 >= pendingTimings.count {
+                pendingTimings.removeFirst(pendingTimingHead)
+                pendingTimingHead = 0
+            }
+            lastOutputTiming = value.0
+            return value
+        }
+        let previous = lastOutputTiming
+        let fallback = VideoFrameTiming(
+            rtpTimestamp: previous?.rtpTimestamp ?? 0,
+            presentationTime: previous.map {
+                CMTimeAdd($0.presentationTime, $0.nominalDuration)
+            } ?? .zero,
+            nominalDuration: previous?.nominalDuration ?? CMTime(value: 3_000, timescale: 90_000)
+        )
+        lastOutputTiming = fallback
+        return (fallback, nil)
+    }
+
+    private func enqueueLatestFrame(
+        _ data: Data,
+        timing: VideoFrameTiming,
+        motion: VerifiedVideoFrameMotion?
+    ) {
         stateLock.lock()
         guard running else {
             stateLock.unlock()
             return
         }
-        pendingFrame.replace(with: DecodedFrame(data: data, width: width, height: height))
+        pendingFrame.replace(with: DecodedFrame(
+            data: data,
+            width: width,
+            height: height,
+            timing: timing,
+            motion: motion
+        ))
         let shouldSchedule = !frameDeliveryScheduled
         if shouldSchedule { frameDeliveryScheduled = true }
         stateLock.unlock()
@@ -199,7 +257,7 @@ final class FFmpegVideoDecoder {
         }
         stateLock.unlock()
 
-        onFrame?(frame.data, frame.width, frame.height)
+        onFrame?(frame.data, frame.width, frame.height, frame.timing, frame.motion)
 
         stateLock.lock()
         let shouldContinue = running && !pendingFrame.isEmpty
@@ -236,18 +294,6 @@ final class FFmpegVideoDecoder {
             && accumulator.allocatedByteCount == 4
     }
 
-    private static func findExecutable() -> URL? {
-        let candidates: [URL?] = [
-            Bundle.main.resourceURL?.appendingPathComponent("ffmpeg-parrotlab"),
-            ProcessInfo.processInfo.environment["PARROTLAB_FFMPEG"]
-                .map { URL(fileURLWithPath: $0) },
-            URL(fileURLWithPath: "/opt/homebrew/bin/ffmpeg"),
-            URL(fileURLWithPath: "/usr/local/bin/ffmpeg")
-        ]
-        return candidates.compactMap { $0 }.first {
-            FileManager.default.isExecutableFile(atPath: $0.path)
-        }
-    }
 }
 
 private struct FixedFrameAccumulator {
@@ -308,6 +354,26 @@ private struct DecodedFrame {
     let data: Data
     let width: Int
     let height: Int
+    let timing: VideoFrameTiming
+    let motion: VerifiedVideoFrameMotion?
+
+    init(
+        data: Data,
+        width: Int,
+        height: Int,
+        timing: VideoFrameTiming = VideoFrameTiming(
+            rtpTimestamp: 0,
+            presentationTime: .zero,
+            nominalDuration: CMTime(value: 3_000, timescale: 90_000)
+        ),
+        motion: VerifiedVideoFrameMotion? = nil
+    ) {
+        self.data = data
+        self.width = width
+        self.height = height
+        self.timing = timing
+        self.motion = motion
+    }
 }
 
 private struct LatestDecodedFrameSlot {

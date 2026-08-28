@@ -1,197 +1,554 @@
-# Parrot Lab
+# Parrot Lab for macOS
 
-Parrot Lab is an early macOS ground-station and diagnostics app for the Parrot
-Bebop 2 and SkyController 2. It talks directly to the controller over USB,
-shows the drone camera with a live HUD, and exposes the radio and flight data
-we have been using to reverse-engineer the platform.
+Parrot Lab is a native macOS HUD and diagnostic client for the Parrot SkyController 2 and Bebop 2. It is intentionally built from Apple system frameworks rather than Electron or an embedded browser.
 
-> **Beta:** this is experimental software for bench testing and development.
-> Do not use it as your only flight display or safety system.
+See [CHANGELOG.md](CHANGELOG.md) for the V1.3 release highlights and known
+limitations.
 
-![Parrot Lab HUD preview](docs/images/ParrotLab.png)
+> [!WARNING]
+> **Development preview — not flight-ready.** The app now receives live video
+> through the established SC2 route, but direct production USB/libmux support is
+> not complete. Dragon Lab restarts the drone's flight process and must only be
+> used while landed with the props removed. Do not rely on this build as a
+> flight display or as a replacement for FreeFlight.
 
-## What works
+The intended production transport is the SC2 mobile link used by FreeFlight: Bebop 2 video and telemetry arrive at `mppd` over Wi-Fi and are forwarded to the mobile client through Parrot's USB `libmux` channels. Version 1.3 does not yet implement that USB video path.
 
-- Direct Apple Silicon Mac-to-SkyController 2 networking over USB-A
-- Live Bebop 2 H.264 video relayed by the SC2
-- RF chain RSSI, average RSSI, noise, SNR, link quality and PHY rate
-- Flight state, distance, altitude, roll, pitch and yaw
-- SkyController 2 and Bebop 2 battery telemetry
-- Persistent ARSDK navigation telemetry: GPS fix, satellites, speed and last
-  known coordinates
-- RTP bitrate, packet-loss and jitter diagnostics
-- Lossless H.264 recording and source-resolution PNG/JPEG photo capture
-- Original full-sensor 4K fisheye JPEG capture directly from the drone
-- Mac-side denoise, clarity, low-light cleanup and high-quality 2× enhancement
-- Selectable stock 480p and 720p Dragon profiles
-- Adjustable 1–16 Mbit/s adaptive or locked stream bitrate
-- Integrated, verified installers for Dragon Lab, the RF/MOD Suite and the
-  SC2 Apple-NCM driver patch
-- Guided SC2 bridge/USB address discovery and RF power-profile controls
-- A verified, reversible persistent Telnet/ADB installer for supported Bebop
-  firmware files
+Version 1.3 provides:
 
+- direct, read-only Telnet connection to the SC2 at `192.168.42.88`;
+- parsing of the SC2's existing `mppd`, `wifid`, and link-quality telemetry;
+- a persistent SC2-routed ARDiscovery/ARNetwork/ARCommands session for
+  structured drone battery, flight state, GPS, speed, attitude, satellite and
+  camera events;
+- per-chain RSSI, noise, SNR, PHY rate, flight state, altitude, attitude, controller battery and temperature;
+- a graphical video HUD with the RF Lab red/yellow/green/cyan signal gradient;
+- an artificial horizon and live link/video statistics;
+- SC2 `/video` restream discovery on the two listeners observed in firmware 1.0.9;
+- a UDP/RTP H.264 receiver with FU-A and STAP-A reassembly and low-latency AVFoundation display;
+- bounded VideoToolbox H.264 recording of the processed Parrot Lab output;
+- an optional developer-only archive of the untouched incoming Annex-B stream;
+- original-quality H.264-to-MP4 remuxing plus an optional quality-controlled
+  H.264 re-encode from the native **Video** menu;
+- PNG or JPEG capture of the latest processed output frame at the selected
+  enhancement/MetalFX resolution;
+- independent Core Image enhancement and configurable Apple MetalFX Spatial
+  output up to 3840 × 2160, shared by live view, stills and normal recording;
+- optional GPU H.264 artifact repair for isolated green/odd-color blocks and
+  confidence-gated temporal mosquito-noise cleanup;
+- experimental, developer-controlled 900p temporal reconstruction with
+  synchronized IMU alignment, dense residual optical flow and occlusion/
+  ghost rejection;
+- a guarded, non-persistent Dragon Video Lab for resolution and bitrate tests;
+- verified one-click deployment of Dragon Lab and the RF/MOD Suite from the
+  native **Tools** menu;
+- a guarded SC2 1.0.9 Apple-NCM driver installer with verified FTP staging,
+  on-device digest checks and an explicit controller reboot;
+- a self-contained FFmpeg recovery decoder with its non-system dependencies
+  embedded in the application bundle;
+- an ad-hoc-signed, double-clickable Apple-silicon `.app` bundle.
 
-RF/NVM changes are never applied automatically. Dragon Lab can make an
-explicit, landed-only runtime video change after confirmation; it does not
-replace the stock binary or persist the profile across a reboot.
+RF/NVM writes occur only through the explicit, confirmed RF power workflow,
+which creates and verifies recovery backups on both devices. Parrot Lab never
+edits `persist.dragon-prog.post_cmd`. Dragon Lab can explicitly stop and
+relaunch Dragon with runtime-only arguments after its applicable safety check.
+Applying a profile is immediate and does not show an additional confirmation
+sheet.
 
-See the [changelog](CHANGELOG.md) for this beta's complete update summary.
+## Requirements
 
-> **Version 1.2 limitation:** the patched 1080p profile and **Custom · modified
-> binary** mode are currently non-functional. Do not use them in this release.
-> Unified Bebop 2 firmware support for 4.4.2 and 4.7.1 is planned for version
-> 1.3.
+- macOS 13 or later on Apple silicon;
+- SC2 and Bebop 2 powered and associated;
+- a network route from the Mac to `192.168.42.88`;
+- the project's explicitly enabled SC2 Telnet service on TCP 23;
+- Local Network access when macOS requests it.
 
-## Download the beta
+## Current macOS release status
 
-The ready-to-run Apple Silicon build is available from
-[GitHub Releases](https://github.com/GiannisTDM/parrot-lab/releases). It is
-ad-hoc signed and verified, but it is not Apple-notarized because the project
-does not currently use a paid Developer ID certificate.
+Parrot Lab is currently distributed as an **ad-hoc-signed, non-notarized
+development build** because the project does not yet use a paid Apple Developer
+ID certificate. The release contains a normal macOS `.app`, but Gatekeeper may
+block its first launch.
 
-Extract the ZIP, move **Parrot Lab.app** to `/Applications`, then right-click
-the app and choose **Open**. If Gatekeeper still blocks this beta, advanced
-users can remove quarantine from this app only:
+Testers should extract the ZIP, move **Parrot Lab.app** to `/Applications`,
+then right-click the app, choose **Open**, and confirm **Open**. If macOS still
+refuses to launch it, advanced users can remove quarantine from this app only:
 
 ```sh
 xattr -dr com.apple.quarantine "/Applications/Parrot Lab.app"
 ```
 
-Do not disable Gatekeeper globally. The complete packaging and verification
-process is documented in [RELEASING.md](RELEASING.md).
+Do not disable Gatekeeper globally. See [RELEASING.md](RELEASING.md) for the
+complete maintainer workflow and tester instructions.
 
-## Tested setup
+## Build the application
 
-- Apple Silicon Mac running macOS 13 or newer
-- SkyController 2 firmware 1.0.9 (Linux 3.4.11+)
-- Bebop 2 connected to the SkyController 2
-- Homebrew FFmpeg for the Bebop's cyclic-intra-refresh H.264 stream
+From this directory:
 
-Other versions may work, but the included SC2 kernel module is tied to the
-tested kernel. Do not load it on a different kernel build without rebuilding
-and validating it.
+```sh
+./scripts/build-app.sh
+```
 
-## How it fits together
+The ad-hoc-signed bundle is installed at one canonical location, while `dist`
+keeps the GitHub-Release-ready archive and its checksum:
 
 ```text
-Parrot Lab on macOS
-    |  Apple private NCM over USB (192.168.53.0/24)
-    v
-SkyController 2 (192.168.53.1)
-    |-- TCP 23    SC2 telemetry
-    |-- TCP 7711  video-restream setup
-    |-- UDP 55004 H.264/RTP video
-    `-- TCP 2324  read-only Telnet relay to the Bebop 2
-                         |
-                         `-- Wi-Fi to 192.168.42.1
+~/Applications/Parrot Lab.app
+dist/Parrot-Lab-macOS-arm64.zip
+dist/Parrot-Lab-macOS-arm64.zip.sha256
 ```
 
-## Install the SC2 support files
-
-The SC2 must already have Telnet access. Copy the contents of [`sc2`](sc2) to
-a writable FTP directory on the controller, then run as root:
+To ad-hoc sign and package an already assembled bundle independently:
 
 ```sh
-cd /data/lib/ftp/internal_000/parrot-lab-sc2
-chmod +x install.sh test.sh unload.sh uninstall.sh
-./install.sh
-reboot
+./scripts/package-macos-release.sh "/path/to/Parrot Lab.app"
 ```
 
-The installer temporarily remounts `/` read/write, installs one short boxinit
-service named `plboot`, and restores the root filesystem to read-only. On the
-next boot, that service starts:
+The packager fails on any signing, strict verification, self-test, ZIP
+integrity, or post-extraction signature error. It uses no Apple credentials,
+paid signing identity, provisioning profile, or notarization secret.
 
-- the Apple-NCM module needed for Mac USB networking;
-- a TCP 2324 relay used only to read drone telemetry.
-
-After reboot, connect the Mac to the SC2 USB-A port. The Mac should receive a
-`192.168.53.x` address and should be able to reach `192.168.53.1`.
-
-For a non-persistent test, run `./test.sh ./apple_mac_ncm.ko` instead. See the
-[SC2 notes](sc2/README.md) for verification, removal and the persistence bug
-that led to the current installer.
-
-## Build and run the Mac app
-
-Install the decoder and build the app:
+Release builds require an arm64 FFmpeg executable. The build first reuses the
+one in the installed Parrot Lab app when available, then checks the usual
+Homebrew locations. For a clean build or a specific FFmpeg build, provide it
+explicitly:
 
 ```sh
-brew install ffmpeg
-./scripts/build-app.sh
-open "$HOME/Applications/Parrot Lab.app"
+PARROTLAB_FFMPEG=/absolute/path/to/arm64/ffmpeg ./scripts/build-app.sh
 ```
 
-In Parrot Lab, leave the SC2 address at `192.168.53.1`, connect, and start the
-video receiver on UDP port `55004`. The **Tools** menu installs or updates the
-bundled Dragon Lab, RF/MOD and SC2 driver components, discovers changing SC2
-addresses, and exposes the guarded RF profile workflow. Uploads are downloaded
-again and verified before the app offers the next step.
+The executable is copied to
+`Contents/Resources/ffmpeg-parrotlab`. The packager recursively copies every
+non-system Mach-O dependency into `Contents/Frameworks`, rewrites the load
+paths to bundle-relative locations, and verifies that the bundled executable
+starts without `DYLD_*` overrides. A release fails if FFmpeg is missing, has no
+arm64 slice, or retains an unresolved external dependency. Testers do not need
+Homebrew or a separate FFmpeg installation.
 
-Developers can run the test suite directly:
+You can also build and test only the executable:
 
 ```sh
 swift build
 .build/debug/ParrotLab --self-test
 ```
 
-The build script creates an ad-hoc-signed app in `~/Applications` and a
-release-ready, independently verified ZIP in `dist/`. FFmpeg is discovered
-from Homebrew at runtime. A custom executable
-can be embedded by setting `PARROTLAB_FFMPEG=/absolute/path/to/ffmpeg`; anyone
-redistributing such a bundle is responsible for complying with FFmpeg's
-license and the licenses of the enabled codecs.
-
-## Enable persistent Bebop 2 Telnet
-
-With temporary Telnet already active on a supported Bebop 2 firmware build,
-choose **Tools → Enable Persistent Telnet on Bebop 2…**. Parrot Lab uploads and
-verifies the installer, makes the stock developer-network script run during
-boot, and leaves the root filesystem read-only when it finishes. Telnet and
-ADB will then return automatically after a reboot.
-
-The system partition is full on the tested firmware, so the installer moves
-the verified stock `tcpdump` binary to the writable `internal_000` storage and
-leaves a working symlink at its original path. Both the firmware files and the
-resulting edits are checked against known digests; unknown versions are
-rejected instead of modified.
-
-> **Security warning:** this enables passwordless root Telnet on the aircraft
-> network. Use it only on trusted private networks. To remove the boot change,
-> connect to the drone and run:
+For an off-screen HUD render suitable for UI regression checks:
 
 ```sh
+.build/debug/ParrotLab --render-preview /tmp/parrot-lab-preview.png
+```
+
+For the complete application window:
+
+```sh
+.build/debug/ParrotLab --render-app-preview /tmp/parrot-lab-app-preview.png
+```
+
+## Local pictures and recordings
+
+The **MEDIA** controls in the top toolbar save directly on the Mac:
+
+- **Browse…** selects the destination directory. The choice is remembered;
+- **Record** encodes Parrot Lab's processed GPU output through the hardware
+  VideoToolbox H.264 encoder. Select it again to stop and finalize the
+  duration-bearing filename;
+- **PNG/JPEG** chooses the still-image format;
+- **Picture** saves the latest processed output frame without the HUD overlay,
+  at the enhancement/MetalFX resolution currently shown by the live view;
+- **Drone 4K Fisheye** is a separate stock-camera action. It sends Parrot's
+  `jpeg_fisheye` photo-format command through the SC2, waits for the camera's
+  ready/busy/ready sequence and successful photo event, then finds the new
+  JPEG below the aircraft's enumerated `internal_000/<product>/media/`
+  directory. The original drone JPEG is downloaded unchanged and can be
+  revealed in Finder from the completion dialog. The live preview may pause
+  while stock Dragon captures the full-sensor photo and should resume itself.
+
+The default destination is `~/Movies/Parrot Lab`. Filenames use local time:
+
+```text
+PictureBB2-2026-08-21_18-32-45.png
+VideoBB2-2026-08-21_18-32-45-03m17s.h264
+```
+
+Normal recording is now one deliberate lossy generation after processing:
+
+```text
+Bebop H.264 → decode → enhancement / MetalFX → VideoToolbox H.264
+```
+
+The encoder input is the same selected processed resolution shown by the live
+view. It uses a latest-frame-only pre-encoder slot, at most three submitted
+frames in flight, and a 16 MiB disk queue. If recording cannot keep up it drops
+or stops explicitly; it can never make the FPV display accumulate latency.
+The **Video → Archive Untouched Incoming H.264 (Developer)** option can
+simultaneously create a separate `RawVideoBB2-…h264` diagnostic file. That raw
+archive preserves Dragon's original NAL units and SEI, but is not the normal
+user-facing recording.
+
+At 100%, the H.264-to-MP4 tool stream-copies the already processed Parrot Lab
+recording. It does not perform a second lossy encode.
+
+## Video receive modes
+
+Choose a mode before starting video:
+
+- **Compatibility · Recovery decoder** preserves the proven FFmpeg recovery
+  path for the stock Bebop cyclic-intra-refresh stream.
+- **900p Modified · FrameInfo** prefers VideoToolbox for the validated
+  1600 × 900 stream produced by `-V 2 -q 1000 -o`.
+- **900p Temporal · FrameInfo** uses the same bounded receiver for the
+  stabilized 1600 × 900 stream produced by
+  `-V 2 -f 30 -R gpu -S 0 -q 12000 -o`.
+
+Both 900p modes automatically fall back to the recovery decoder if no
+hardware-decoded frame appears within three seconds.
+
+Receiver mode selection alone never writes or persists Dragon configuration.
+The separate **Dragon Video** card can apply a matching runtime profile. In
+either 900p mode, the app detects the legacy FrameInfo V3
+UUID in type-6 H.264 SEI and decodes the official 56-byte Parrot
+VideoMetadataV2 record carried in the RTP header extension. The record is
+attached to the access unit by its exact 90 kHz RTP timestamp and supplies
+synchronized drone/view quaternions, camera pan/tilt, exposure, speed and
+other frame telemetry. Captured data established the exact relationship
+`RTP timestamp = round(FrameInfo timestamp_us × 90000 / 1000000)` for every
+frame, with a contiguous FrameInfo counter. This is frame-synchronized
+orientation from Dragon's IMU pipeline, not a claim that the stream carries
+the full high-rate raw accelerometer/gyroscope sample sequence. Parrot Lab
+also preserves the first capped set of raw
+RTP header extensions in `/tmp/parrotlab-rtp-extensions.bin`. The matching
+capped Annex-B capture is `/tmp/parrotlab-capture.h264`.
+
+The decoded callback feeds an IOSurface-backed, latest-frame-only processing
+queue. Its bounded three-frame temporal history is reset on timestamp
+discontinuity and exposes whether synchronized motion is available. Quaternion
+signs are made continuous before history association because `q` and `-q`
+represent the same rotation. The pipeline does not average frames blindly.
+
+### Calibrated 4.7.1 900p camera geometry
+
+Parrot Lab contains the measured 1600 × 900 camera model, full-fisheye
+projection, native sensor mapping and curved per-pixel row timing for this
+specific source profile:
+
+- Bebop/Dragon firmware 4.7.1;
+- patched 1600 × 900 visible stream;
+- Dragon GPU reprojection with onboard stabilization retained (`-R gpu -S 0`);
+- the fixed raised SC2 virtual-camera position used for calibration;
+- coordinates before Parrot Lab scaling.
+
+The app can generate immutable Metal camera-ray, row-time and validity
+textures at 1600 × 900. The timing texture uses the fisheye-to-sensor mapping,
+not a linear output-X approximation: the active readout is 31.167 ms at a
+14.7571 µs line period and its equal-time contours curve near the sides.
+
+This calibration must not be applied to 4.4.2 or another virtual-camera
+position. H.264 does not identify all source-side choices, so **Motion
+Correction → 4.7.1 900p Calibrated Jello Correction** is off by default;
+turning it on is the source-profile confirmation. The normal 900p Dragon Lab
+profile uses `-R gpu -S 0` and retains Dragon's onboard stabilization.
+
+### Calibrated rolling-shutter correction
+
+VideoMetadataV2 quaternions use Q14 `(w,x,y,z)` Hamilton algebra. `frame_quat`
+is used directly as the active displayed camera/view FRD → global NED rotation;
+`drone_quat` is not multiplied into it. Rays use camera FRD coordinates
+`[forward,right,down] = [1,(u-cx)/fx,(v-cy)/fy]`.
+
+The RTP/FrameInfo timestamp is the V4L2 frame-DMA completion timestamp (frame
+EOF). For calibrated sensor row `k = sensor_y - 610`, the shader evaluates:
+
+```text
+t_mid(k) = T_metadata - (2112-k) × 14.7571 µs - exposure/2 - δIRQ
+```
+
+`δIRQ` currently defaults to zero. Consecutive `frame_quat` samples are
+shortest-path SLERPed at the curved per-pixel exposure time. A two-pass inverse
+Metal warp rotates every valid camera ray into the center-time frame view and
+projects it back through the 900p intrinsics. Correction is capped at 6° per
+frame, invalid calibration edges remain pass-through, and failure or missing
+metadata always falls back to the untouched frame. Processing and processed
+recording remain latest-frame-only and bounded.
+
+### Experimental temporal reconstruction
+
+**Parrot Lab → Settings → Experimental temporal reconstruction** enables a
+bounded causal reconstruction pass for the 1600 × 900 source. It is off by
+default. The prior source/history is first aligned with the exact
+RTP-associated `frame_quat`; Apple Vision then estimates the remaining dense
+image motion. The GPU resolve accepts history only where photometric confidence
+and, by default, forward/backward flow consistency indicate that it is safe.
+This provides motion-compensated temporal denoising/anti-aliasing without
+blindly averaging moving objects.
+
+Settings expose history strength, ghost rejection, occlusion-consistency
+threshold and a strict flow-latency budget. Any dimension/timestamp
+discontinuity, missing resource, failed flow, or budget overrun discards the
+result and resets history to the current frame. Processing remains
+latest-frame-only; temporal work can reduce processed FPS but cannot add an
+unbounded FPV queue. Detailed developer video diagnostics show flow latency
+and whether history was used or reset.
+
+The optional **Image Enhancement → H.264 Artifact Repair · Color Blocks +
+Mosquito Noise** pass is independent of the heavier optical-flow feature. A
+Metal shader identifies locally coherent chroma blocks that disagree with
+several surrounding regions, including isolated decoder-green corruption. It
+also applies conservative edge-aware spatial cleanup and a single-frame,
+confidence-gated temporal chroma resolve for mosquito shimmer. Selecting a
+different enhancement immediately clears its one-frame history. It cannot
+reconstruct detail that was never received; irrecoverable packet-loss damage
+still requires a clean reference frame from the encoder.
+
+Frame interpolation remains a separate future feature; temporal reconstruction
+does not synthesize 60 fps frames.
+
+## Dragon video runtime controls
+
+Dragon Video offers four documented runtime profiles:
+
+- **Stock 856 × 480** uses `/usr/bin/dragon-prog -V 1`;
+- **Stock 1280 × 720** uses `/usr/bin/dragon-prog -V 2`;
+- **900p Modified** uses the firmware-matched patched binary with
+  `-V 2 -q 1000 -o`;
+- **900p Temporal** uses the firmware-matched patched binary with
+  `-V 2 -f 30 -R gpu -S 0 -q 12000 -o`.
+
+The former 1080p experiment remains deprecated because it exceeded the
+drone's sustainable video-processing capacity.
+
+The 900p Temporal runtime action has no flight-state interlock. Selecting it
+and pressing **Apply profile** is the authorization to queue the Dragon
+restart. Other profiles, custom launches, and stock restoration retain the
+fresh `LANDED` requirement.
+
+The resolution menu also offers **Custom · modified binary**. Selecting it
+reveals a command-line field and starts the uploaded modified binary with those
+arguments instead of a preset. Custom input is normalized to
+whitespace-separated tokens, limited to 512 bytes and 64 arguments, and rejects
+shell metacharacters. The validated argument string is passed without `eval`;
+the executable path itself cannot be changed from the UI.
+
+The bitrate slider sets Dragon's `-q` streaming ceiling from 1 to 16 Mbit/s in
+0.5 Mbit/s steps. **Lock bitrate** additionally supplies `-s`; leave it off to
+retain Dragon's link adaptation. The helper selects the matching 4.4.2 or
+4.7.1 patched binary. Neither 900p preset passes `-I off`; the 900p Temporal
+preset keeps Dragon's GPU reprojection/stabilization enabled.
+
+“Temporal” in the Dragon menu names the grounded source profile. Parrot Lab's
+separate experimental temporal reconstruction is controlled under
+**Parrot Lab → Settings** and is never enabled merely by selecting that Dragon
+profile.
+
+The app calls this helper through the SC2 drone-Telnet relay on TCP 2324,
+falling back to direct Bebop Telnet at `192.168.42.1:23` only for bench use:
+
+```text
+/data/ftp/internal_000/parrotlab_dragon_video.sh
+```
+
+Before first use, choose **Tools → Install/Update Dragon Lab on Bebop 2**. The
+app uploads these bundled files to the drone's writable `internal_000`
+directory through the stock anonymous FTP service at `192.168.42.1:21`:
+
+```text
+tools/parrotlab_dragon_video.sh
+  -> /data/ftp/internal_000/parrotlab_dragon_video.sh
+
+patched/dragon-prog-900p-4.4.2
+  -> /data/ftp/internal_000/dragon-prog-900p-4.4.2
+
+patched/dragon-prog-900p-4.7.1
+  -> /data/ftp/internal_000/dragon-prog-900p-4.7.1
+```
+
+It downloads all three uploads again and compares SHA-256 digests. Once FTP
+verification succeeds, the app marks only these three app-owned files executable
+and checks their MD5 digests on the drone. It first tries the SC2 relay, then
+direct Bebop Telnet if needed; each connection attempt has an eight-second
+deadline. Installation neither stops Dragon nor replaces the stock binary.
+
+Before every Lab or custom launch, the helper reads
+`ro.parrot.build.version` from `/etc/build.prop` and selects
+`dragon-prog-900p-4.4.2` or `dragon-prog-900p-4.7.1`. Unsupported firmware is
+rejected before the running Dragon process is touched. Before
+stopping Dragon, the helper validates the complete request and starts a
+detached worker through the firmware's `/usr/bin/setsid`, with stdin redirected
+and HUP ignored. The helper explicitly restores the stock firmware command
+path because manually enabled Telnet sessions may omit `/usr/bin`. Custom
+arguments are passed as one validated shell argument; the stock drone does not
+need a `base64` utility. It then
+reports `QUEUED` to the app. The worker waits for that acknowledgement to leave
+the Telnet socket, stops Dragon, and launches the requested process without
+depending on the SC2 relay that Dragon teardown temporarily removes. It tries
+a normal termination first and uses `SIGKILL` only if Dragon does not exit.
+**Restore stock** uses the same detached transaction before relaunching
+`/usr/bin/DragonStarter.sh`.
+
+Drone battery and navigation state now arrive as native ARCommands through the
+SC2 at controller RF range. Version 1.3 no longer opens a periodic Telnet relay
+or direct-drone Telnet connection to scrape battery logs. The persistent ARSDK
+session requests all states after connecting and refreshes them periodically;
+the stock 4K fisheye capture reuses the same command connection.
+
+Telnet remains intentionally limited to data and operations not supplied by
+the Bebop ARCommands interface: SC2 RF-chain diagnostics and temperature,
+Dragon Lab runtime control, and explicit installer tools.
+
+Live testing established an ordering dependency in the current relay setup:
+Bebop Telnet must be running before the SC2 associates with the aircraft. The
+persistent Bebop Telnet tool makes that true on subsequent boots; for its
+one-time installation, manually enable Telnet before connecting the SC2.
+
+After installing a release containing this change, run **Tools →
+Install/Update Dragon Lab on Bebop 2** once to replace the older foreground
+helper on the drone. Worker state is recorded in
+`/data/ftp/internal_000/parrotlab-dragon-video.state`; Dragon and worker output
+remain available in `/tmp/parrotlab-dragon-video.log` and
+`/tmp/parrotlab-dragon-worker.log` respectively.
+
+Controls require a live SC2 connection. All profiles except 900p Temporal,
+plus custom launch and stock restore, additionally require a flight-state
+update from the last three seconds that explicitly says `LANDED`; they relock
+if telemetry stalls. Applying or restoring is immediate once its applicable
+conditions are satisfied. A
+relay closure after `QUEUED` is treated as expected, and the UI changes from
+queued to running when fresh drone telemetry returns. No setting is persisted
+and no stock binary is replaced; a normal reboot is the final stock recovery
+route.
+
+## Tools menu uploads
+
+The native macOS **Tools** menu contains deployment and discovery actions:
+
+- **Install/Update Dragon Lab on Bebop 2** uploads and verifies the patched
+  Dragon binary and helper at the fixed stock Bebop FTP address
+  `192.168.42.1:21`;
+- **Enable Persistent Telnet on Bebop 2…** uses one manually enabled Telnet
+  session to install an app-owned Boxinit trigger that starts the stock Telnet
+  service on future boots;
+- **Upload RF/MOD Suite** uploads and verifies `parrot_rf_lab.sh` on the Bebop
+  at `/data/ftp/internal_000/parrot_rf_lab.sh`;
+- **Upload RF/MOD Suite to SkyController 2** uses the address currently shown
+  in **SC2 HOST** and installs the same script at
+  `/data/lib/ftp/internal_000/parrot_rf_lab.sh`;
+- **Enable/Disable RF Power Mod…** explicitly applies the tested profile to
+  both devices or restores their preserved original baselines. It creates and
+  verifies backups before writing and then performs controlled reboots;
+- **Find SC2 IP through Bebop 2…** uploads a read-only helper to the Bebop,
+  correlates the associated Parrot station with the Bebop ARP/dnsmasq lease
+  state, then fills **SC2 HOST** and caches the bridge-side DHCP address;
+- **Install/Update SC2 Driver Patch** uploads the production Apple-private NCM
+  installer and matching ARMv7 `apple_mac_ncm.ko`. It tries a verified live or
+  cached SC2 address first; after a connection failure it discovers the current
+  SC2 address through the Bebop and resumes automatically.
+
+All uploads use anonymous/no-credential FTP and download each uploaded
+file for a byte-count and SHA-256 comparison. The RF/MOD actions only deploy
+the script: they do not run it, apply an RF profile, edit NVM, or touch factory
+files. It can be launched explicitly from the corresponding device shell with
+`sh <device-path> menu`.
+
+The persistent Telnet action accepts the supported Bebop 2 firmware builds
+4.4.2 and 4.7.1. Installer
+and upload actions do not require an established Parrot Lab telemetry session;
+their confirmation sheets remain available for bench-safety checks. It verifies
+`install_bebop2_persistent_telnet.sh`, connects directly to
+`192.168.42.1:23` and verifies the exact stock firmware files. Because the
+system UBIFS is full, it backs up `/usr/sbin/tcpdump` to
+`internal_000/parrotlab-system-backup`, verifies the backup and replaces the
+original with a symlink. It then adds `/bin/usbnetwork.sh` immediately before
+`exit 0` in `/etc/init.d/rcS`, following the stock four-button developer-mode
+path. The installer syncs and returns `/` to read-only before reporting
+success, and does not reboot the aircraft. The boot call enables the stock
+no-password root Telnet service, ADB and USB developer networking. Anyone on
+the aircraft network will therefore have root access. Remove the `rcS` call
+with:
+
+```text
 sh /data/ftp/internal_000/install_bebop2_persistent_telnet.sh uninstall
 ```
 
-## Safety and recovery
+The SC2 driver action supports a bootstrap workflow for controllers that do not
+yet expose a usable Mac USB network connection. After a critical confirmation,
+it runs these stages:
 
-- Back up the SC2 before installing or editing system files.
-- Do the first test on the bench with props removed and the aircraft grounded.
-- Keep a working Telnet path until USB networking has been verified after a
-  full reboot.
-- Use Dragon Lab only while landed, preferably on the bench with props
-  removed; it restarts the live camera process.
-- Treat RF profile changes as experimental and verify local EIRP rules before
-  enabling them.
-- Run `/data/lib/parrotlab/uninstall_sc2_apple_ncm.sh`, then reboot, to remove
-  SC2 persistence.
-- Loading a kernel module built for another kernel can crash the controller.
+1. try the verified live/cached controller address; if it fails, upload and run
+   `parrotlab_find_sc2_ip.sh` on the Bebop and cache the returned DHCP address;
+2. upload `install_sc2_apple_ncm.sh` and `apple_mac_ncm.ko` through anonymous
+   FTP to the controller's `internal_000` and verify their SHA-256 digests;
+3. connect to SC2 TCP 23, compare on-device MD5 digests and apply mode `775` to
+   the installer script;
+4. run the installer, require its success marker, issue `sync`, and reboot the
+   SC2.
 
-## Background and acknowledgements
+The installer refuses firmware other than SkyController 2 1.0.9 or a kernel
+other than `3.4.11+`. It persistently places the module and rollback helper
+under `/data/lib/parrotlab`, removes obsolete Parrot Lab experimental RC
+entries after backing them up, and writes one production Boxinit service named
+`plboot`. The short name is required because SC2 Boxinit silently ignored the
+older long service names. Rollback remains available on the controller at:
 
-This work was partly inspired by the community-authored
-[*An unofficial Bebop drone hacking guide 1.7.2*](https://fargesportfolio.com/wp-content/uploads/2018/01/BeebopHackingGuide1_7_2.pdf).
-Its documentation of the Bebop's Linux filesystem, Telnet/FTP access and open
-developer tooling remains excellent background material.
+```text
+/data/lib/parrotlab/uninstall_sc2_apple_ncm.sh
+```
 
-Parrot, Bebop and SkyController are trademarks of their respective owner. This
-project is independent community research and is not affiliated with Parrot.
+## Connect to the SkyController 2
 
-## License
+1. Power the Bebop 2 and SC2 and wait for their link to settle.
+2. Connect the Mac using the established USB/network route.
+3. Leave the default SC2 address `192.168.42.88`, or replace it with the current DHCP address.
+4. Select **Connect SC2**.
 
-The Parrot Lab app and original project files are released under the
-[MIT License](LICENSE). The adapted Linux Apple-NCM driver retains its
-upstream GPL-2.0-or-BSD-2-Clause choice; see
-[third-party notices](THIRD_PARTY_NOTICES.md).
+The app opens a Telnet connection and starts `ulogcat`. It does not log in with a credential and it does not write any device configuration. The captured lines are parsed locally; the full raw feed is not retained by default.
+
+The SC2 already publishes the key HUD line at approximately five updates per second:
+
+```text
+rssi_mpp, rssi, flight state, altitude, latitude, longitude, roll, pitch, yaw
+```
+
+It separately publishes per-chain Broadcom values, link-quality percentages, controller temperature, and controller battery.
+
+Values of `500` used by `mppd` as unavailable altitude/position sentinels are deliberately shown as unavailable rather than as real telemetry.
+
+## Video transport
+
+The **Start video** control uses the live-proven SC2 restream path available in
+the current lab setup.
+
+The app:
+
+1. opens the requested local UDP port, initially `55004`;
+2. probes the SC2's observed TCP listeners `7711` and `6007` with its built-in `GET /video` request;
+3. parses any returned SDP address and video port;
+4. switches the local listener if the SC2 announces another port;
+5. accepts H.264/RTP payload type 96 and displays decoded access units immediately.
+
+The request/port assumptions came from a separate SC2 1.0.9 restream facility. Hardware testing established that this is not a working replacement for the FreeFlight USB-mobile session. FreeFlight uses `mppd`'s AOA/iAP2 `libmux` transport with dedicated command, stream-data and stream-control channels.
+
+Failure of this path does not affect SC2 control or the telemetry HUD. Direct
+USB role negotiation and the Parrot mux session still need to be implemented
+for a production controller-forwarded flight stream.
+
+## Why the app runs on the Mac
+
+The drone should spend its resources on stabilization, encoding, networking, and flight control. Drawing the HUD on the Mac means:
+
+- no extra graphics work on the BB2;
+- no overlay burned permanently into recordings;
+- no additional video encode generation;
+- easier logging, plotting, and future layout changes;
+- the ability to merge SC2 receive statistics with drone telemetry.
+
+## Planned suite modules
+
+- broader ARSDK controls and alerts beyond the battery/navigation/camera state
+  already ingested by version 1.3;
+- verified SC2 video restream negotiation and recorded-stream playback;
+- firmware identity checks before offering device-specific experimental profiles;
+- RF Lab NVM inspection and editing through the same safety checks as the BusyBox tool;
+- synchronized flight, RF and video experiment bundles;
+- live graphs, CSV export and an optional minimal fullscreen flight layout;
+- a strict landed-state interlock before any configuration write.
+
+Old Bebop camera options changed meaning across firmware generations. The future Video Lab must inspect the installed firmware and current `persist.dragon-prog.post_cmd` value before offering a preset.

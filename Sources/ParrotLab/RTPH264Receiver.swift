@@ -15,6 +15,19 @@ struct H264AccessUnit: Equatable {
     let nalUnits: [Data]
     let rtpTimestamp: UInt32
     let rtpHeaderExtensions: [Data]
+    let videoMetadata: VideoMetadataV2?
+
+    init(
+        nalUnits: [Data],
+        rtpTimestamp: UInt32,
+        rtpHeaderExtensions: [Data],
+        videoMetadata: VideoMetadataV2? = nil
+    ) {
+        self.nalUnits = nalUnits
+        self.rtpTimestamp = rtpTimestamp
+        self.rtpHeaderExtensions = rtpHeaderExtensions
+        self.videoMetadata = videoMetadata
+    }
 }
 
 final class RTPH264Receiver {
@@ -462,7 +475,10 @@ private struct H264RTPAssembler {
         let output = H264AccessUnit(
             nalUnits: nalUnits,
             rtpTimestamp: timestamp,
-            rtpHeaderExtensions: headerExtensions
+            rtpHeaderExtensions: headerExtensions,
+            videoMetadata: headerExtensions.lazy.compactMap {
+                VideoMetadataV2.decode($0, rtpTimestamp: timestamp)
+            }.first
         )
         nalUnits.removeAll(keepingCapacity: true)
         seenNALUnits.removeAll(keepingCapacity: true)

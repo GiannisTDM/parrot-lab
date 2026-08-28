@@ -45,6 +45,23 @@ struct TelemetrySnapshot: Equatable {
     var videoUniqueTimestampFPS: Double?
     var videoDecodedFPS: Double?
     var videoDisplayRefreshFPS: Double?
+    var videoProcessedFPS: Double?
+    var videoProcessingDroppedFrames: UInt64 = 0
+    var videoProcessingLatencyMs: Double?
+    var videoProcessedWidth: Int?
+    var videoProcessedHeight: Int?
+    var videoTemporalHistoryDepth: Int = 0
+    var videoTemporalHistoryAgeMs: Double?
+    var videoTemporalMotionAvailable = false
+    var videoTemporalMotionConfidence: Double?
+    var videoTemporalReprojectionStatus = "BYPASSED · NO FRAME MOTION"
+    var videoTemporalFlowLatencyMs: Double?
+    var videoTemporalHistoryUsed = false
+    var videoLastRTPTimestamp: UInt32?
+    var videoMotionAssociationOffsetMs: Double?
+    var videoCameraCalibrationStatus = Bebop900pCameraCalibration.profile.statusLabel
+    var videoCameraReadoutStatus = "ROW LUT 31.167 ms · CURVED LEFT→RIGHT"
+    var videoRollingShutterStatus = "RS OFF · CALIBRATION AVAILABLE"
     var videoPackets: UInt64 = 0
     var videoDuplicatePackets: UInt64 = 0
     var videoPacketsLost: UInt64 = 0

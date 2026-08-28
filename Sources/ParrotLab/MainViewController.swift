@@ -1,4 +1,5 @@
 import AppKit
+import UniformTypeIdentifiers
 
 final class MainViewController: NSViewController {
     private enum SC2DriverInstallPhase {
@@ -77,7 +78,9 @@ final class MainViewController: NSViewController {
     private let sc2USBDiscovery = SC2USBDiscovery()
     private let restreamProbe = RestreamProbe()
     private let rtpReceiver = RTPH264Receiver()
-    private let streamRecorder = H264StreamRecorder()
+    private let streamRecorder = ProcessedH264Recorder()
+    private let rawArchiveRecorder = H264StreamRecorder()
+    private let mp4Converter = H264MP4Converter()
     private let arsdkClient = ARSDKCommandClient()
     private lazy var droneFisheyeCapture = DroneFisheyeCaptureController(client: arsdkClient)
     private let droneMediaFTP = DroneMediaFTP()
@@ -93,10 +96,33 @@ final class MainViewController: NSViewController {
     private var videoRunning = false
     private var videoStatus = "Restream idle"
     private var videoFormatStatus = "FORMAT waiting"
+    private var videoCodedFormatStatus = "CODED waiting"
     private var videoMetadataPresence = VideoMetadataPresence()
     private var mediaDirectoryURL = MediaFileNamer.defaultDirectory
     private var recordingStartedAt: Date?
     private var recordingTimer: Timer?
+    private var rawH264ArchiveEnabled = UserDefaults.standard.bool(
+        forKey: "ParrotLab.ArchiveRawIncomingH264"
+    )
+    private var calibratedRollingShutterEnabled = UserDefaults.standard.bool(
+        forKey: "ParrotLab.Calibrated471RollingShutterV2"
+    )
+    private var developerVideoDiagnosticsEnabled = UserDefaults.standard.bool(
+        forKey: "ParrotLab.DeveloperVideoDiagnostics"
+    )
+    private lazy var temporalReconstructionConfiguration = TemporalReconstructionConfiguration(
+        isEnabled: UserDefaults.standard.bool(forKey: "ParrotLab.Temporal.Enabled"),
+        historyWeight: Self.storedDouble("ParrotLab.Temporal.HistoryWeight", fallback: 0.58),
+        ghostRejection: Self.storedDouble("ParrotLab.Temporal.GhostRejection", fallback: 0.68),
+        consistencyThresholdPixels: Self.storedDouble("ParrotLab.Temporal.ConsistencyPixels", fallback: 2.0),
+        latencyBudgetMilliseconds: Self.storedDouble("ParrotLab.Temporal.LatencyBudgetMs", fallback: 65.0),
+        usesBidirectionalFlow: UserDefaults.standard.object(forKey: "ParrotLab.Temporal.Bidirectional") == nil
+            ? true
+            : UserDefaults.standard.bool(forKey: "ParrotLab.Temporal.Bidirectional")
+    )
+    private var processedRecordingStats: ProcessedRecordingStats?
+    private var videoConversionInFlight = false
+    private var videoConversionProgressAlert: NSAlert?
     private var pictureWriteInFlight = false
     private var dronePhotoInFlight = false
     private var dronePhotoBaseline = Set<DroneRemotePhoto>()
@@ -142,6 +168,7 @@ final class MainViewController: NSViewController {
     private var dragonRuntimeStatus = "SC2 OFFLINE"
 
     private static let mediaDirectoryPreferenceKey = "ParrotLabMediaDirectory"
+    private static let mp4QualityPreferenceKey = "ParrotLabMP4ConversionQuality"
     private static let cachedSC2HostPreferenceKey = "ParrotLabCachedSC2Host"
     private static let cachedSC2USBHostPreferenceKey = "ParrotLabCachedSC2USBHost"
 
@@ -157,12 +184,12 @@ final class MainViewController: NSViewController {
     private let pictureButton = NSButton(title: "Picture", target: nil, action: nil)
     private let droneFisheyeButton = NSButton(title: "Drone 4K Fisheye", target: nil, action: nil)
     private let dragonResolutionPopup = NSPopUpButton(frame: .zero, pullsDown: false)
-    private let dragonBitrateSlider = NSSlider(value: 8_000, minValue: 1_000, maxValue: 16_000, target: nil, action: nil)
-    private let dragonBitrateValue = NSTextField(labelWithString: "8.0 Mbps")
+    private let dragonBitrateSlider = NSSlider(value: 12_000, minValue: 1_000, maxValue: 16_000, target: nil, action: nil)
+    private let dragonBitrateValue = NSTextField(labelWithString: "12.0 Mbps")
     private let dragonLockRateButton = NSButton(checkboxWithTitle: "Lock bitrate", target: nil, action: nil)
     private let dragonCustomArgumentsLabel = NSTextField(labelWithString: "CUSTOM ARGUMENTS")
     private let dragonCustomArgumentsField = NSTextField(
-        string: "-V 1 -f 30 -R off -S 0 -I off -q 8000 -o"
+        string: "-V 2 -f 30 -R gpu -S 0 -q 12000 -o"
     )
     private let dragonApplyButton = NSButton(title: "Apply profile", target: nil, action: nil)
     private let dragonRestoreButton = NSButton(title: "Restore stock", target: nil, action: nil)
@@ -191,6 +218,8 @@ final class MainViewController: NSViewController {
         view.appearance = NSAppearance(named: .darkAqua)
         buildInterface()
         wireDataSources()
+        applyRollingShutterConfiguration()
+        applyTemporalReconstructionConfiguration()
         updateInterface()
     }
 
@@ -275,7 +304,7 @@ final class MainViewController: NSViewController {
         let title = NSTextField(labelWithString: "PARROT LAB")
         title.font = .systemFont(ofSize: 17, weight: .bold)
         title.textColor = .white
-        let version = NSTextField(labelWithString: "V1.2")
+        let version = NSTextField(labelWithString: "V1.3")
         version.font = .monospacedSystemFont(ofSize: 8.5, weight: .bold)
         version.textColor = LabVisualStyle.accent
         let titleRow = NSStackView()
@@ -305,7 +334,7 @@ final class MainViewController: NSViewController {
         mediaControls.addArrangedSubview(browseMediaButton)
         styleButton(recordingButton, action: #selector(toggleRecording), symbol: "record.circle")
         recordingButton.bezelColor = .systemRed
-        recordingButton.toolTip = "Record every received H.264 access unit without re-encoding"
+        recordingButton.toolTip = "Record Parrot Lab's processed GPU output through the bounded VideoToolbox encoder"
         recordingButton.widthAnchor.constraint(equalToConstant: 112).isActive = true
         mediaControls.addArrangedSubview(recordingButton)
         for format in PictureFileFormat.allCases {
@@ -319,7 +348,7 @@ final class MainViewController: NSViewController {
         pictureFormatPopup.widthAnchor.constraint(equalToConstant: 66).isActive = true
         mediaControls.addArrangedSubview(pictureFormatPopup)
         styleButton(pictureButton, action: #selector(takePicture), symbol: "camera")
-        pictureButton.toolTip = "Save the latest decoded source frame without the HUD overlay"
+        pictureButton.toolTip = "Save the latest processed output frame at its selected resolution, without the HUD overlay"
         pictureButton.widthAnchor.constraint(equalToConstant: 82).isActive = true
         mediaControls.addArrangedSubview(pictureButton)
         styleButton(droneFisheyeButton, action: #selector(captureDroneFisheye), symbol: "camera.aperture")
@@ -362,7 +391,7 @@ final class MainViewController: NSViewController {
         videoModePopup.font = .systemFont(ofSize: 12, weight: .medium)
         videoModePopup.alignment = .center
         videoModePopup.widthAnchor.constraint(equalToConstant: 235).isActive = true
-        videoModePopup.toolTip = "Compatibility preserves the proven decoder. 1080p Lab expects the unwarped Dragon profile and captures FrameInfo metadata."
+        videoModePopup.toolTip = "Compatibility preserves the proven decoder. Both 900p modes use the firmware-matched modified Dragon and capture frame-synchronized metadata."
         bottomRow.addArrangedSubview(videoModePopup)
 
         bottomRow.addArrangedSubview(sectionLabel("RTP UDP"))
@@ -390,19 +419,20 @@ final class MainViewController: NSViewController {
         scroll.hasVerticalScroller = true
         scroll.autohidesScrollers = true
 
-        let document = LabFlippedView(frame: NSRect(x: 0, y: 0, width: 300, height: 980))
+        let document = LabFlippedView(frame: .zero)
+        document.translatesAutoresizingMaskIntoConstraints = false
         let stack = NSStackView()
         stack.orientation = .vertical
         stack.spacing = 10
         stack.alignment = .leading
         stack.addArrangedSubview(buildDragonCard())
-        stack.addArrangedSubview(card(title: "VIDEO", body: videoLabel))
+        stack.addArrangedSubview(card(title: "VIDEO", body: videoLabel, maximumLines: 24))
         stack.addArrangedSubview(card(title: "RF LINK", body: rfLabel))
         stack.addArrangedSubview(card(title: "FLIGHT", body: flightLabel))
         stack.addArrangedSubview(card(title: "ARSDK NAVIGATION", body: navigationLabel))
         stack.addArrangedSubview(card(title: "SC2 HEALTH", body: healthLabel))
 
-        let notice = NSTextField(wrappingLabelWithString: "Dragon Lab changes runtime options only. It never writes the persistent Dragon property or replaces the stock system binary.")
+        let notice = NSTextField(wrappingLabelWithString: "Dragon video profiles change runtime options only. They never write the persistent Dragon property or replace the stock system binary.")
         notice.textColor = LabVisualStyle.mutedText
         notice.font = .systemFont(ofSize: 10.5)
         notice.maximumNumberOfLines = 5
@@ -413,13 +443,18 @@ final class MainViewController: NSViewController {
         NSLayoutConstraint.activate([
             stack.leadingAnchor.constraint(equalTo: document.leadingAnchor),
             stack.trailingAnchor.constraint(equalTo: document.trailingAnchor),
-            stack.topAnchor.constraint(equalTo: document.topAnchor)
+            stack.topAnchor.constraint(equalTo: document.topAnchor),
+            stack.bottomAnchor.constraint(equalTo: document.bottomAnchor, constant: -8)
         ])
         scroll.documentView = document
+        NSLayoutConstraint.activate([
+            document.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
+            document.heightAnchor.constraint(greaterThanOrEqualTo: scroll.contentView.heightAnchor)
+        ])
         return scroll
     }
 
-    private func card(title: String, body: NSTextField) -> NSView {
+    private func card(title: String, body: NSTextField, maximumLines: Int = 8) -> NSView {
         let container = LabPanelView()
         container.widthAnchor.constraint(equalToConstant: 300).isActive = true
 
@@ -443,7 +478,7 @@ final class MainViewController: NSViewController {
         stack.addArrangedSubview(heading)
         body.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
         body.textColor = NSColor.white.withAlphaComponent(0.86)
-        body.maximumNumberOfLines = 8
+        body.maximumNumberOfLines = maximumLines
         body.lineBreakMode = .byWordWrapping
         body.widthAnchor.constraint(equalToConstant: 274).isActive = true
         stack.addArrangedSubview(body)
@@ -489,7 +524,7 @@ final class MainViewController: NSViewController {
         icon.contentTintColor = LabVisualStyle.accent
         icon.widthAnchor.constraint(equalToConstant: 16).isActive = true
         headingRow.addArrangedSubview(icon)
-        let heading = NSTextField(labelWithString: "DRAGON LAB")
+        let heading = NSTextField(labelWithString: "DRAGON VIDEO")
         heading.font = .systemFont(ofSize: 10.5, weight: .bold)
         heading.textColor = LabVisualStyle.accent
         headingRow.addArrangedSubview(heading)
@@ -505,7 +540,7 @@ final class MainViewController: NSViewController {
         }
         dragonResolutionPopup.addItem(withTitle: "Custom · modified binary")
         dragonResolutionPopup.lastItem?.tag = Self.customDragonModeTag
-        dragonResolutionPopup.selectItem(withTag: DragonVideoResolution.lab1080.rawValue)
+        dragonResolutionPopup.selectItem(withTag: DragonVideoResolution.temporal900.rawValue)
         dragonResolutionPopup.target = self
         dragonResolutionPopup.action = #selector(dragonResolutionChanged)
         dragonResolutionPopup.controlSize = .regular
@@ -522,7 +557,7 @@ final class MainViewController: NSViewController {
         styleTextField(dragonCustomArgumentsField, width: 274)
         dragonCustomArgumentsField.alignment = .left
         dragonCustomArgumentsField.font = .monospacedSystemFont(ofSize: 10.5, weight: .medium)
-        dragonCustomArgumentsField.placeholderString = "-V 1 -f 30 -R off …"
+        dragonCustomArgumentsField.placeholderString = "-V 2 -f 30 -R gpu -S 0 …"
         dragonCustomArgumentsField.toolTip = "Whitespace-separated arguments for the uploaded modified Dragon binary. Shell metacharacters are rejected."
         dragonCustomArgumentsField.isHidden = true
         stack.addArrangedSubview(dragonCustomArgumentsField)
@@ -570,7 +605,7 @@ final class MainViewController: NSViewController {
         dragonStatusLabel.widthAnchor.constraint(equalToConstant: 274).isActive = true
         stack.addArrangedSubview(dragonStatusLabel)
 
-        let warning = NSTextField(wrappingLabelWithString: "Requires LANDED. Restart is queued on the drone first; expect the SC2 link, video and telemetry to drop briefly.")
+        let warning = NSTextField(wrappingLabelWithString: "900p Temporal has no flight-state interlock. Other profiles require LANDED. Every restart briefly drops the SC2 link, video and telemetry.")
         warning.font = .systemFont(ofSize: 10, weight: .regular)
         warning.textColor = NSColor.systemOrange.withAlphaComponent(0.82)
         warning.maximumNumberOfLines = 3
@@ -801,6 +836,11 @@ final class MainViewController: NSViewController {
             self.videoFormatStatus = "FORMAT \(width)x\(height)"
             self.updateInterface()
         }
+        hudView.videoView.onCodedFormat = { [weak self] width, height in
+            guard let self else { return }
+            self.videoCodedFormatStatus = "CODED \(width)x\(height)"
+            self.updateInterface()
+        }
         hudView.videoView.onMetadataPresence = { [weak self] presence in
             guard let self else { return }
             self.videoMetadataPresence = presence
@@ -810,10 +850,31 @@ final class MainViewController: NSViewController {
             self?.hudView.videoView.display(accessUnit: accessUnit)
         }
         rtpReceiver.onCompleteAccessUnit = { [weak self] accessUnit in
-            self?.streamRecorder.observe(accessUnit)
+            self?.rawArchiveRecorder.observe(accessUnit)
+        }
+        hudView.videoView.onProcessedFrame = { [weak self] frame in
+            self?.streamRecorder.observe(frame)
         }
         streamRecorder.onFinished = { [weak self] result in
             self?.recordingFinished(result)
+        }
+        streamRecorder.onStats = { [weak self] stats in
+            self?.processedRecordingStats = stats
+            self?.updateInterface()
+        }
+        rawArchiveRecorder.onFinished = { [weak self] result in
+            guard let self else { return }
+            let size = ByteCountFormatter.string(
+                fromByteCount: Int64(result.bytesWritten),
+                countStyle: .file
+            )
+            self.appendLog("Untouched diagnostic H.264 archive saved: \(result.url.path) · \(size)")
+            if let error = result.errorDescription {
+                self.appendLog("Raw archive finished with an error: \(error)")
+            }
+        }
+        mp4Converter.onCompletion = { [weak self] result in
+            self?.mp4ConversionFinished(result)
         }
         droneFisheyeCapture.onLog = { [weak self] message in
             self?.appendLog("ARSDK: \(message)")
@@ -833,6 +894,23 @@ final class MainViewController: NSViewController {
             guard let self else { return }
             self.snapshot.videoDecodedFPS = stats.decodedFPS
             self.snapshot.videoDisplayRefreshFPS = stats.displayRefreshFPS
+            self.snapshot.videoProcessedFPS = stats.processedFPS
+            self.snapshot.videoProcessingDroppedFrames = stats.processingDroppedFrames
+            self.snapshot.videoProcessingLatencyMs = stats.processingLatencyMilliseconds
+            self.snapshot.videoProcessedWidth = stats.processedWidth
+            self.snapshot.videoProcessedHeight = stats.processedHeight
+            self.snapshot.videoTemporalHistoryDepth = stats.temporalHistoryDepth
+            self.snapshot.videoTemporalHistoryAgeMs = stats.temporalHistoryAgeMilliseconds
+            self.snapshot.videoTemporalMotionAvailable = stats.temporalMotionAvailable
+            self.snapshot.videoTemporalMotionConfidence = stats.temporalMotionConfidence
+            self.snapshot.videoTemporalReprojectionStatus = stats.temporalReprojectionStatus
+            self.snapshot.videoTemporalFlowLatencyMs = stats.temporalFlowLatencyMilliseconds
+            self.snapshot.videoTemporalHistoryUsed = stats.temporalHistoryUsed
+            self.snapshot.videoLastRTPTimestamp = stats.lastRTPTimestamp
+            self.snapshot.videoMotionAssociationOffsetMs = stats.motionAssociationOffsetMilliseconds
+            self.snapshot.videoCameraCalibrationStatus = stats.cameraCalibrationStatus
+            self.snapshot.videoCameraReadoutStatus = stats.cameraReadoutStatus
+            self.snapshot.videoRollingShutterStatus = stats.rollingShutterStatus
             self.updateInterface()
         }
         rtpReceiver.onStats = { [weak self] stats in
@@ -965,13 +1043,14 @@ final class MainViewController: NSViewController {
         guard !videoRunning else { return }
         let mode = selectedVideoMode
         hudView.videoView.receiveMode = mode
+        applyRollingShutterConfiguration()
         videoFormatStatus = "FORMAT waiting"
         videoMetadataPresence = VideoMetadataPresence()
         videoStatus = "Restream idle"
         appendLog("Video mode selected: \(mode.menuTitle)")
         if let profile = mode.expectedDragonProfile {
-            appendLog("1080p Lab expects Dragon profile: \(profile)")
-            appendLog("Dragon Lab can apply a matching non-persistent runtime profile while landed")
+            appendLog("\(mode.menuTitle) expects Dragon profile: \(profile)")
+            appendLog("Dragon Video can apply the matching non-persistent runtime profile while landed")
         }
         updateInterface()
     }
@@ -982,6 +1061,10 @@ final class MainViewController: NSViewController {
 
     private var customDragonModeSelected: Bool {
         dragonResolutionPopup.selectedItem?.tag == Self.customDragonModeTag
+    }
+
+    private var temporalDragonModeSelected: Bool {
+        selectedDragonResolution == .temporal900
     }
 
     @objc private func dragonResolutionChanged() {
@@ -1006,10 +1089,12 @@ final class MainViewController: NSViewController {
     }
 
     @objc private func applyDragonProfile() {
-        guard canAdjustDragon else {
+        guard canApplySelectedDragonProfile else {
             showDragonAlert(
                 title: "Dragon controls are locked",
-                message: "Connect to the SC2 and wait until live telemetry explicitly reports LANDED."
+                message: temporalDragonModeSelected
+                    ? "Connect to the SC2 before applying 900p Temporal."
+                    : "Connect to the SC2 and wait until live telemetry explicitly reports LANDED."
             )
             return
         }
@@ -1026,14 +1111,6 @@ final class MainViewController: NSViewController {
             appendLog("Dragon profile rejected: bitrate must be 1–16 Mbps in 0.5 Mbps steps")
             return
         }
-
-        let alert = NSAlert()
-        alert.alertStyle = .critical
-        alert.messageText = "Restart Dragon with \(profile.resolution.statusLabel)?"
-        alert.informativeText = "A detached worker is queued on the drone before the current process is stopped, so it can complete even while the SC2 relay is unavailable. It relaunches Dragon with \(profile.bitrateLabel) \(profile.locksBitrate ? "locked bitrate" : "adaptive bitrate ceiling"). Keep the drone landed with props removed. The change is not persistent and a reboot restores normal startup."
-        alert.addButton(withTitle: "Restart Dragon")
-        alert.addButton(withTitle: "Cancel")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
 
         if videoRunning { startVideo() }
         videoModePopup.selectItem(withTag: profile.resolution.receiverMode.rawValue)
@@ -1059,21 +1136,13 @@ final class MainViewController: NSViewController {
             return
         }
 
-        let alert = NSAlert()
-        alert.alertStyle = .critical
-        alert.messageText = "Restart the modified Dragon with custom arguments?"
-        alert.informativeText = "Executable:\n/data/ftp/internal_000/dragon-prog-1080p-mode1-30fps\n\nArguments:\n\(launch.arguments)\n\nA detached drone-side worker performs the stop and start even if the SC2 relay disconnects. The preview decoder mode is left unchanged. Keep the drone landed with props removed."
-        alert.addButton(withTitle: "Start Custom Dragon")
-        alert.addButton(withTitle: "Cancel")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-
         if videoRunning { startVideo() }
         queuedDragonOperation = nil
         queuedDragonTelemetryNotBefore = nil
-        pendingDragonLaunchSummary = "CUSTOM LAB"
+        pendingDragonLaunchSummary = "CUSTOM MODIFIED"
         runDragonCommand(
             launch.applyCommand,
-            status: "APPLYING · CUSTOM LAB",
+            status: "APPLYING · CUSTOM MODIFIED",
             logMessage: "Queueing modified Dragon with validated custom arguments: \(launch.arguments)"
         )
     }
@@ -1086,14 +1155,6 @@ final class MainViewController: NSViewController {
             )
             return
         }
-
-        let alert = NSAlert()
-        alert.alertStyle = .critical
-        alert.messageText = "Restore stock Dragon startup?"
-        alert.informativeText = "A detached worker is queued before the active Dragon process is stopped, then relaunches /usr/bin/DragonStarter.sh even if the SC2 relay disconnects. Keep the drone landed with props removed."
-        alert.addButton(withTitle: "Restore stock")
-        alert.addButton(withTitle: "Cancel")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
 
         if videoRunning { startVideo() }
         queuedDragonOperation = nil
@@ -1111,7 +1172,7 @@ final class MainViewController: NSViewController {
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = "Install or update Dragon Lab on Bebop 2?"
-        alert.informativeText = "Parrot Lab will upload the patched Dragon binary and runtime helper through anonymous FTP to 192.168.42.1:/internal_000, download both files for SHA-256 verification, then mark only those uploaded files executable. It will not replace /usr/bin/dragon-prog or restart Dragon."
+        alert.informativeText = "Parrot Lab will upload the 900p Dragon binaries for Bebop firmware 4.4.2 and 4.7.1 plus the runtime helper through anonymous FTP to 192.168.42.1:/internal_000. Every file is downloaded for SHA-256 verification and marked executable. At launch, the helper reads the installed firmware version and selects only its matching binary. It will not replace /usr/bin/dragon-prog or restart Dragon."
         alert.addButton(withTitle: "Install / Update")
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
@@ -1140,7 +1201,7 @@ final class MainViewController: NSViewController {
                 self.runDragonCommand(
                     command,
                     status: "VERIFYING LAB FILES",
-                    logMessage: "FTP transfer verified; marking the two app-owned files executable and checking their MD5 digests",
+                    logMessage: "FTP transfer verified; marking the three app-owned files executable and checking their MD5 digests",
                     canRetryAfterNoResult: true
                 )
             case .failure(let error):
@@ -1295,11 +1356,124 @@ final class MainViewController: NSViewController {
         }
     }
 
-    func setVideoEnhancement(rawValue: Int) {
-        guard let preset = VideoEnhancementPreset(rawValue: rawValue) else { return }
+    @discardableResult
+    func setVideoEnhancement(rawValue: Int) -> Bool {
+        guard let preset = VideoEnhancementPreset(rawValue: rawValue) else { return false }
+        guard !streamRecorder.isActive else {
+            showMediaAlert("Finish the current recording before changing the processed-video pipeline.")
+            return false
+        }
         hudView.videoView.enhancementPreset = preset
         appendLog("Mac image enhancement changed to \(preset.menuTitle)")
         updateInterface()
+        return true
+    }
+
+    @discardableResult
+    func setMetalFXSpatialScaling(rawValue: Int) -> Bool {
+        guard let mode = VideoSpatialScalingMode(rawValue: rawValue) else { return false }
+        guard !streamRecorder.isActive else {
+            showMediaAlert("Finish the current recording before changing its processed output resolution.")
+            return false
+        }
+        if mode.usesMetalFX && !hudView.videoView.isMetalFXSpatialScalingSupported {
+            showMediaAlert("Apple MetalFX Spatial is not supported by this Mac.")
+            appendLog("MetalFX Spatial selection rejected: unsupported GPU")
+            return false
+        }
+        hudView.videoView.spatialScalingMode = mode
+        appendLog("Mac spatial scaling changed to \(mode.menuTitle)")
+        updateInterface()
+        return true
+    }
+
+    func setRawH264ArchiveEnabled(_ enabled: Bool) {
+        guard !streamRecorder.isActive else {
+            showMediaAlert("Finish the current recording before changing the diagnostic raw archive option.")
+            return
+        }
+        rawH264ArchiveEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: "ParrotLab.ArchiveRawIncomingH264")
+        appendLog(enabled
+            ? "Untouched incoming H.264 developer archive armed for future recordings"
+            : "Untouched incoming H.264 developer archive disabled")
+        updateInterface()
+    }
+
+    var isRawH264ArchiveEnabled: Bool { rawH264ArchiveEnabled }
+
+    @discardableResult
+    func setCalibratedRollingShutterEnabled(_ enabled: Bool) -> Bool {
+        calibratedRollingShutterEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: "ParrotLab.Calibrated471RollingShutterV2")
+        applyRollingShutterConfiguration()
+        appendLog(enabled
+            ? "Calibrated 4.7.1 900p rolling-shutter correction enabled for the stabilized 900p Temporal profile"
+            : "Calibrated rolling-shutter correction disabled")
+        updateInterface()
+        return true
+    }
+
+    var isCalibratedRollingShutterEnabled: Bool { calibratedRollingShutterEnabled }
+
+    func setDeveloperVideoDiagnosticsEnabled(_ enabled: Bool) {
+        developerVideoDiagnosticsEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: "ParrotLab.DeveloperVideoDiagnostics")
+        appendLog(enabled
+            ? "Detailed developer video diagnostics enabled"
+            : "Detailed developer video diagnostics hidden")
+        updateInterface()
+    }
+
+    var isDeveloperVideoDiagnosticsEnabled: Bool { developerVideoDiagnosticsEnabled }
+
+    var currentTemporalReconstructionConfiguration: TemporalReconstructionConfiguration {
+        temporalReconstructionConfiguration
+    }
+
+    func setTemporalReconstructionConfiguration(_ value: TemporalReconstructionConfiguration) {
+        var sanitized = value
+        sanitized.historyWeight = min(0.85, max(0, value.historyWeight))
+        sanitized.ghostRejection = min(1, max(0, value.ghostRejection))
+        sanitized.consistencyThresholdPixels = min(8, max(0.5, value.consistencyThresholdPixels))
+        sanitized.latencyBudgetMilliseconds = min(120, max(15, value.latencyBudgetMilliseconds))
+        temporalReconstructionConfiguration = sanitized
+        UserDefaults.standard.set(sanitized.isEnabled, forKey: "ParrotLab.Temporal.Enabled")
+        UserDefaults.standard.set(sanitized.historyWeight, forKey: "ParrotLab.Temporal.HistoryWeight")
+        UserDefaults.standard.set(sanitized.ghostRejection, forKey: "ParrotLab.Temporal.GhostRejection")
+        UserDefaults.standard.set(sanitized.consistencyThresholdPixels, forKey: "ParrotLab.Temporal.ConsistencyPixels")
+        UserDefaults.standard.set(sanitized.latencyBudgetMilliseconds, forKey: "ParrotLab.Temporal.LatencyBudgetMs")
+        UserDefaults.standard.set(sanitized.usesBidirectionalFlow, forKey: "ParrotLab.Temporal.Bidirectional")
+        applyTemporalReconstructionConfiguration()
+        appendLog(sanitized.isEnabled
+            ? String(
+                format: "Experimental temporal reconstruction enabled · history %.0f%% · ghost rejection %.0f%% · budget %.0f ms · %@ flow",
+                sanitized.historyWeight * 100,
+                sanitized.ghostRejection * 100,
+                sanitized.latencyBudgetMilliseconds,
+                sanitized.usesBidirectionalFlow ? "bidirectional" : "single-direction"
+            )
+            : "Experimental temporal reconstruction disabled")
+        updateInterface()
+    }
+
+    private func applyTemporalReconstructionConfiguration() {
+        hudView.videoView.temporalReconstructionConfiguration = temporalReconstructionConfiguration
+    }
+
+    private func applyRollingShutterConfiguration() {
+        hudView.videoView.rollingShutterConfiguration = RollingShutterProcessingConfiguration(
+            isEnabled: calibratedRollingShutterEnabled,
+            calibrationProfile: .firmware471GPUFixedRaised,
+            quaternionConvention: VideoQuaternionConvention(
+                action: .active,
+                handedness: .rightHanded,
+                composition: .frameViewOnly
+            ),
+            timestampAnchor: .frameEOF,
+            maximumStabilizationAngleDegrees: 6,
+            irqDelaySeconds: 0
+        )
     }
 
     private func beginRFPowerSC2Upload(host: String) {
@@ -1886,6 +2060,13 @@ final class MainViewController: NSViewController {
         }
     }
 
+    private static func storedDouble(_ key: String, fallback: Double) -> Double {
+        guard let number = UserDefaults.standard.object(forKey: key) as? NSNumber else {
+            return fallback
+        }
+        return number.doubleValue
+    }
+
     private func sc2DriverFTPFilePreparationCommand() -> String {
         let root = "/data/lib/ftp/internal_000"
         return "D=\(root); " +
@@ -1976,15 +2157,20 @@ final class MainViewController: NSViewController {
     }
 
     private func dragonInstallVerificationCommand(_ result: BebopToolInstallResult) -> String? {
-        guard let binary = result.assets.first(where: { $0.assetName == "dragon-prog-1080p-mode1-30fps" }),
+        guard let binary442 = result.assets.first(where: { $0.assetName == "dragon-prog-900p-4.4.2" }),
+              let binary471 = result.assets.first(where: { $0.assetName == "dragon-prog-900p-4.7.1" }),
               let helper = result.assets.first(where: { $0.assetName == "parrotlab_dragon_video.sh" }) else {
             return nil
         }
-        return "chmod 755 \(binary.devicePath) \(helper.devicePath); " +
-            "D=$(md5sum \(binary.devicePath)); D=${D%% *}; " +
+        return "chmod 755 \(binary442.devicePath) \(binary471.devicePath) \(helper.devicePath); " +
+            "D442=$(md5sum \(binary442.devicePath)); D442=${D442%% *}; " +
+            "D471=$(md5sum \(binary471.devicePath)); D471=${D471%% *}; " +
             "H=$(md5sum \(helper.devicePath)); H=${H%% *}; " +
-            "if [ -x \(binary.devicePath) ] && [ -x \(helper.devicePath) ] && " +
-            "[ \"$D\" = \"\(binary.md5)\" ] && [ \"$H\" = \"\(helper.md5)\" ]; " +
+            "if [ -x \(binary442.devicePath) ] && [ -x \(binary471.devicePath) ] && " +
+            "[ -x \(helper.devicePath) ] && " +
+            "[ \"$D442\" = \"\(binary442.md5)\" ] && " +
+            "[ \"$D471\" = \"\(binary471.md5)\" ] && " +
+            "[ \"$H\" = \"\(helper.md5)\" ]; " +
             "then echo __PARROTLAB_INSTALL__=READY; else echo __PARROTLAB_INSTALL__=ERROR; fi; exit"
     }
 
@@ -2203,6 +2389,15 @@ final class MainViewController: NSViewController {
             !sc2DriverInstallInFlight
     }
 
+    private var canApplySelectedDragonProfile: Bool {
+        connectButton.title == "Disconnect" &&
+            (temporalDragonModeSelected || hasFreshLandedTelemetry) &&
+            !dragonCommandInFlight &&
+            !toolUploadInFlight &&
+            !persistentTelnetInstallInFlight &&
+            !sc2DriverInstallInFlight
+    }
+
     private var hasFreshLandedTelemetry: Bool {
         guard snapshot.flightState == "LANDED", let lastFlightStateUpdate else { return false }
         return Date().timeIntervalSince(lastFlightStateUpdate) <= 3
@@ -2356,7 +2551,7 @@ final class MainViewController: NSViewController {
                 appendLog("Dragon Lab files are executable and match the verified FTP upload")
                 showToolAlert(
                     title: "Dragon Lab installed",
-                    message: "The patched binary and helper are verified in /data/ftp/internal_000. Stock /usr/bin/dragon-prog was not changed and Dragon was not restarted.",
+                    message: "Both firmware-specific 900p binaries and the runtime helper are verified in /data/ftp/internal_000. The helper will automatically select the 4.4.2 or 4.7.1 binary at launch. Stock /usr/bin/dragon-prog was not changed and Dragon was not restarted.",
                     style: .informational
                 )
             } else {
@@ -2392,7 +2587,7 @@ final class MainViewController: NSViewController {
                 queuedDragonOperation = .restore
                 dragonRuntimeStatus = "RESTORE QUEUED · WAITING FOR LINK"
             } else {
-                let summary = pendingDragonLaunchSummary ?? "DRAGON LAB"
+                let summary = pendingDragonLaunchSummary ?? "DRAGON VIDEO"
                 queuedDragonOperation = .launch(summary)
                 dragonRuntimeStatus = "QUEUED · \(summary)"
             }
@@ -2479,12 +2674,30 @@ final class MainViewController: NSViewController {
             videoModePopup.isEnabled = true
             videoStatus = "Restream idle"
             videoFormatStatus = "FORMAT waiting"
+            videoCodedFormatStatus = "CODED waiting"
             videoMetadataPresence = VideoMetadataPresence()
             snapshot.videoBitrateKbps = nil
             snapshot.videoEncodedAUFPS = nil
             snapshot.videoUniqueTimestampFPS = nil
             snapshot.videoDecodedFPS = nil
             snapshot.videoDisplayRefreshFPS = nil
+            snapshot.videoProcessedFPS = nil
+            snapshot.videoProcessingDroppedFrames = 0
+            snapshot.videoProcessingLatencyMs = nil
+            snapshot.videoProcessedWidth = nil
+            snapshot.videoProcessedHeight = nil
+            snapshot.videoTemporalHistoryDepth = 0
+            snapshot.videoTemporalHistoryAgeMs = nil
+            snapshot.videoTemporalMotionAvailable = false
+            snapshot.videoTemporalMotionConfidence = nil
+            snapshot.videoTemporalReprojectionStatus = "BYPASSED · NO FRAME MOTION"
+            snapshot.videoTemporalFlowLatencyMs = nil
+            snapshot.videoTemporalHistoryUsed = false
+            snapshot.videoLastRTPTimestamp = nil
+            snapshot.videoMotionAssociationOffsetMs = nil
+            snapshot.videoCameraCalibrationStatus = Bebop900pCameraCalibration.profile.statusLabel
+            snapshot.videoCameraReadoutStatus = "ROW LUT 31.167 ms · CURVED LEFT→RIGHT"
+            snapshot.videoRollingShutterStatus = "RS OFF · CALIBRATION AVAILABLE"
             snapshot.videoPackets = 0
             snapshot.videoDuplicatePackets = 0
             snapshot.videoPacketsLost = 0
@@ -2499,7 +2712,7 @@ final class MainViewController: NSViewController {
         }
         let mode = selectedVideoMode
         hudView.videoView.receiveMode = mode
-        streamRecorder.resetParameterSets()
+        rawArchiveRecorder.resetParameterSets()
         do {
             try rtpReceiver.start(port: port)
             videoRunning = true
@@ -2507,7 +2720,7 @@ final class MainViewController: NSViewController {
             videoModePopup.isEnabled = false
             videoStatus = "Listening UDP \(port) · probing SC2"
             if let profile = mode.expectedDragonProfile {
-                appendLog("Starting 1080p Lab receiver; expected Dragon profile: \(profile)")
+                appendLog("Starting \(mode.menuTitle) receiver; expected Dragon profile: \(profile)")
             } else {
                 appendLog("Starting compatibility receiver with the proven recovery decoder")
             }
@@ -2615,22 +2828,33 @@ final class MainViewController: NSViewController {
             snapshot.sc2PowerState ?? "—"
         ].joined(separator: "\n")
 
-        videoLabel.stringValue = [
-            "MODE \(selectedVideoMode.statusLabel)",
-            "ENHANCEMENT \(hudView.videoView.enhancementPreset.statusLabel)",
+        var videoLines = [
+            "MODE \(selectedVideoMode.statusLabel) · ENH \(hudView.videoView.enhancementPreset.statusLabel)",
+            "\(videoFormatStatus) · OUT \(processedOutputStatus)",
             videoStatus,
-            videoFormatStatus,
-            metadataStatus,
-            "RTP \(snapshot.videoBitrateKbps.map { "\($0) kbps" } ?? "waiting")",
-            "ENCODED AU FPS \(fps(snapshot.videoEncodedAUFPS))",
-            "UNIQUE RTP TS FPS \(fps(snapshot.videoUniqueTimestampFPS))",
-            "DECODED FPS \(fps(snapshot.videoDecodedFPS))",
-            "DISPLAY REFRESH FPS \(fps(snapshot.videoDisplayRefreshFPS))",
-            "PACKETS \(snapshot.videoPackets)",
-            "DUPLICATE RTP \(snapshot.videoDuplicatePackets)",
-            "LOST \(snapshot.videoPacketsLost)",
-            "JITTER \(snapshot.videoJitterMs.map { String(format: "%.1f ms", $0) } ?? "—")"
-        ].joined(separator: "\n")
+            "RTP \(snapshot.videoBitrateKbps.map { "\($0) kbps" } ?? "waiting") · LOST \(snapshot.videoPacketsLost)",
+            "FPS AU \(fps(snapshot.videoEncodedAUFPS)) · DEC \(fps(snapshot.videoDecodedFPS)) · PROC \(fps(snapshot.videoProcessedFPS))",
+            snapshot.videoRollingShutterStatus,
+            processedRecordingStatus
+        ]
+        if developerVideoDiagnosticsEnabled {
+            videoLines.append(contentsOf: [
+                "SCALER \(hudView.videoView.spatialScalingMode.statusLabel) · \(videoCodedFormatStatus)",
+                metadataStatus,
+                "PKT \(snapshot.videoPackets) · DUP \(snapshot.videoDuplicatePackets) · JIT \(snapshot.videoJitterMs.map { String(format: "%.1f ms", $0) } ?? "—")",
+                "RTP-TS FPS \(fps(snapshot.videoUniqueTimestampFPS)) · DISPLAY \(fps(snapshot.videoDisplayRefreshFPS))",
+                "PROCESS \(snapshot.videoProcessingLatencyMs.map { String(format: "%.1f ms", $0) } ?? "—") · DROP \(snapshot.videoProcessingDroppedFrames)",
+                "TEMPORAL \(snapshot.videoTemporalHistoryDepth)/3 · \(snapshot.videoTemporalHistoryAgeMs.map { String(format: "%.1f ms", $0) } ?? "—")",
+                "MOTION \(snapshot.videoTemporalMotionAvailable ? "AU-SYNC" : "WAITING") · CONF \(snapshot.videoTemporalMotionConfidence.map { String(format: "%.2f", $0) } ?? "—")",
+                "FLOW \(snapshot.videoTemporalFlowLatencyMs.map { String(format: "%.1f ms", $0) } ?? "—") · HISTORY \(snapshot.videoTemporalHistoryUsed ? "USED" : "RESET/BYPASS")",
+                "RTP TS \(snapshot.videoLastRTPTimestamp.map(String.init) ?? "—") · ASSOCIATION \(snapshot.videoMotionAssociationOffsetMs == nil ? "—" : "EXACT")",
+                snapshot.videoTemporalReprojectionStatus,
+                "CAL \(snapshot.videoCameraCalibrationStatus)",
+                snapshot.videoCameraReadoutStatus
+            ])
+        }
+        videoLabel.maximumNumberOfLines = developerVideoDiagnosticsEnabled ? 24 : 7
+        videoLabel.stringValue = videoLines.joined(separator: "\n")
 
         let connected = connectButton.title == "Disconnect"
         let landed = hasFreshLandedTelemetry
@@ -2638,19 +2862,20 @@ final class MainViewController: NSViewController {
             persistentTelnetInstallInFlight || sc2DriverInstallInFlight
         hostField.isEnabled = !deviceOperationActive
         connectButton.isEnabled = !deviceOperationActive
-        let controlsEnabled = connected && landed && !dragonCommandInFlight &&
+        let profileSelectionEnabled = connected && !dragonCommandInFlight &&
             !toolUploadInFlight && !persistentTelnetInstallInFlight &&
             !sc2DriverInstallInFlight
         let customSelected = customDragonModeSelected
-        dragonResolutionPopup.isEnabled = controlsEnabled
-        dragonBitrateSlider.isEnabled = controlsEnabled && !customSelected
-        dragonLockRateButton.isEnabled = controlsEnabled && !customSelected
+        let profileApplyEnabled = profileSelectionEnabled && (temporalDragonModeSelected || landed)
+        dragonResolutionPopup.isEnabled = profileSelectionEnabled
+        dragonBitrateSlider.isEnabled = profileSelectionEnabled && !customSelected
+        dragonLockRateButton.isEnabled = profileSelectionEnabled && !customSelected
         dragonCustomArgumentsLabel.isHidden = !customSelected
         dragonCustomArgumentsField.isHidden = !customSelected
-        dragonCustomArgumentsField.isEnabled = controlsEnabled && customSelected
+        dragonCustomArgumentsField.isEnabled = profileSelectionEnabled && landed && customSelected
         dragonApplyButton.title = customSelected ? "Start custom" : "Apply profile"
-        dragonApplyButton.isEnabled = controlsEnabled
-        dragonRestoreButton.isEnabled = controlsEnabled
+        dragonApplyButton.isEnabled = profileApplyEnabled
+        dragonRestoreButton.isEnabled = profileSelectionEnabled && landed
 
         let recordingActive = streamRecorder.isActive
         browseMediaButton.isEnabled = !recordingActive && !dronePhotoInFlight
@@ -2665,6 +2890,9 @@ final class MainViewController: NSViewController {
         } else if !connected {
             dragonStatusLabel.stringValue = "SC2 OFFLINE"
             dragonStatusLabel.textColor = LabVisualStyle.mutedText
+        } else if !landed && temporalDragonModeSelected {
+            dragonStatusLabel.stringValue = "TEMPORAL READY · NO FLIGHT INTERLOCK"
+            dragonStatusLabel.textColor = .systemGreen
         } else if !landed {
             let status = snapshot.flightState == "LANDED" ? "STALE TELEMETRY" : snapshot.flightState
             dragonStatusLabel.stringValue = "LOCKED · \(status)"
@@ -2678,7 +2906,34 @@ final class MainViewController: NSViewController {
     private var metadataStatus: String {
         let sei = videoMetadataPresence.hasLegacyFrameInfoSEI ? "SEI ✓" : "SEI —"
         let rtp = videoMetadataPresence.hasRTPHeaderExtensions ? "RTP-EXT ✓" : "RTP-EXT —"
-        return "META \(sei)  \(rtp)"
+        let motion = videoMetadataPresence.hasDecodedVideoMetadataV2 ? "MOTION SYNC ✓" : "MOTION —"
+        return "META \(sei)  \(rtp)  \(motion)"
+    }
+
+    private var processedOutputStatus: String {
+        guard let width = snapshot.videoProcessedWidth,
+              let height = snapshot.videoProcessedHeight,
+              width > 0, height > 0 else { return "waiting" }
+        return "\(width)x\(height)"
+    }
+
+    private var processedRecordingStatus: String {
+        guard streamRecorder.isActive else {
+            return rawH264ArchiveEnabled ? "REC PROCESSED · RAW ARCHIVE ARMED" : "REC PROCESSED"
+        }
+        guard let stats = processedRecordingStats else { return "REC STARTING"
+        }
+        return String(
+            format: "REC %dx%d · %.1f FPS · %.1f Mbps · DROP %llu+%llu · Q %d/%@",
+            stats.width,
+            stats.height,
+            stats.encodedFPS,
+            stats.bitrateMbps,
+            stats.droppedBeforeEncoder,
+            stats.droppedByEncoder,
+            stats.encoderInFlight,
+            ByteCountFormatter.string(fromByteCount: Int64(stats.diskQueueBytes), countStyle: .memory)
+        )
     }
 
     @objc private func browseMediaDirectory() {
@@ -2709,7 +2964,20 @@ final class MainViewController: NSViewController {
         let started = Date()
         do {
             let temporaryURL = try streamRecorder.start(directory: mediaDirectoryURL, at: started)
+            if rawH264ArchiveEnabled {
+                do {
+                    let rawURL = try rawArchiveRecorder.start(
+                        directory: mediaDirectoryURL,
+                        at: started,
+                        rawArchive: true
+                    )
+                    appendLog("Untouched diagnostic H.264 archive started: \(rawURL.path)")
+                } catch {
+                    appendLog("Processed recording will continue, but raw archive could not start: \(error.localizedDescription)")
+                }
+            }
             recordingStartedAt = started
+            processedRecordingStats = nil
             recordingButton.image = NSImage(systemSymbolName: "stop.circle.fill", accessibilityDescription: nil)
             recordingButton.bezelColor = .systemRed
             recordingTimer?.invalidate()
@@ -2718,7 +2986,7 @@ final class MainViewController: NSViewController {
             }
             updateRecordingButton()
             updateInterface()
-            appendLog("Raw H.264 recording started: \(temporaryURL.path)")
+            appendLog("Processed Parrot Lab H.264 recording started: \(temporaryURL.path)")
         } catch {
             showMediaAlert("Could not start recording: \(error.localizedDescription)")
             appendLog("Recording failed to start: \(error.localizedDescription)")
@@ -2732,6 +3000,7 @@ final class MainViewController: NSViewController {
         recordingButton.title = "Finishing…"
         recordingButton.isEnabled = false
         streamRecorder.stop()
+        rawArchiveRecorder.stop()
     }
 
     private func updateRecordingButton() {
@@ -2741,9 +3010,11 @@ final class MainViewController: NSViewController {
     }
 
     private func recordingFinished(_ result: H264RecordingResult) {
+        rawArchiveRecorder.stop()
         recordingTimer?.invalidate()
         recordingTimer = nil
         recordingStartedAt = nil
+        processedRecordingStats = nil
         recordingButton.title = "Record"
         recordingButton.image = NSImage(systemSymbolName: "record.circle", accessibilityDescription: nil)
         recordingButton.bezelColor = .systemRed
@@ -2752,6 +3023,109 @@ final class MainViewController: NSViewController {
         appendLog("Recording saved: \(result.url.path) · \(MediaFileNamer.durationStamp(result.duration)) · \(size)")
         if let error = result.errorDescription {
             showMediaAlert("The partial recording was saved, but an error occurred: \(error)")
+        }
+    }
+
+    func convertFinishedH264ToMP4() {
+        guard !videoConversionInFlight, !mp4Converter.isConverting else {
+            showMediaAlert("A video conversion is already running.")
+            return
+        }
+
+        let openPanel = NSOpenPanel()
+        openPanel.title = "Choose a finished Parrot Lab H.264 recording"
+        openPanel.prompt = "Choose Recording"
+        openPanel.allowedContentTypes = [UTType(filenameExtension: "h264") ?? .data]
+        openPanel.allowsMultipleSelection = false
+        openPanel.canChooseDirectories = false
+        openPanel.directoryURL = mediaDirectoryURL
+        guard openPanel.runModal() == .OK, let inputURL = openPanel.url else { return }
+
+        let savedQuality = UserDefaults.standard.object(forKey: Self.mp4QualityPreferenceKey) as? Int
+            ?? MP4ConversionQuality.maximum
+        let qualityView = MP4ConversionQualityView(initialPercent: savedQuality)
+        let qualityAlert = NSAlert()
+        qualityAlert.alertStyle = .informational
+        qualityAlert.messageText = "MP4 conversion quality"
+        qualityAlert.informativeText = "100% packages the original H.264 stream into MP4 without changing a frame. Lower settings re-encode the video to reduce its size."
+        qualityAlert.accessoryView = qualityView
+        qualityAlert.addButton(withTitle: "Continue")
+        qualityAlert.addButton(withTitle: "Cancel")
+        guard qualityAlert.runModal() == .alertFirstButtonReturn else { return }
+        let quality = qualityView.quality
+        UserDefaults.standard.set(quality.percent, forKey: Self.mp4QualityPreferenceKey)
+
+        let savePanel = NSSavePanel()
+        savePanel.title = "Save converted MP4"
+        savePanel.prompt = "Convert"
+        savePanel.allowedContentTypes = [.mpeg4Movie]
+        savePanel.canCreateDirectories = true
+        savePanel.directoryURL = inputURL.deletingLastPathComponent()
+        savePanel.nameFieldStringValue = inputURL.deletingPathExtension().lastPathComponent + ".mp4"
+        guard savePanel.runModal() == .OK, let outputURL = savePanel.url else { return }
+
+        beginMP4Conversion(inputURL: inputURL, outputURL: outputURL, quality: quality)
+    }
+
+    private func beginMP4Conversion(
+        inputURL: URL,
+        outputURL: URL,
+        quality: MP4ConversionQuality
+    ) {
+        let progress = NSProgressIndicator()
+        progress.style = .spinning
+        progress.controlSize = .regular
+        progress.startAnimation(nil)
+        progress.frame = NSRect(x: 0, y: 0, width: 390, height: 32)
+
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = quality.copiesOriginalStream
+            ? "Packaging original video into MP4…"
+            : "Converting video to MP4…"
+        alert.informativeText = "Source: \(inputURL.lastPathComponent)\nQuality: \(quality.displayLabel)"
+        alert.accessoryView = progress
+        alert.addButton(withTitle: "Cancel")
+        videoConversionInFlight = true
+        videoConversionProgressAlert = alert
+        appendLog("MP4 conversion started: \(inputURL.path) → \(outputURL.path) · \(quality.displayLabel)")
+
+        if let window = view.window {
+            alert.beginSheetModal(for: window) { [weak self] _ in
+                guard let self, self.videoConversionInFlight else { return }
+                self.appendLog("Cancelling MP4 conversion")
+                self.mp4Converter.cancel()
+            }
+        }
+        mp4Converter.convert(inputURL: inputURL, outputURL: outputURL, quality: quality)
+    }
+
+    private func mp4ConversionFinished(_ result: Result<H264MP4ConversionResult, Error>) {
+        videoConversionInFlight = false
+        if let alert = videoConversionProgressAlert {
+            if let parent = alert.window.sheetParent {
+                parent.endSheet(alert.window)
+            } else {
+                alert.window.orderOut(nil)
+            }
+        }
+        videoConversionProgressAlert = nil
+
+        switch result {
+        case .failure(let error):
+            appendLog("MP4 conversion failed: \(error.localizedDescription)")
+            showMediaAlert("Could not convert the video: \(error.localizedDescription)")
+        case .success(let conversion):
+            appendLog("MP4 saved: \(conversion.outputURL.path) · \(conversion.quality.displayLabel)")
+            let alert = NSAlert()
+            alert.alertStyle = .informational
+            alert.messageText = "MP4 video saved"
+            alert.informativeText = "Saved \(conversion.outputURL.lastPathComponent) to:\n\(conversion.outputURL.deletingLastPathComponent().path)"
+            alert.addButton(withTitle: "Reveal in Finder")
+            alert.addButton(withTitle: "OK")
+            if alert.runModal() == .alertFirstButtonReturn {
+                NSWorkspace.shared.activateFileViewerSelecting([conversion.outputURL])
+            }
         }
     }
 
@@ -2872,6 +3246,7 @@ final class MainViewController: NSViewController {
     }
 
     func prepareForTermination() {
+        mp4Converter.cancel()
         toolInstaller.cancel()
         sc2USBDiscovery.cancel()
         droneFisheyeCapture.cancel()
@@ -2888,6 +3263,7 @@ final class MainViewController: NSViewController {
         recordingTimer?.invalidate()
         recordingTimer = nil
         streamRecorder.stopAndWait()
+        rawArchiveRecorder.stopAndWait()
         _ = pictureWriteGroup.wait(timeout: .now() + 5)
     }
 

@@ -5,14 +5,42 @@ import CoreMedia
 import QuartzCore
 import VideoToolbox
 
+private final class DecodedVideoFrameContext {
+    let timing: VideoFrameTiming
+    let motion: VerifiedVideoFrameMotion?
+
+    init(timing: VideoFrameTiming, motion: VerifiedVideoFrameMotion?) {
+        self.timing = timing
+        self.motion = motion
+    }
+}
+
 struct VideoPipelineStats: Equatable {
     let decodedFPS: Double
     let displayRefreshFPS: Double
+    let processedFPS: Double
+    let processingDroppedFrames: UInt64
+    let processingLatencyMilliseconds: Double
+    let processedWidth: Int
+    let processedHeight: Int
+    let temporalHistoryDepth: Int
+    let temporalHistoryAgeMilliseconds: Double
+    let temporalMotionAvailable: Bool
+    let temporalMotionConfidence: Double?
+    let temporalReprojectionStatus: String
+    let temporalFlowLatencyMilliseconds: Double?
+    let temporalHistoryUsed: Bool
+    let lastRTPTimestamp: UInt32?
+    let motionAssociationOffsetMilliseconds: Double?
+    let cameraCalibrationStatus: String
+    let cameraReadoutStatus: String
+    let rollingShutterStatus: String
 }
 
 enum VideoEnhancementPreset: Int, CaseIterable {
     case off
     case denoise
+    case h264ArtifactRepair
     case clarity
     case lowLight
     case upscale2x
@@ -22,6 +50,7 @@ enum VideoEnhancementPreset: Int, CaseIterable {
         switch self {
         case .off: return "Off · Source Image"
         case .denoise: return "Denoise"
+        case .h264ArtifactRepair: return "H.264 Artifact Repair · Color Blocks + Mosquito Noise"
         case .clarity: return "Clarity"
         case .lowLight: return "Low-Light Cleanup"
         case .upscale2x: return "High-Quality 2× Upscale"
@@ -33,6 +62,7 @@ enum VideoEnhancementPreset: Int, CaseIterable {
         switch self {
         case .off: return "OFF"
         case .denoise: return "DENOISE"
+        case .h264ArtifactRepair: return "H264 REPAIR"
         case .clarity: return "CLARITY"
         case .lowLight: return "LOW LIGHT"
         case .upscale2x: return "2X UPSCALE"
@@ -41,12 +71,66 @@ enum VideoEnhancementPreset: Int, CaseIterable {
     }
 }
 
+enum VideoSpatialScalingMode: Int, CaseIterable {
+    case off = 0
+    case metalFX2x = 1
+    case metalFX1080p = 2
+    case metalFX1440p = 3
+    case metalFX1800p = 4
+    case metalFX2160p = 5
+
+    var menuTitle: String {
+        switch self {
+        case .off: return "Off · Native Resolution"
+        case .metalFX2x: return "Apple MetalFX Spatial · 2×"
+        case .metalFX1080p: return "Apple MetalFX Spatial · 1920 × 1080"
+        case .metalFX1440p: return "Apple MetalFX Spatial · 2560 × 1440"
+        case .metalFX1800p: return "Apple MetalFX Spatial · 3200 × 1800"
+        case .metalFX2160p: return "Apple MetalFX Spatial · 3840 × 2160"
+        }
+    }
+
+    var statusLabel: String {
+        switch self {
+        case .off: return "OFF"
+        case .metalFX2x: return "METALFX 2X"
+        case .metalFX1080p: return "METALFX 1080P"
+        case .metalFX1440p: return "METALFX 1440P"
+        case .metalFX1800p: return "METALFX 1800P"
+        case .metalFX2160p: return "METALFX 4K"
+        }
+    }
+
+    var usesMetalFX: Bool { self != .off }
+
+    func outputDimensions(sourceWidth: Int, sourceHeight: Int) -> (width: Int, height: Int) {
+        switch self {
+        case .off:
+            return (Self.even(sourceWidth), Self.even(sourceHeight))
+        case .metalFX2x:
+            return (Self.even(sourceWidth * 2), Self.even(sourceHeight * 2))
+        case .metalFX1080p:
+            return (1_920, 1_080)
+        case .metalFX1440p:
+            return (2_560, 1_440)
+        case .metalFX1800p:
+            return (3_200, 1_800)
+        case .metalFX2160p:
+            return (3_840, 2_160)
+        }
+    }
+
+    private static func even(_ value: Int) -> Int { max(2, value & ~1) }
+}
+
 final class H264VideoView: NSView {
     var onDebug: ((String) -> Void)?
     var onFormat: ((Int, Int) -> Void)?
+    var onCodedFormat: ((Int, Int) -> Void)?
     var onMetadataPresence: ((VideoMetadataPresence) -> Void)?
     var onFrameReady: (() -> Void)?
     var onPipelineStats: ((VideoPipelineStats) -> Void)?
+    var onProcessedFrame: ((ProcessedVideoFrame) -> Void)?
     var receiveMode: VideoReceiveMode = .compatibility {
         didSet {
             guard receiveMode != oldValue else { return }
@@ -62,15 +146,66 @@ final class H264VideoView: NSView {
         set {
             enhancementLock.lock()
             storedEnhancementPreset = newValue
+            let scaling = storedSpatialScalingMode
             enhancementLock.unlock()
+            processingPipeline.update(enhancement: newValue, scaling: scaling)
         }
     }
-    private let videoLayer = CALayer()
-    private let ciContext = CIContext(options: [.cacheIntermediates: false])
+    var spatialScalingMode: VideoSpatialScalingMode {
+        get {
+            enhancementLock.lock()
+            defer { enhancementLock.unlock() }
+            return storedSpatialScalingMode
+        }
+        set {
+            enhancementLock.lock()
+            storedSpatialScalingMode = newValue
+            let enhancement = storedEnhancementPreset
+            enhancementLock.unlock()
+            processingPipeline.update(enhancement: enhancement, scaling: newValue)
+        }
+    }
+    var isMetalFXSpatialScalingSupported: Bool { processingPipeline.isMetalFXSupported }
+    var rollingShutterConfiguration: RollingShutterProcessingConfiguration {
+        get {
+            enhancementLock.lock()
+            defer { enhancementLock.unlock() }
+            return storedRollingShutterConfiguration
+        }
+        set {
+            enhancementLock.lock()
+            storedRollingShutterConfiguration = newValue
+            enhancementLock.unlock()
+            processingPipeline.updateRollingShutterConfiguration(newValue)
+        }
+    }
+    var temporalReconstructionConfiguration: TemporalReconstructionConfiguration {
+        get {
+            enhancementLock.lock()
+            defer { enhancementLock.unlock() }
+            return storedTemporalReconstructionConfiguration
+        }
+        set {
+            enhancementLock.lock()
+            storedTemporalReconstructionConfiguration = newValue
+            enhancementLock.unlock()
+            processingPipeline.updateTemporalReconstructionConfiguration(newValue)
+        }
+    }
+    private let videoLayer = AVSampleBufferDisplayLayer()
+    private let stillImageContext = CIContext(options: [.cacheIntermediates: false])
     private let softwareColorSpace = CGColorSpaceCreateDeviceRGB()
     private let enhancementLock = NSLock()
     private var storedEnhancementPreset = VideoEnhancementPreset.off
+    private var storedSpatialScalingMode = VideoSpatialScalingMode.off
+    private var storedRollingShutterConfiguration = RollingShutterProcessingConfiguration()
+    private var storedTemporalReconstructionConfiguration = TemporalReconstructionConfiguration()
+    private let processingPipeline = LiveVideoProcessingPipeline()
     private var formatDescription: CMVideoFormatDescription?
+    private var visibleSourceRect: CGRect?
+    private var rtpTimestampMapper = RTPVideoTimestampMapper()
+    private var lastDroneVideoQuaternion: VideoMetadataQuaternion?
+    private var lastFrameVideoQuaternion: VideoMetadataQuaternion?
     private var decompressionSession: VTDecompressionSession?
     private var softwareDecoder: FFmpegVideoDecoder?
     private var sps: Data?
@@ -84,14 +219,35 @@ final class H264VideoView: NSView {
     private var metadataPresence = VideoMetadataPresence()
     private var extensionDumpHandle: FileHandle?
     private var dumpedExtensionAccessUnits = 0
-    private var latestDecodedFrame: CGImage?
+    private var latestProcessedPixelBuffer: CVPixelBuffer?
+    private var displayFormatDescription: CMVideoFormatDescription?
+    private var displayFormatKey: String?
     private let hardwareFrameLock = NSLock()
-    private var pendingHardwareFrame: CGImage?
+    private var pendingHardwareFrame: ProcessedVideoFrame?
     private var hardwareFrameDeliveryScheduled = false
     private let frameRateLock = NSLock()
     private var decodedFramesInWindow = 0
     private var displayedFramesInWindow = 0
     private var frameRateWindowStarted = Date()
+    private var latestProcessingStats = LiveVideoProcessingStats(
+        processedFPS: 0,
+        droppedBeforeProcessing: 0,
+        outputWidth: 0,
+        outputHeight: 0,
+        averageLatencyMilliseconds: 0,
+        temporalHistoryDepth: 0,
+        temporalHistoryAgeMilliseconds: 0,
+        temporalMotionAvailable: false,
+        temporalMotionConfidence: nil,
+        temporalReprojectionStatus: "BYPASSED · NO FRAME MOTION",
+        temporalFlowLatencyMilliseconds: nil,
+        temporalHistoryUsed: false,
+        lastRTPTimestamp: nil,
+        motionAssociationOffsetMilliseconds: nil,
+        cameraCalibrationStatus: Bebop900pCameraCalibration.profile.statusLabel,
+        cameraReadoutStatus: "ROW LUT 31.167 ms · CURVED LEFT→RIGHT",
+        rollingShutterStatus: "RS OFF · CALIBRATION AVAILABLE"
+    )
 
     private static let legacyFrameInfoUUID = Data([
         0x97, 0x77, 0x08, 0x83, 0xc8, 0xd3, 0x40, 0x2e,
@@ -102,10 +258,23 @@ final class H264VideoView: NSView {
         super.init(frame: frameRect)
         wantsLayer = true
         layer?.backgroundColor = NSColor.black.cgColor
-        videoLayer.contentsGravity = .resizeAspect
+        videoLayer.videoGravity = .resizeAspect
         videoLayer.backgroundColor = NSColor.black.cgColor
         videoLayer.actions = ["contents": NSNull()]
         layer?.addSublayer(videoLayer)
+        processingPipeline.onDebug = { [weak self] message in self?.onDebug?(message) }
+        processingPipeline.onFrame = { [weak self] frame in
+            guard let self else { return }
+            self.onProcessedFrame?(frame)
+            self.enqueueLatestHardwareFrame(frame)
+        }
+        processingPipeline.onStats = { [weak self] stats in
+            guard let self else { return }
+            self.frameRateLock.lock()
+            self.latestProcessingStats = stats
+            self.frameRateLock.unlock()
+        }
+        processingPipeline.update(enhancement: .off, scaling: .off)
     }
 
     required init?(coder: NSCoder) { nil }
@@ -130,15 +299,22 @@ final class H264VideoView: NSView {
         captureAnnexB(nalUnits)
         if formatDescription == nil { rebuildFormatDescription() }
         guard let formatDescription else { return }
-        softwareDecoder?.feed(nalUnits: nalUnits)
 
         let frameNALs = nalUnits.filter {
             guard let byte = $0.first else { return false }
             return ![7, 8, 9].contains(Int(byte & 0x1f))
         }
-        guard !frameNALs.isEmpty else { return }
+        guard frameNALs.contains(where: {
+            guard let byte = $0.first else { return false }
+            return (1...5).contains(Int(byte & 0x1f))
+        }) else { return }
+        let frameTiming = rtpTimestampMapper.timing(for: accessUnit.rtpTimestamp)
+        let verifiedMotion = accessUnit.videoMetadata.map {
+            makeVerifiedMotion(metadata: $0, timing: frameTiming)
+        }
 
         if softwareDecoder != nil {
+            softwareDecoder?.feed(nalUnits: nalUnits, timing: frameTiming, motion: verifiedMotion)
             if !reportedFirstFrame {
                 reportedFirstFrame = true
                 onDebug?("First H.264 access unit sent to recovery decoder (NAL types: \(frameNALs.compactMap { $0.first.map { String($0 & 0x1f) } }.joined(separator: ",")))")
@@ -177,8 +353,8 @@ final class H264VideoView: NSView {
         guard replaceStatus == kCMBlockBufferNoErr else { return }
 
         var timing = CMSampleTimingInfo(
-            duration: .invalid,
-            presentationTimeStamp: .invalid,
+            duration: frameTiming.nominalDuration,
+            presentationTimeStamp: frameTiming.presentationTime,
             decodeTimeStamp: .invalid
         )
         var sampleSize = sampleData.count
@@ -205,7 +381,7 @@ final class H264VideoView: NSView {
             first[kCMSampleAttachmentKey_DependsOnOthers] = !isSync
         }
 
-        decode(sampleBuffer)
+        decode(sampleBuffer, timing: frameTiming, motion: verifiedMotion)
         if !reportedFirstFrame {
             reportedFirstFrame = true
             onDebug?("First H.264 access unit queued (NAL types: \(frameNALs.compactMap { $0.first.map { String($0 & 0x1f) } }.joined(separator: ",")))")
@@ -222,13 +398,20 @@ final class H264VideoView: NSView {
         decompressionSession = nil
         softwareDecoder?.stop()
         softwareDecoder = nil
+        processingPipeline.reset()
+        rtpTimestampMapper.reset()
+        lastDroneVideoQuaternion = nil
+        lastFrameVideoQuaternion = nil
         hardwareFrameLock.lock()
         pendingHardwareFrame = nil
         hardwareFrameDeliveryScheduled = false
         hardwareFrameLock.unlock()
-        videoLayer.contents = nil
-        latestDecodedFrame = nil
+        videoLayer.flushAndRemoveImage()
+        latestProcessedPixelBuffer = nil
+        displayFormatDescription = nil
+        displayFormatKey = nil
         formatDescription = nil
+        visibleSourceRect = nil
         sps = nil
         pps = nil
         reportedParameterSets = false
@@ -245,6 +428,25 @@ final class H264VideoView: NSView {
         decodedFramesInWindow = 0
         displayedFramesInWindow = 0
         frameRateWindowStarted = Date()
+        latestProcessingStats = LiveVideoProcessingStats(
+            processedFPS: 0,
+            droppedBeforeProcessing: 0,
+            outputWidth: 0,
+            outputHeight: 0,
+            averageLatencyMilliseconds: 0,
+            temporalHistoryDepth: 0,
+            temporalHistoryAgeMilliseconds: 0,
+            temporalMotionAvailable: false,
+            temporalMotionConfidence: nil,
+            temporalReprojectionStatus: "BYPASSED · NO FRAME MOTION",
+            temporalFlowLatencyMilliseconds: nil,
+            temporalHistoryUsed: false,
+            lastRTPTimestamp: nil,
+            motionAssociationOffsetMilliseconds: nil,
+            cameraCalibrationStatus: Bebop900pCameraCalibration.profile.statusLabel,
+            cameraReadoutStatus: "ROW LUT 31.167 ms · CURVED LEFT→RIGHT",
+            rollingShutterStatus: "RS OFF · CALIBRATION AVAILABLE"
+        )
         frameRateLock.unlock()
     }
 
@@ -274,17 +476,32 @@ final class H264VideoView: NSView {
         }
         if status == noErr {
             formatDescription = description
+            if let description {
+                let coded = CMVideoFormatDescriptionGetDimensions(description)
+                let codedRect = CGRect(x: 0, y: 0, width: Int(coded.width), height: Int(coded.height))
+                let clean = CMVideoFormatDescriptionGetCleanAperture(
+                    description,
+                    originIsAtTopLeft: false
+                ).intersection(codedRect)
+                visibleSourceRect = clean.isNull || clean.isEmpty ? codedRect : clean
+            }
             rebuildDecompressionSession(description)
             if !reportedParameterSets {
                 reportedParameterSets = true
                 if let description {
-                    let dimensions = CMVideoFormatDescriptionGetDimensions(description)
-                    let width = Int(dimensions.width)
-                    let height = Int(dimensions.height)
+                    let coded = CMVideoFormatDescriptionGetDimensions(description)
+                    let presentation = CMVideoFormatDescriptionGetPresentationDimensions(
+                        description,
+                        usePixelAspectRatio: true,
+                        useCleanAperture: true
+                    )
+                    let width = Int(presentation.width.rounded())
+                    let height = Int(presentation.height.rounded())
                     onFormat?(width, height)
-                    if receiveMode == .experimental1080p,
-                       width != 1_920 || !(1_080...1_088).contains(height) {
-                        onDebug?("1080p Lab expected 1920x1080/1088 but SPS reports \(width)x\(height); continuing safely")
+                    onCodedFormat?(Int(coded.width), Int(coded.height))
+                    if receiveMode.is900p,
+                       Int(coded.width) != 1_600 || !(900...912).contains(Int(coded.height)) {
+                        onDebug?("900p receiver expected 1600x900/912 but SPS reports \(Int(coded.width))x\(Int(coded.height)); continuing safely")
                     }
                 }
                 onDebug?("H.264 SPS/PPS accepted")
@@ -292,6 +509,32 @@ final class H264VideoView: NSView {
         } else {
             onDebug?("H.264 SPS/PPS rejected: OSStatus \(status)")
         }
+    }
+
+    private func makeVerifiedMotion(
+        metadata: VideoMetadataV2,
+        timing: VideoFrameTiming
+    ) -> VerifiedVideoFrameMotion {
+        let quaternionError = abs(metadata.droneQuaternion.norm - 1) +
+            abs(metadata.frameQuaternion.norm - 1)
+        let drone = metadata.droneQuaternion.preservingSignContinuity(
+            after: lastDroneVideoQuaternion
+        )
+        let frame = metadata.frameQuaternion.preservingSignContinuity(
+            after: lastFrameVideoQuaternion
+        )
+        lastDroneVideoQuaternion = drone
+        lastFrameVideoQuaternion = frame
+        return VerifiedVideoFrameMotion(
+            sampleTime: timing.presentationTime,
+            rtpTimestamp: metadata.rtpTimestamp,
+            droneQuaternion: drone,
+            frameQuaternion: frame,
+            cameraPanRadians: metadata.cameraPanRadians,
+            cameraTiltRadians: metadata.cameraTiltRadians,
+            exposureDurationSeconds: metadata.exposureMilliseconds / 1_000,
+            confidence: max(0, min(1, 1 - quaternionError * 10))
+        )
     }
 
     private func rebuildDecompressionSession(_ description: CMFormatDescription?) {
@@ -329,8 +572,14 @@ final class H264VideoView: NSView {
             decoder.onDecodedFrame = { [weak self] in
                 self?.recordFrameRate(decoded: 1, displayed: 0)
             }
-            decoder.onFrame = { [weak self] data, width, height in
-                self?.handleSoftwareFrame(data: data, width: width, height: height)
+            decoder.onFrame = { [weak self] data, width, height, timing, motion in
+                self?.handleSoftwareFrame(
+                    data: data,
+                    width: width,
+                    height: height,
+                    timing: timing,
+                    motion: motion
+                )
             }
             if decoder.start() {
                 softwareDecoder = decoder
@@ -343,10 +592,18 @@ final class H264VideoView: NSView {
 
     private func createVideoToolboxSession(description: CMFormatDescription) -> Bool {
         var callback = VTDecompressionOutputCallbackRecord(
-            decompressionOutputCallback: { refCon, _, status, _, imageBuffer, _, _ in
+            decompressionOutputCallback: { refCon, sourceFrameRefCon, status, _, imageBuffer, _, _ in
                 guard let refCon else { return }
                 let view = Unmanaged<H264VideoView>.fromOpaque(refCon).takeUnretainedValue()
-                view.handleDecodedFrame(status: status, imageBuffer: imageBuffer)
+                let context = sourceFrameRefCon.map {
+                    Unmanaged<DecodedVideoFrameContext>.fromOpaque($0).takeRetainedValue()
+                }
+                view.handleDecodedFrame(
+                    status: status,
+                    imageBuffer: imageBuffer,
+                    timing: context?.timing,
+                    motion: context?.motion
+                )
             },
             decompressionOutputRefCon: Unmanaged.passUnretained(self).toOpaque()
         )
@@ -376,7 +633,7 @@ final class H264VideoView: NSView {
     private func scheduleHardwareDecoderFallback(width: Int, height: Int) {
         let workItem = DispatchWorkItem { [weak self] in
             guard let self, !self.reportedFirstDecodedFrame, self.softwareDecoder == nil else { return }
-            self.onDebug?("VideoToolbox produced no frame in 3 seconds; switching 1080p Lab to recovery decoder")
+            self.onDebug?("VideoToolbox produced no frame in 3 seconds; switching the 900p receiver to the recovery decoder")
             if let decompressionSession = self.decompressionSession {
                 VTDecompressionSessionInvalidate(decompressionSession)
                 self.decompressionSession = nil
@@ -387,40 +644,53 @@ final class H264VideoView: NSView {
         DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: workItem)
     }
 
-    private func decode(_ sampleBuffer: CMSampleBuffer) {
+    private func decode(
+        _ sampleBuffer: CMSampleBuffer,
+        timing: VideoFrameTiming,
+        motion: VerifiedVideoFrameMotion?
+    ) {
         guard let decompressionSession else { return }
+        let frameContext = Unmanaged.passRetained(
+            DecodedVideoFrameContext(timing: timing, motion: motion)
+        )
         var infoFlags = VTDecodeInfoFlags()
         let status = VTDecompressionSessionDecodeFrame(
             decompressionSession,
             sampleBuffer: sampleBuffer,
             flags: [._EnableAsynchronousDecompression, ._EnableTemporalProcessing],
-            frameRefcon: nil,
+            frameRefcon: frameContext.toOpaque(),
             infoFlagsOut: &infoFlags,
         )
         if status != noErr {
+            frameContext.release()
             onDebug?("VideoToolbox rejected access unit: OSStatus \(status)")
         }
     }
 
-    private func handleDecodedFrame(status: OSStatus, imageBuffer: CVImageBuffer?) {
-        guard status == noErr, let imageBuffer else {
+    private func handleDecodedFrame(
+        status: OSStatus,
+        imageBuffer: CVImageBuffer?,
+        timing: VideoFrameTiming?,
+        motion: VerifiedVideoFrameMotion?
+    ) {
+        guard status == noErr, let imageBuffer, let timing else {
             DispatchQueue.main.async { [weak self] in
                 self?.onDebug?("VideoToolbox frame decode failed: OSStatus \(status)")
             }
             return
         }
         recordFrameRate(decoded: 1, displayed: 0)
-        let cgImage = autoreleasepool { () -> CGImage? in
-            let image = CIImage(cvImageBuffer: imageBuffer)
-            return renderEnhanced(image)
-        }
-        guard let cgImage else { return }
-        enqueueLatestHardwareFrame(cgImage)
+        processingPipeline.submit(DecodedVideoFrame(
+            image: .pixelBuffer(imageBuffer),
+            timing: timing,
+            visibleRect: visibleSourceRect,
+            verifiedMotion: motion
+        ))
     }
 
-    private func enqueueLatestHardwareFrame(_ image: CGImage) {
+    private func enqueueLatestHardwareFrame(_ frame: ProcessedVideoFrame) {
         hardwareFrameLock.lock()
-        pendingHardwareFrame = image
+        pendingHardwareFrame = frame
         let shouldSchedule = !hardwareFrameDeliveryScheduled
         if shouldSchedule { hardwareFrameDeliveryScheduled = true }
         hardwareFrameLock.unlock()
@@ -432,23 +702,24 @@ final class H264VideoView: NSView {
 
     private func deliverLatestHardwareFrame() {
         hardwareFrameLock.lock()
-        let image = pendingHardwareFrame
+        let frame = pendingHardwareFrame
         pendingHardwareFrame = nil
         hardwareFrameLock.unlock()
 
-        if let image {
+        if let frame {
             hardwareFallbackWorkItem?.cancel()
             hardwareFallbackWorkItem = nil
-            latestDecodedFrame = image
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            videoLayer.contents = image
-            CATransaction.commit()
-            recordFrameRate(decoded: 0, displayed: 1)
-            if !reportedFirstDecodedFrame {
-                reportedFirstDecodedFrame = true
-                onDebug?("First decoded video frame displayed: \(image.width)x\(image.height)")
-                onFrameReady?()
+            latestProcessedPixelBuffer = frame.pixelBuffer
+            if videoLayer.status == .failed { videoLayer.flush() }
+            if videoLayer.isReadyForMoreMediaData,
+               let sampleBuffer = displaySampleBuffer(for: frame) {
+                videoLayer.enqueue(sampleBuffer)
+                recordFrameRate(decoded: 0, displayed: 1)
+                if !reportedFirstDecodedFrame {
+                    reportedFirstDecodedFrame = true
+                    onDebug?("First processed IOSurface displayed: \(frame.width)x\(frame.height)")
+                    onFrameReady?()
+                }
             }
         }
 
@@ -461,7 +732,13 @@ final class H264VideoView: NSView {
         }
     }
 
-    private func handleSoftwareFrame(data: Data, width: Int, height: Int) {
+    private func handleSoftwareFrame(
+        data: Data,
+        width: Int,
+        height: Int,
+        timing: VideoFrameTiming,
+        motion: VerifiedVideoFrameMotion?
+    ) {
         // FFmpegVideoDecoder coalesces delivery onto the main queue, keeping at
         // most one not-yet-presented RGBA frame alive.
         dispatchPrecondition(condition: .onQueue(.main))
@@ -482,70 +759,65 @@ final class H264VideoView: NSView {
                     intent: .defaultIntent
                   ) else { return }
 
-            let displayedImage: CGImage
-            if enhancementPreset == .off {
-                displayedImage = image
-            } else {
-                displayedImage = renderEnhanced(CIImage(cgImage: image)) ?? image
-            }
-
-            // Commit each replacement explicitly so Core Animation does not
-            // accumulate full-resolution CGImages in an implicit transaction.
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            latestDecodedFrame = displayedImage
-            videoLayer.contents = displayedImage
-            CATransaction.commit()
-            recordFrameRate(decoded: 0, displayed: 1)
-            if !reportedFirstDecodedFrame {
-                reportedFirstDecodedFrame = true
-                onDebug?("First software-decoded video frame displayed: \(displayedImage.width)x\(displayedImage.height)")
-                onFrameReady?()
-            }
+            processingPipeline.submit(DecodedVideoFrame(
+                image: .cgImage(image),
+                timing: timing,
+                visibleRect: visibleSourceRect,
+                verifiedMotion: motion
+            ))
         }
     }
 
-    private func renderEnhanced(_ source: CIImage) -> CGImage? {
-        let preset = enhancementPreset
-        var image = source
-
-        func applying(_ name: String, values: [String: Any]) {
-            guard let filter = CIFilter(name: name) else { return }
-            filter.setValue(image, forKey: kCIInputImageKey)
-            for (key, value) in values { filter.setValue(value, forKey: key) }
-            if let output = filter.outputImage { image = output }
-        }
-
-        switch preset {
-        case .off:
-            break
-        case .denoise:
-            applying("CINoiseReduction", values: ["inputNoiseLevel": 0.025, "inputSharpness": 0.35])
-        case .clarity:
-            applying("CINoiseReduction", values: ["inputNoiseLevel": 0.012, "inputSharpness": 0.45])
-            applying("CISharpenLuminance", values: [kCIInputSharpnessKey: 0.38, kCIInputRadiusKey: 1.1])
-            applying("CIColorControls", values: [kCIInputContrastKey: 1.045, kCIInputSaturationKey: 1.02])
-        case .lowLight:
-            applying("CINoiseReduction", values: ["inputNoiseLevel": 0.035, "inputSharpness": 0.3])
-            applying("CIHighlightShadowAdjust", values: ["inputShadowAmount": 0.42, "inputHighlightAmount": 0.82])
-            applying("CIGammaAdjust", values: ["inputPower": 0.88])
-            applying("CISharpenLuminance", values: [kCIInputSharpnessKey: 0.22, kCIInputRadiusKey: 0.9])
-        case .upscale2x:
-            applying("CILanczosScaleTransform", values: [kCIInputScaleKey: 2.0, kCIInputAspectRatioKey: 1.0])
-        case .upscaleClarity2x:
-            applying("CINoiseReduction", values: ["inputNoiseLevel": 0.012, "inputSharpness": 0.45])
-            applying("CISharpenLuminance", values: [kCIInputSharpnessKey: 0.34, kCIInputRadiusKey: 1.0])
-            applying("CILanczosScaleTransform", values: [kCIInputScaleKey: 2.0, kCIInputAspectRatioKey: 1.0])
-        }
-
-        return ciContext.createCGImage(image, from: image.extent.integral)
-    }
-
-    /// Returns the most recently decoded source frame without the HUD overlay.
-    /// The image is immutable and safe to hand to the background image writer.
+    /// Returns the most recent processed output frame without the HUD overlay.
+    /// Its enhancement and MetalFX resolution match live display and normal
+    /// recording at the moment the picture is taken. The image is immutable
+    /// and safe to hand to the background image writer.
     func latestFrameImage() -> CGImage? {
         dispatchPrecondition(condition: .onQueue(.main))
-        return latestDecodedFrame
+        guard let latestProcessedPixelBuffer else { return nil }
+        let image = CIImage(cvPixelBuffer: latestProcessedPixelBuffer)
+        return stillImageContext.createCGImage(
+            image,
+            from: image.extent.integral,
+            format: .RGBA8,
+            colorSpace: CGColorSpace(name: CGColorSpace.sRGB)
+        )
+    }
+
+    private func displaySampleBuffer(for frame: ProcessedVideoFrame) -> CMSampleBuffer? {
+        let pixelFormat = CVPixelBufferGetPixelFormatType(frame.pixelBuffer)
+        let key = "\(frame.width)x\(frame.height)-\(pixelFormat)"
+        if displayFormatDescription == nil || displayFormatKey != key {
+            var description: CMVideoFormatDescription?
+            guard CMVideoFormatDescriptionCreateForImageBuffer(
+                allocator: kCFAllocatorDefault,
+                imageBuffer: frame.pixelBuffer,
+                formatDescriptionOut: &description
+            ) == noErr else { return nil }
+            displayFormatDescription = description
+            displayFormatKey = key
+        }
+        guard let displayFormatDescription else { return nil }
+        var timing = CMSampleTimingInfo(
+            duration: frame.timing.nominalDuration,
+            presentationTimeStamp: frame.timing.presentationTime,
+            decodeTimeStamp: .invalid
+        )
+        var sampleBuffer: CMSampleBuffer?
+        guard CMSampleBufferCreateReadyWithImageBuffer(
+            allocator: kCFAllocatorDefault,
+            imageBuffer: frame.pixelBuffer,
+            formatDescription: displayFormatDescription,
+            sampleTiming: &timing,
+            sampleBufferOut: &sampleBuffer
+        ) == noErr, let sampleBuffer else { return nil }
+        if let attachments = CMSampleBufferGetSampleAttachmentsArray(
+            sampleBuffer,
+            createIfNecessary: true
+        ), let first = (attachments as NSArray).firstObject as? NSMutableDictionary {
+            first[kCMSampleAttachmentKey_DisplayImmediately] = true
+        }
+        return sampleBuffer
     }
 
     private func recordFrameRate(decoded: Int, displayed: Int) {
@@ -559,7 +831,24 @@ final class H264VideoView: NSView {
         }
         let stats = VideoPipelineStats(
             decodedFPS: Double(decodedFramesInWindow) / elapsed,
-            displayRefreshFPS: Double(displayedFramesInWindow) / elapsed
+            displayRefreshFPS: Double(displayedFramesInWindow) / elapsed,
+            processedFPS: latestProcessingStats.processedFPS,
+            processingDroppedFrames: latestProcessingStats.droppedBeforeProcessing,
+            processingLatencyMilliseconds: latestProcessingStats.averageLatencyMilliseconds,
+            processedWidth: latestProcessingStats.outputWidth,
+            processedHeight: latestProcessingStats.outputHeight,
+            temporalHistoryDepth: latestProcessingStats.temporalHistoryDepth,
+            temporalHistoryAgeMilliseconds: latestProcessingStats.temporalHistoryAgeMilliseconds,
+            temporalMotionAvailable: latestProcessingStats.temporalMotionAvailable,
+            temporalMotionConfidence: latestProcessingStats.temporalMotionConfidence,
+            temporalReprojectionStatus: latestProcessingStats.temporalReprojectionStatus,
+            temporalFlowLatencyMilliseconds: latestProcessingStats.temporalFlowLatencyMilliseconds,
+            temporalHistoryUsed: latestProcessingStats.temporalHistoryUsed,
+            lastRTPTimestamp: latestProcessingStats.lastRTPTimestamp,
+            motionAssociationOffsetMilliseconds: latestProcessingStats.motionAssociationOffsetMilliseconds,
+            cameraCalibrationStatus: latestProcessingStats.cameraCalibrationStatus,
+            cameraReadoutStatus: latestProcessingStats.cameraReadoutStatus,
+            rollingShutterStatus: latestProcessingStats.rollingShutterStatus
         )
         decodedFramesInWindow = 0
         displayedFramesInWindow = 0
@@ -596,7 +885,7 @@ final class H264VideoView: NSView {
     }
 
     private func captureRTPHeaderExtensions(_ accessUnit: H264AccessUnit) {
-        guard receiveMode == .experimental1080p,
+        guard receiveMode.is900p,
               !accessUnit.rtpHeaderExtensions.isEmpty,
               dumpedExtensionAccessUnits < 300 else { return }
         let url = URL(fileURLWithPath: "/tmp/parrotlab-rtp-extensions.bin")
@@ -632,6 +921,11 @@ final class H264VideoView: NSView {
            !accessUnit.rtpHeaderExtensions.isEmpty {
             metadataPresence.hasRTPHeaderExtensions = true
             onDebug?("RTP header-extension metadata detected")
+        }
+        if !metadataPresence.hasDecodedVideoMetadataV2,
+           accessUnit.videoMetadata != nil {
+            metadataPresence.hasDecodedVideoMetadataV2 = true
+            onDebug?("Synchronized Parrot VideoMetadataV2 decoded from the RTP extension")
         }
         if metadataPresence != previous { onMetadataPresence?(metadataPresence) }
     }

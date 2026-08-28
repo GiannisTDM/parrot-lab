@@ -27,8 +27,12 @@ enum BebopToolPackage: String {
         case .dragonLab:
             return [
                 BebopToolAsset(
-                    sourceRelativePath: "patched/dpd1830",
-                    remoteName: "dragon-prog-1080p-mode1-30fps"
+                    sourceRelativePath: "patched/dragon-prog-900p-4.4.2",
+                    remoteName: "dragon-prog-900p-4.4.2"
+                ),
+                BebopToolAsset(
+                    sourceRelativePath: "patched/dragon-prog-900p-4.7.1",
+                    remoteName: "dragon-prog-900p-4.7.1"
                 ),
                 BebopToolAsset(
                     sourceRelativePath: "tools/parrotlab_dragon_video.sh",

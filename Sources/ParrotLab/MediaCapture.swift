@@ -69,6 +69,27 @@ enum MediaFileNamer {
         ))
     }
 
+    static func temporaryRawArchiveURL(
+        directory: URL,
+        date: Date = Date(),
+        timeZone: TimeZone = .current
+    ) -> URL {
+        uniqueURL(directory.appendingPathComponent(
+            "RawVideoBB2-\(dateStamp(date, timeZone: timeZone))-recording.h264"
+        ))
+    }
+
+    static func completedRawArchiveURL(
+        directory: URL,
+        date: Date,
+        duration: TimeInterval,
+        timeZone: TimeZone = .current
+    ) -> URL {
+        uniqueURL(directory.appendingPathComponent(
+            "RawVideoBB2-\(dateStamp(date, timeZone: timeZone))-\(durationStamp(duration)).h264"
+        ))
+    }
+
     static func durationStamp(_ duration: TimeInterval) -> String {
         let totalSeconds = max(0, Int(duration.rounded()))
         let hours = totalSeconds / 3_600
@@ -195,6 +216,7 @@ final class H264StreamRecorder {
     private var finishError: String?
     private var cachedSPS: Data?
     private var cachedPPS: Data?
+    private var rawArchiveNaming = false
 
     var isRecording: Bool {
         stateLock.lock()
@@ -209,9 +231,15 @@ final class H264StreamRecorder {
     }
 
     @discardableResult
-    func start(directory: URL, at date: Date = Date()) throws -> URL {
+    func start(
+        directory: URL,
+        at date: Date = Date(),
+        rawArchive: Bool = false
+    ) throws -> URL {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let temporaryURL = MediaFileNamer.temporaryVideoURL(directory: directory, date: date)
+        let temporaryURL = rawArchive
+            ? MediaFileNamer.temporaryRawArchiveURL(directory: directory, date: date)
+            : MediaFileNamer.temporaryVideoURL(directory: directory, date: date)
         guard FileManager.default.createFile(atPath: temporaryURL.path, contents: nil) else {
             throw captureError("Could not create \(temporaryURL.lastPathComponent)")
         }
@@ -239,6 +267,7 @@ final class H264StreamRecorder {
         bytesWritten = 0
         recordedAccessUnits = 0
         finishError = nil
+        rawArchiveNaming = rawArchive
         pendingChunks.removeAll(keepingCapacity: true)
         pendingHead = 0
         pendingBytes = 0
@@ -396,6 +425,7 @@ final class H264StreamRecorder {
             let ended = endedAt ?? Date()
             let written = bytesWritten
             let accessUnits = recordedAccessUnits
+            let usesRawArchiveName = rawArchiveNaming
             var errorDescription = finishError
             self.handle = nil
             directoryURL = nil
@@ -403,6 +433,7 @@ final class H264StreamRecorder {
             startedAt = nil
             endedAt = nil
             recordedAccessUnits = 0
+            rawArchiveNaming = false
             pendingChunks.removeAll(keepingCapacity: false)
             pendingHead = 0
             pendingBytes = 0
@@ -421,16 +452,27 @@ final class H264StreamRecorder {
             if accessUnits == 0 {
                 errorDescription = errorDescription ?? "No H.264 access units were received while recording"
             }
-            var resultURL = temporary ?? MediaFileNamer.temporaryVideoURL(
-                directory: directory ?? MediaFileNamer.defaultDirectory,
-                date: started
-            )
-            if let directory, let temporary {
-                let completed = MediaFileNamer.completedVideoURL(
-                    directory: directory,
-                    date: started,
-                    duration: duration
+            var resultURL = temporary ?? (usesRawArchiveName
+                ? MediaFileNamer.temporaryRawArchiveURL(
+                    directory: directory ?? MediaFileNamer.defaultDirectory,
+                    date: started
                 )
+                : MediaFileNamer.temporaryVideoURL(
+                    directory: directory ?? MediaFileNamer.defaultDirectory,
+                    date: started
+                ))
+            if let directory, let temporary {
+                let completed = usesRawArchiveName
+                    ? MediaFileNamer.completedRawArchiveURL(
+                        directory: directory,
+                        date: started,
+                        duration: duration
+                    )
+                    : MediaFileNamer.completedVideoURL(
+                        directory: directory,
+                        date: started,
+                        duration: duration
+                    )
                 do {
                     try FileManager.default.moveItem(at: temporary, to: completed)
                     resultURL = completed
