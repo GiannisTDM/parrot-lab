@@ -9,7 +9,9 @@ export PATH
 
 # Parrot Lab's non-persistent Dragon launcher for supported Bebop 2 firmware
 # 4.4.2 and 4.7.1.
-# Install this file and the optional patched binary in /data/ftp/internal_000.
+# Install this file and both firmware-specific patched binaries in
+# /data/ftp/internal_000. The matching binary is selected from build.prop
+# before Dragon is stopped.
 # It never changes persist.dragon-prog.post_cmd or overwrites /usr/bin files.
 #
 # Important: apply/custom/restore validate everything and queue a detached
@@ -17,7 +19,11 @@ export PATH
 # relay, so the worker must not depend on that transport remaining connected.
 
 LAB_ROOT="${PARROTLAB_DRAGON_ROOT:-/data/ftp/internal_000}"
-CUSTOM_1080="${PARROTLAB_DRAGON_1080:-$LAB_ROOT/dragon-prog-1080p-mode1-30fps}"
+DRAGON_900_442="${PARROTLAB_DRAGON_900_442:-$LAB_ROOT/dragon-prog-900p-4.4.2}"
+DRAGON_900_471="${PARROTLAB_DRAGON_900_471:-$LAB_ROOT/dragon-prog-900p-4.7.1}"
+BUILD_PROP="${PARROTLAB_BUILD_PROP:-/etc/build.prop}"
+LAB_BINARY=""
+FIRMWARE_VERSION=""
 STATE_FILE="$LAB_ROOT/parrotlab-dragon-video.state"
 LOG_FILE="/tmp/parrotlab-dragon-video.log"
 WORKER_LOG="/tmp/parrotlab-dragon-worker.log"
@@ -66,7 +72,8 @@ usage()
     cat <<'EOF'
 Usage:
   parrotlab_dragon_video.sh status
-  parrotlab_dragon_video.sh apply stock480|stock720|lab1080 BITRATE_KBPS adaptive|constant LANDED
+  parrotlab_dragon_video.sh resolve
+  parrotlab_dragon_video.sh apply stock480|stock720|modified900|temporal900 BITRATE_KBPS adaptive|constant LANDED
   parrotlab_dragon_video.sh custom 'DRAGON ARGUMENTS' LANDED
   parrotlab_dragon_video.sh restore LANDED
 
@@ -132,6 +139,21 @@ validate_bitrate()
     [ $(($1 % 500)) -eq 0 ] || fail "BITRATE_STEP_MUST_BE_500"
 }
 
+select_lab_binary()
+{
+    FIRMWARE_VERSION=$(sed -n 's/^ro\.parrot\.build\.version=//p' "$BUILD_PROP" 2>/dev/null | head -n 1)
+    case "$FIRMWARE_VERSION" in
+        4.4.2)
+            LAB_BINARY=$DRAGON_900_442
+            ;;
+        4.7.1)
+            LAB_BINARY=$DRAGON_900_471
+            ;;
+        *) fail "UNSUPPORTED_FIRMWARE|${FIRMWARE_VERSION:-unknown}" ;;
+    esac
+    [ -x "$LAB_BINARY" ] || fail "BINARY_NOT_EXECUTABLE|$LAB_BINARY"
+}
+
 validate_profile()
 {
     profile_resolution=$1
@@ -141,14 +163,24 @@ validate_profile()
         stock480)
             profile_binary=/usr/bin/dragon-prog
             profile_video_mode=1
+            profile_launch_kind=stock
             ;;
         stock720)
             profile_binary=/usr/bin/dragon-prog
             profile_video_mode=2
+            profile_launch_kind=stock
             ;;
-        lab1080)
-            profile_binary=$CUSTOM_1080
-            profile_video_mode=1
+        modified900)
+            select_lab_binary
+            profile_binary=$LAB_BINARY
+            profile_video_mode=2
+            profile_launch_kind=modified900
+            ;;
+        temporal900)
+            select_lab_binary
+            profile_binary=$LAB_BINARY
+            profile_video_mode=2
+            profile_launch_kind=temporal900
             ;;
         *) fail "UNKNOWN_RESOLUTION" ;;
     esac
@@ -176,7 +208,7 @@ validate_custom_arguments()
     set -- $custom_arguments
     [ "$#" -gt 0 ] || fail "CUSTOM_ARGUMENTS_EMPTY"
     [ "$#" -le 64 ] || fail "TOO_MANY_CUSTOM_ARGUMENTS"
-    [ -x "$CUSTOM_1080" ] || fail "BINARY_NOT_EXECUTABLE|$CUSTOM_1080"
+    select_lab_binary
 }
 
 queue_worker()
@@ -204,19 +236,44 @@ start_profile()
 
     stop_dragon
     : > "$LOG_FILE"
-    if [ "$rate_mode" = "constant" ]; then
-        "$SETSID_BIN" "$profile_binary" -V "$profile_video_mode" -f 30 -R off -S 0 -I off \
-            -q "$bitrate" -s -o >> "$LOG_FILE" 2>&1 < /dev/null &
-    else
-        "$SETSID_BIN" "$profile_binary" -V "$profile_video_mode" -f 30 -R off -S 0 -I off \
-            -q "$bitrate" -o >> "$LOG_FILE" 2>&1 < /dev/null &
-    fi
+    case "$profile_launch_kind:$rate_mode" in
+        modified900:constant)
+            "$SETSID_BIN" "$profile_binary" -V 2 -q "$bitrate" -s -o \
+                >> "$LOG_FILE" 2>&1 < /dev/null &
+            ;;
+        modified900:adaptive)
+            "$SETSID_BIN" "$profile_binary" -V 2 -q "$bitrate" -o \
+                >> "$LOG_FILE" 2>&1 < /dev/null &
+            ;;
+        temporal900:constant)
+            "$SETSID_BIN" "$profile_binary" -V 2 -f 30 -R gpu -S 0 -q "$bitrate" -s -o \
+                >> "$LOG_FILE" 2>&1 < /dev/null &
+            ;;
+        temporal900:adaptive)
+            "$SETSID_BIN" "$profile_binary" -V 2 -f 30 -R gpu -S 0 -q "$bitrate" -o \
+                >> "$LOG_FILE" 2>&1 < /dev/null &
+            ;;
+        stock:constant)
+            "$SETSID_BIN" "$profile_binary" -V "$profile_video_mode" -f 30 -R off -S 0 \
+                -q "$bitrate" -s -o >> "$LOG_FILE" 2>&1 < /dev/null &
+            ;;
+        stock:adaptive)
+            "$SETSID_BIN" "$profile_binary" -V "$profile_video_mode" -f 30 -R off -S 0 \
+                -q "$bitrate" -o >> "$LOG_FILE" 2>&1 < /dev/null &
+            ;;
+        *) fail "UNKNOWN_LAUNCH_CONFIGURATION" ;;
+    esac
     new_pid=$!
 
     sleep 2
     kill -0 "$new_pid" 2>/dev/null || fail "DRAGON_START_FAILED|$LOG_FILE"
-    record_state "running|$resolution|$bitrate|$rate_mode|$new_pid"
-    emit "RUNNING|$resolution|$bitrate|$rate_mode|$new_pid"
+    if [ "$resolution" = "modified900" ] || [ "$resolution" = "temporal900" ]; then
+        record_state "running|$resolution|$bitrate|$rate_mode|$new_pid|firmware:$FIRMWARE_VERSION|binary:$profile_binary"
+        emit "RUNNING|$resolution|$bitrate|$rate_mode|$new_pid|firmware:$FIRMWARE_VERSION"
+    else
+        record_state "running|$resolution|$bitrate|$rate_mode|$new_pid"
+        emit "RUNNING|$resolution|$bitrate|$rate_mode|$new_pid"
+    fi
 }
 
 start_custom()
@@ -226,13 +283,13 @@ start_custom()
     : > "$LOG_FILE"
 
     set -- $custom_arguments
-    "$SETSID_BIN" "$CUSTOM_1080" "$@" >> "$LOG_FILE" 2>&1 < /dev/null &
+    "$SETSID_BIN" "$LAB_BINARY" "$@" >> "$LOG_FILE" 2>&1 < /dev/null &
     new_pid=$!
 
     sleep 2
     kill -0 "$new_pid" 2>/dev/null || fail "DRAGON_START_FAILED|$LOG_FILE"
-    record_state "running|custom|$new_pid|$custom_arguments"
-    emit "RUNNING|custom|$new_pid|$custom_arguments"
+    record_state "running|custom|$new_pid|firmware:$FIRMWARE_VERSION|binary:$LAB_BINARY|$custom_arguments"
+    emit "RUNNING|custom|$new_pid|firmware:$FIRMWARE_VERSION|$custom_arguments"
 }
 
 restore_stock()
@@ -277,6 +334,11 @@ report_status()
 case "${1:-}" in
     status)
         report_status
+        ;;
+    resolve)
+        [ "$#" -eq 1 ] || { usage; exit 2; }
+        select_lab_binary
+        emit "BINARY|$FIRMWARE_VERSION|$LAB_BINARY"
         ;;
     apply)
         [ "$#" -eq 5 ] || { usage; exit 2; }

@@ -1,5 +1,62 @@
 # Changelog
 
+## 1.3.0 — 2026-08-28
+
+Version 1.3 turns Parrot Lab into a broader all-in-one Bebop 2 workbench while
+keeping every live-video queue explicitly bounded.
+
+### Added
+
+- Added firmware-matched **1600 × 900** Dragon profiles for Bebop firmware
+  4.4.2 and 4.7.1. The helper verifies the installed firmware and selects only
+  its matching binary before touching the running Dragon process.
+- Added processed H.264 recording of Parrot Lab's enhanced output, original-
+  quality H.264-to-MP4 remuxing at 100%, and an optional quality-controlled
+  MP4 re-encode.
+- Added Apple MetalFX Spatial output through 4K, processed-resolution PNG/JPEG
+  screenshots and independent enhancement controls.
+- Added optional GPU repair for isolated green/odd-colour H.264 blocks and
+  confidence-gated temporal mosquito-noise cleanup.
+- Added experimental 900p temporal reconstruction using synchronized
+  `frame_quat` alignment, Apple Vision residual optical flow, confidence
+  rejection and bidirectional occlusion checks. It remains off by default.
+- Added calibrated 4.7.1 900p rolling-shutter/jello correction with curved
+  sensor-row timing and frame-synchronized camera orientation.
+- Added VideoMetadataV2 parsing and timestamp association for synchronized
+  drone/view quaternions, exposure, camera position and motion data.
+
+### Changed
+
+- Removed the unsustainable 1080p experiment from the interface and replaced
+  it with firmware-specific 900p Modified and 900p Temporal profiles.
+- Normal recording now encodes the same processed GPU output shown by the live
+  view. The untouched incoming Annex-B stream remains available as a separate
+  developer archive.
+- Added standard macOS application, Edit, Services and Window menus plus
+  developer video/settings controls.
+- Release builds now compile optimized Swift files in parallel and emit a
+  matching SHA-256 file beside the distributable ZIP.
+
+### Fixed and hardened
+
+- Latest-frame-only decode, processing and recording branches prevent slow GPU
+  or disk work from accumulating live-display latency or unbounded history.
+- Temporal and artifact-repair history resets safely across timestamps,
+  dimensions, presets and failed/late motion estimates.
+- Unsupported Bebop firmware is rejected before a patched Dragon launch, and
+  stock restoration remains available through the detached helper workflow.
+- The self-contained Apple-silicon release continues to verify bundled FFmpeg,
+  ad-hoc signing, archive integrity and the exact post-extraction app.
+
+### Known limitations
+
+- Temporal reconstruction is experimental, requires decoded 1600 × 900 input
+  and can reduce processed FPS on slower Macs.
+- Direct production USB/libmux video transport is not implemented; video uses
+  the established SkyController restream path.
+- The public build is ad-hoc signed and not notarized. Parrot Lab remains a
+  development workbench, not a certified flight display.
+
 ## 1.2.0 — 2026-08-26
 
 ### Added

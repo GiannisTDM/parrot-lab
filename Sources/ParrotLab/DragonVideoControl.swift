@@ -3,13 +3,15 @@ import Foundation
 enum DragonVideoResolution: Int, CaseIterable {
     case stock480
     case stock720
-    case lab1080
+    case modified900
+    case temporal900
 
     var menuTitle: String {
         switch self {
         case .stock480: return "Stock · 856 × 480"
         case .stock720: return "Stock · 1280 × 720"
-        case .lab1080: return "Lab · 1920 × 1080"
+        case .modified900: return "900p Modified · 1600 × 900"
+        case .temporal900: return "900p Temporal · 1600 × 900"
         }
     }
 
@@ -17,7 +19,8 @@ enum DragonVideoResolution: Int, CaseIterable {
         switch self {
         case .stock480: return "stock480"
         case .stock720: return "stock720"
-        case .lab1080: return "lab1080"
+        case .modified900: return "modified900"
+        case .temporal900: return "temporal900"
         }
     }
 
@@ -25,7 +28,8 @@ enum DragonVideoResolution: Int, CaseIterable {
         switch self {
         case .stock480: return "480P"
         case .stock720: return "720P"
-        case .lab1080: return "1080P LAB"
+        case .modified900: return "900P MODIFIED"
+        case .temporal900: return "900P TEMPORAL"
         }
     }
 
@@ -33,12 +37,17 @@ enum DragonVideoResolution: Int, CaseIterable {
         switch self {
         case .stock480: return 2_500
         case .stock720: return 5_000
-        case .lab1080: return 8_000
+        case .modified900: return 1_000
+        case .temporal900: return 12_000
         }
     }
 
     var receiverMode: VideoReceiveMode {
-        self == .lab1080 ? .experimental1080p : .compatibility
+        switch self {
+        case .modified900: return .modified900
+        case .temporal900: return .temporal900
+        case .stock480, .stock720: return .compatibility
+        }
     }
 }
 
@@ -77,15 +86,17 @@ struct DragonVideoProfile: Equatable {
 
     static func selfTest() -> Bool {
         guard let profile = DragonVideoProfile(
-            resolution: .lab1080,
-            bitrateKbps: 8_000,
-            locksBitrate: true
+            resolution: .temporal900,
+            bitrateKbps: 12_000,
+            locksBitrate: false
         ) else { return false }
         return profile.applyCommand ==
-            "sh /data/ftp/internal_000/parrotlab_dragon_video.sh apply lab1080 8000 constant LANDED; exit" &&
-            profile.launchSummary == "1080P LAB · 8.0 Mbps LOCKED" &&
-            DragonVideoProfile(resolution: .lab1080, bitrateKbps: 8_250, locksBitrate: false) == nil &&
-            DragonVideoProfile(resolution: .lab1080, bitrateKbps: 16_500, locksBitrate: false) == nil &&
+            "sh /data/ftp/internal_000/parrotlab_dragon_video.sh apply temporal900 12000 adaptive LANDED; exit" &&
+            profile.launchSummary == "900P TEMPORAL · 12.0 Mbps MAX" &&
+            DragonVideoProfile(resolution: .modified900, bitrateKbps: 1_000, locksBitrate: false)?.applyCommand ==
+                "sh /data/ftp/internal_000/parrotlab_dragon_video.sh apply modified900 1000 adaptive LANDED; exit" &&
+            DragonVideoProfile(resolution: .temporal900, bitrateKbps: 8_250, locksBitrate: false) == nil &&
+            DragonVideoProfile(resolution: .temporal900, bitrateKbps: 16_500, locksBitrate: false) == nil &&
             DragonCustomLaunch.selfTest()
     }
 }

@@ -16,22 +16,39 @@ SIGNED_RELEASE_DIR="$STAGE_DIR/signed-release"
 trap '/bin/rm -rf "$STAGE_DIR"' EXIT HUP INT TERM
 
 cd "$PROJECT_DIR"
-swift build -c release
+BUILD_JOBS=${PARROTLAB_BUILD_JOBS:-$(/usr/sbin/sysctl -n hw.logicalcpu 2>/dev/null || printf '%s' 4)}
+case "$BUILD_JOBS" in
+    ''|*[!0-9]*|0) printf '%s\n' "PARROTLAB_BUILD_JOBS must be a positive integer" >&2; exit 2 ;;
+esac
+printf '%s\n' "Building optimized Parrot Lab release with $BUILD_JOBS parallel jobs"
+# Swift's default Release whole-module optimizer kept this target effectively
+# single-core for many minutes. Per-file -O preserves an optimized binary while
+# allowing the independent source files to compile concurrently.
+SWIFT_BUILD_DIR="$PROJECT_DIR/.build"
+if [ -n "${PARROTLAB_SWIFT_SCRATCH_PATH:-}" ]; then
+    SWIFT_BUILD_DIR=$PARROTLAB_SWIFT_SCRATCH_PATH
+    swift build --scratch-path "$SWIFT_BUILD_DIR" -c release -j "$BUILD_JOBS" \
+        -Xswiftc -no-whole-module-optimization
+else
+    swift build -c release -j "$BUILD_JOBS" -Xswiftc -no-whole-module-optimization
+fi
 
 mkdir -p "$STAGE_APP/Contents/MacOS" "$STAGE_APP/Contents/Frameworks" \
     "$STAGE_APP/Contents/Resources/DeviceTools" "$DIST_DIR" "$INSTALL_DIR"
-COPYFILE_DISABLE=1 cp "$PROJECT_DIR/.build/release/ParrotLab" "$STAGE_APP/Contents/MacOS/ParrotLab"
+COPYFILE_DISABLE=1 cp "$SWIFT_BUILD_DIR/release/ParrotLab" "$STAGE_APP/Contents/MacOS/ParrotLab"
 COPYFILE_DISABLE=1 cp "$PROJECT_DIR/Resources/Info.plist" "$STAGE_APP/Contents/Info.plist"
 COPYFILE_DISABLE=1 cp "$PROJECT_DIR/Resources/ParrotLabIcon.png" "$STAGE_APP/Contents/Resources/ParrotLabIcon.png"
 COPYFILE_DISABLE=1 cp "$PROJECT_DIR/Resources/ParrotLab.icns" "$STAGE_APP/Contents/Resources/ParrotLab.icns"
-COPYFILE_DISABLE=1 cp "$PROJECT_DIR/patched/dpd1830" "$STAGE_APP/Contents/Resources/DeviceTools/dragon-prog-1080p-mode1-30fps"
+COPYFILE_DISABLE=1 cp "$PROJECT_DIR/patched/dragon-prog-900p-4.4.2" "$STAGE_APP/Contents/Resources/DeviceTools/dragon-prog-900p-4.4.2"
+COPYFILE_DISABLE=1 cp "$PROJECT_DIR/patched/dragon-prog-900p-4.7.1" "$STAGE_APP/Contents/Resources/DeviceTools/dragon-prog-900p-4.7.1"
 COPYFILE_DISABLE=1 cp "$PROJECT_DIR/tools/parrotlab_dragon_video.sh" "$STAGE_APP/Contents/Resources/DeviceTools/parrotlab_dragon_video.sh"
 COPYFILE_DISABLE=1 cp "$PROJECT_DIR/tools/install_bebop2_persistent_telnet.sh" "$STAGE_APP/Contents/Resources/DeviceTools/install_bebop2_persistent_telnet.sh"
 COPYFILE_DISABLE=1 cp "$PROJECT_DIR/tools/parrot_rf_lab.sh" "$STAGE_APP/Contents/Resources/DeviceTools/parrot_rf_lab.sh"
 COPYFILE_DISABLE=1 cp "$PROJECT_DIR/tools/parrotlab_find_sc2_ip.sh" "$STAGE_APP/Contents/Resources/DeviceTools/parrotlab_find_sc2_ip.sh"
 COPYFILE_DISABLE=1 cp "$PROJECT_DIR/sc2/install.sh" "$STAGE_APP/Contents/Resources/DeviceTools/install_sc2_apple_ncm.sh"
 COPYFILE_DISABLE=1 cp "$PROJECT_DIR/sc2/apple_mac_ncm.ko" "$STAGE_APP/Contents/Resources/DeviceTools/apple_mac_ncm.ko"
-chmod 755 "$STAGE_APP/Contents/Resources/DeviceTools/dragon-prog-1080p-mode1-30fps" \
+chmod 755 "$STAGE_APP/Contents/Resources/DeviceTools/dragon-prog-900p-4.4.2" \
+    "$STAGE_APP/Contents/Resources/DeviceTools/dragon-prog-900p-4.7.1" \
     "$STAGE_APP/Contents/Resources/DeviceTools/parrotlab_dragon_video.sh" \
     "$STAGE_APP/Contents/Resources/DeviceTools/install_bebop2_persistent_telnet.sh" \
     "$STAGE_APP/Contents/Resources/DeviceTools/parrot_rf_lab.sh" \
@@ -97,6 +114,10 @@ if ! ditto --noextattr --noqtn "$SIGNED_APP" "$APP_DIR" || \
 fi
 
 mv -f "$STAGE_ZIP" "$ZIP_PATH"
+(
+    cd "$DIST_DIR"
+    /usr/bin/shasum -a 256 "$(basename "$ZIP_PATH")" > "$(basename "$ZIP_PATH").sha256"
+)
 
 # Older builds left a second launchable copy inside dist. The installed app is
 # now the single canonical copy; dist contains only the distributable archive.
@@ -106,3 +127,4 @@ fi
 
 printf '%s\n' "$APP_DIR"
 printf '%s\n' "$ZIP_PATH"
+printf '%s\n' "$ZIP_PATH.sha256"

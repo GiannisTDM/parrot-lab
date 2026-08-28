@@ -94,6 +94,24 @@ enum ParrotLabSelfTest {
             fputs("Self-test failed: FrameInfo metadata\n", stderr)
             return 1
         }
+        guard VideoMetadataV2.selfTest(), RTPVideoTimestampMapper.selfTest() else {
+            fputs("Self-test failed: synchronized video metadata/timing\n", stderr)
+            return 1
+        }
+        guard Bebop900pCameraCalibration.selfTest(),
+              Bebop900pCalibrationTextureSet.selfTest(),
+              RollingShutterMetalRenderer.selfTest() else {
+            fputs("Self-test failed: calibrated 900p camera/readout mapping\n", stderr)
+            return 1
+        }
+        guard TemporalReconstructionRenderer.selfTest() else {
+            fputs("Self-test failed: temporal reconstruction renderer\n", stderr)
+            return 1
+        }
+        guard H264ArtifactRepairRenderer.selfTest() else {
+            fputs("Self-test failed: H.264 artifact repair renderer\n", stderr)
+            return 1
+        }
 
         guard FFmpegVideoDecoder.bufferingSelfTest() else {
             fputs("Self-test failed: bounded video buffering\n", stderr)
@@ -114,7 +132,9 @@ enum ParrotLabSelfTest {
         }
 
         guard MediaFileNamer.selfTest(), StillImageWriter.selfTest(),
-              H264StreamRecorder.selfTest(), ARSDKPhotoCaptureSelfTest.run(),
+              H264StreamRecorder.selfTest(), ProcessedH264Recorder.selfTest(),
+              H264MP4Converter.selfTest(),
+              ARSDKPhotoCaptureSelfTest.run(),
               ARSDKTelemetryReducer.selfTest(),
               DroneMediaFTP.selfTest() else {
             fputs("Self-test failed: local media capture\n", stderr)
