@@ -60,6 +60,33 @@ final class LabFlippedView: NSView {
     override var isFlipped: Bool { true }
 }
 
+final class LabFlippedBackgroundView: NSView {
+    private let gradient = CAGradientLayer()
+
+    override var isFlipped: Bool { true }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        gradient.colors = [
+            NSColor(srgbRed: 0.025, green: 0.035, blue: 0.05, alpha: 1).cgColor,
+            NSColor(srgbRed: 0.045, green: 0.065, blue: 0.085, alpha: 1).cgColor,
+            NSColor(srgbRed: 0.025, green: 0.03, blue: 0.04, alpha: 1).cgColor
+        ]
+        gradient.locations = [0, 0.55, 1]
+        gradient.startPoint = CGPoint(x: 0, y: 1)
+        gradient.endPoint = CGPoint(x: 1, y: 0)
+        layer = gradient
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override func layout() {
+        super.layout()
+        gradient.frame = bounds
+    }
+}
+
 /// AppKit's frameless text-field cell pins its text to the top when the view
 /// is taller than the font. Keep both display and field-editor rectangles on
 /// the optical vertical center used by the surrounding buttons and popups.

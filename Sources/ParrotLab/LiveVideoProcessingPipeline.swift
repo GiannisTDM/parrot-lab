@@ -129,6 +129,13 @@ struct TemporalReconstructionConfiguration: Equatable {
     /// Flow results slower than this are discarded and history is reset.
     var latencyBudgetMilliseconds = 65.0
     var usesBidirectionalFlow = true
+    /// Residual flow is estimated after IMU alignment, so full source
+    /// resolution is unnecessary. The vectors are scaled back to source pixels
+    /// by the Metal resolve pass.
+    var flowResolutionScale = 0.375
+    /// Inserts one motion-compensated midpoint after every two decoded source
+    /// frames: 30 real + 15 generated = a bounded 45 fps output timeline.
+    var generatesIntermediateFrames = false
 }
 
 enum DecodedVideoImage {
@@ -148,6 +155,8 @@ struct ProcessedVideoFrame {
     let timing: VideoFrameTiming
     let sequenceNumber: UInt64
     let processingLatencyMilliseconds: Double
+    let isSynthetic: Bool
+    let targetFrameRate: Int
 
     var width: Int { CVPixelBufferGetWidth(pixelBuffer) }
     var height: Int { CVPixelBufferGetHeight(pixelBuffer) }
@@ -229,6 +238,7 @@ final class LiveVideoProcessingPipeline {
     private var pools: [PoolKey: CVPixelBufferPool] = [:]
     private var temporalHistory: [TemporalHistoryEntry] = []
     private var temporalReconstructionState: TemporalReconstructionState?
+    private var temporalFrameGenerationPhase = 0
     private var h264ArtifactRepairHistory: CVPixelBuffer?
     private var lastTemporalConfiguration = TemporalReconstructionConfiguration()
     private var lastTemporalStatus = "TEMPORAL OFF"
@@ -237,6 +247,7 @@ final class LiveVideoProcessingPipeline {
     private let maximumTemporalHistoryDepth = 3
     private var statsWindowStarted = Date()
     private var processedInWindow = 0
+    private var processingPassesInWindow = 0
     private var latencyInWindow = 0.0
     private var lastOutputWidth = 0
     private var lastOutputHeight = 0
@@ -305,6 +316,7 @@ final class LiveVideoProcessingPipeline {
         processingQueue.sync {
             temporalHistory.removeAll(keepingCapacity: false)
             temporalReconstructionState = nil
+            temporalFrameGenerationPhase = 0
             h264ArtifactRepairHistory = nil
             lastTemporalConfiguration = TemporalReconstructionConfiguration()
             lastTemporalStatus = "TEMPORAL OFF"
@@ -313,6 +325,7 @@ final class LiveVideoProcessingPipeline {
             pools.removeAll(keepingCapacity: false)
             sequenceNumber = 0
             processedInWindow = 0
+            processingPassesInWindow = 0
             latencyInWindow = 0
             statsWindowStarted = Date()
             lastOutputWidth = 0
@@ -332,12 +345,12 @@ final class LiveVideoProcessingPipeline {
             stateLock.unlock()
 
             autoreleasepool {
-                if let output = process(input) { onFrame?(output) }
+                for output in process(input) { onFrame?(output) }
             }
         }
     }
 
-    private func process(_ input: DecodedVideoFrame) -> ProcessedVideoFrame? {
+    private func process(_ input: DecodedVideoFrame) -> [ProcessedVideoFrame] {
         let started = CFAbsoluteTimeGetCurrent()
         configurationLock.lock()
         let configuration = self.configuration
@@ -358,7 +371,7 @@ final class LiveVideoProcessingPipeline {
             if !visibleRect.isNull, !visibleRect.isEmpty { image = image.cropped(to: visibleRect) }
         }
         let sourceExtent = image.extent.integral
-        guard sourceExtent.width > 0, sourceExtent.height > 0 else { return nil }
+        guard sourceExtent.width > 0, sourceExtent.height > 0 else { return [] }
         image = image.transformed(by: CGAffineTransform(
             translationX: -sourceExtent.origin.x,
             y: -sourceExtent.origin.y
@@ -410,14 +423,90 @@ final class LiveVideoProcessingPipeline {
         }
         let outputWidth = outputDimensions.width
         let outputHeight = outputDimensions.height
-        guard outputWidth > 0, outputHeight > 0,
-              let outputBuffer = makePixelBuffer(width: outputWidth, height: outputHeight) else {
-            emitDebug("Processed-frame pool exhausted; dropping this frame without delaying live video")
-            return nil
+        guard outputWidth > 0, outputHeight > 0 else { return [] }
+
+        var outputs: [ProcessedVideoFrame] = []
+        let frameGenerationActive = configuration.temporal.isEnabled &&
+            configuration.temporal.generatesIntermediateFrames &&
+            configuration.temporal.usesBidirectionalFlow &&
+            sourceWidth == Bebop900pCameraCalibration.width &&
+            sourceHeight == Bebop900pCameraCalibration.height &&
+            !temporalResult.status.contains("BYPASS")
+        let targetFrameRate = frameGenerationActive ? 45 : 30
+        if let intermediateImage = temporalResult.intermediateImage,
+           let intermediateTiming = temporalResult.intermediateTiming,
+           let intermediateBuffer = renderOutput(
+               intermediateImage,
+               sourceWidth: sourceWidth,
+               sourceHeight: sourceHeight,
+               outputWidth: outputWidth,
+               outputHeight: outputHeight,
+               scaling: configuration.scaling,
+               prefersFastScaling: true
+           ) {
+            sequenceNumber &+= 1
+            outputs.append(ProcessedVideoFrame(
+                pixelBuffer: intermediateBuffer,
+                timing: intermediateTiming,
+                sequenceNumber: sequenceNumber,
+                processingLatencyMilliseconds: (CFAbsoluteTimeGetCurrent() - started) * 1_000,
+                isSynthetic: true,
+                targetFrameRate: targetFrameRate
+            ))
         }
 
-        let usedMetalFX: Bool
-        if configuration.scaling.usesMetalFX,
+        guard let outputBuffer = renderOutput(
+            image,
+            sourceWidth: sourceWidth,
+            sourceHeight: sourceHeight,
+            outputWidth: outputWidth,
+            outputHeight: outputHeight,
+            scaling: configuration.scaling
+        ) else {
+            emitDebug("Processed-frame pool exhausted; dropping this frame without delaying live video")
+            return outputs
+        }
+
+        sequenceNumber &+= 1
+        let latency = (CFAbsoluteTimeGetCurrent() - started) * 1_000
+        let realTiming = targetFrameRate == 45
+            ? VideoFrameTiming(
+                rtpTimestamp: input.timing.rtpTimestamp,
+                presentationTime: input.timing.presentationTime,
+                nominalDuration: CMTime(value: 2_000, timescale: 90_000)
+            )
+            : input.timing
+        outputs.append(ProcessedVideoFrame(
+            pixelBuffer: outputBuffer,
+            timing: realTiming,
+            sequenceNumber: sequenceNumber,
+            processingLatencyMilliseconds: latency,
+            isSynthetic: false,
+            targetFrameRate: targetFrameRate
+        ))
+        recordStats(
+            latencyMilliseconds: latency,
+            outputFrameCount: outputs.count,
+            outputWidth: outputWidth,
+            outputHeight: outputHeight,
+            rollingShutterConfiguration: configuration.rollingShutter,
+            rollingShutterStatus: rollingShutterStatus
+        )
+        return outputs
+    }
+
+    private func renderOutput(
+        _ image: CIImage,
+        sourceWidth: Int,
+        sourceHeight: Int,
+        outputWidth: Int,
+        outputHeight: Int,
+        scaling: VideoSpatialScalingMode,
+        prefersFastScaling: Bool = false
+    ) -> CVPixelBuffer? {
+        guard let outputBuffer = makePixelBuffer(width: outputWidth, height: outputHeight) else { return nil }
+        if scaling.usesMetalFX,
+           !prefersFastScaling,
            outputWidth >= sourceWidth,
            outputHeight >= sourceHeight,
            let metalFXRenderer,
@@ -427,40 +516,29 @@ final class LiveVideoProcessingPipeline {
                outputHeight: outputHeight,
                to: outputBuffer
            ) {
-            usedMetalFX = true
-        } else {
-            usedMetalFX = false
-            if configuration.scaling.usesMetalFX,
-               !reportedMetalFXFallback {
-                reportedMetalFXFallback = true
-                emitDebug("MetalFX Spatial could not process the selected output; using GPU Lanczos scaling")
-            }
-            let normalized = scaledImage(image, width: outputWidth, height: outputHeight)
-            ciContext.render(
-                normalized,
-                to: outputBuffer,
-                bounds: CGRect(x: 0, y: 0, width: outputWidth, height: outputHeight),
-                colorSpace: colorSpace
-            )
+            return outputBuffer
         }
-        _ = usedMetalFX
-
-        sequenceNumber &+= 1
-        let latency = (CFAbsoluteTimeGetCurrent() - started) * 1_000
-        let output = ProcessedVideoFrame(
-            pixelBuffer: outputBuffer,
-            timing: input.timing,
-            sequenceNumber: sequenceNumber,
-            processingLatencyMilliseconds: latency
+        if scaling.usesMetalFX, !prefersFastScaling, !reportedMetalFXFallback {
+            reportedMetalFXFallback = true
+            emitDebug("MetalFX Spatial could not process the selected output; using GPU Lanczos scaling")
+        }
+        let normalized: CIImage
+        if prefersFastScaling {
+            let extent = image.extent.integral
+            normalized = image.transformed(by: CGAffineTransform(
+                scaleX: CGFloat(outputWidth) / extent.width,
+                y: CGFloat(outputHeight) / extent.height
+            ))
+        } else {
+            normalized = scaledImage(image, width: outputWidth, height: outputHeight)
+        }
+        ciContext.render(
+            normalized,
+            to: outputBuffer,
+            bounds: CGRect(x: 0, y: 0, width: outputWidth, height: outputHeight),
+            colorSpace: colorSpace
         )
-        recordStats(
-            latencyMilliseconds: latency,
-            outputWidth: outputWidth,
-            outputHeight: outputHeight,
-            rollingShutterConfiguration: configuration.rollingShutter,
-            rollingShutterStatus: rollingShutterStatus
-        )
-        return output
+        return outputBuffer
     }
 
     private func applyConservativeEnhancement(
@@ -551,14 +629,23 @@ final class LiveVideoProcessingPipeline {
         timing: VideoFrameTiming,
         motion: VerifiedVideoFrameMotion?,
         configuration: TemporalReconstructionConfiguration
-    ) -> (image: CIImage, status: String, flowLatencyMilliseconds: Double?, usedHistory: Bool) {
+    ) -> (
+        image: CIImage,
+        intermediateImage: CIImage?,
+        intermediateTiming: VideoFrameTiming?,
+        status: String,
+        flowLatencyMilliseconds: Double?,
+        usedHistory: Bool
+    ) {
         if configuration != lastTemporalConfiguration {
             temporalReconstructionState = nil
+            temporalFrameGenerationPhase = 0
             lastTemporalConfiguration = configuration
         }
         guard configuration.isEnabled else {
             temporalReconstructionState = nil
-            return (image, "TEMPORAL OFF", nil, false)
+            temporalFrameGenerationPhase = 0
+            return (image, nil, nil, "TEMPORAL OFF", nil, false)
         }
         let extent = image.extent.integral
         let width = Int(extent.width.rounded())
@@ -566,12 +653,14 @@ final class LiveVideoProcessingPipeline {
         guard width == Bebop900pCameraCalibration.width,
               height == Bebop900pCameraCalibration.height else {
             temporalReconstructionState = nil
-            return (image, "TEMPORAL BYPASS · REQUIRES 1600x900", nil, false)
+            temporalFrameGenerationPhase = 0
+            return (image, nil, nil, "TEMPORAL BYPASS · REQUIRES 1600x900", nil, false)
         }
         guard let temporalRenderer,
               let currentSource = makePixelBuffer(width: width, height: height) else {
             temporalReconstructionState = nil
-            return (image, "TEMPORAL BYPASS · GPU/POOL UNAVAILABLE", nil, false)
+            temporalFrameGenerationPhase = 0
+            return (image, nil, nil, "TEMPORAL BYPASS · GPU/POOL UNAVAILABLE", nil, false)
         }
         ciContext.render(
             image,
@@ -587,7 +676,7 @@ final class LiveVideoProcessingPipeline {
                 history: currentSource,
                 motion: motion
             )
-            return (CIImage(cvPixelBuffer: currentSource), "TEMPORAL WARMING · NEED PREVIOUS FRAME", nil, false)
+            return (CIImage(cvPixelBuffer: currentSource), nil, nil, "TEMPORAL WARMING · NEED PREVIOUS FRAME", nil, false)
         }
         let delta = CMTimeGetSeconds(CMTimeSubtract(timing.presentationTime, previous.timing.presentationTime))
         let maximumGap = max(0.2, CMTimeGetSeconds(timing.nominalDuration) * 6)
@@ -598,8 +687,12 @@ final class LiveVideoProcessingPipeline {
                 history: currentSource,
                 motion: motion
             )
-            return (CIImage(cvPixelBuffer: currentSource), "TEMPORAL RESET · TIMELINE DISCONTINUITY", nil, false)
+            temporalFrameGenerationPhase = 0
+            return (CIImage(cvPixelBuffer: currentSource), nil, nil, "TEMPORAL RESET · TIMELINE DISCONTINUITY", nil, false)
         }
+        temporalFrameGenerationPhase = (temporalFrameGenerationPhase + 1) % 2
+        let shouldGenerateIntermediate = configuration.generatesIntermediateFrames &&
+            configuration.usesBidirectionalFlow && temporalFrameGenerationPhase == 0
         guard let alignedSource = makePixelBuffer(width: width, height: height),
               let alignedHistory = makePixelBuffer(width: width, height: height),
               let destination = makePixelBuffer(width: width, height: height) else {
@@ -609,8 +702,11 @@ final class LiveVideoProcessingPipeline {
                 history: currentSource,
                 motion: motion
             )
-            return (CIImage(cvPixelBuffer: currentSource), "TEMPORAL DROP · INTERMEDIATE POOL EXHAUSTED", nil, false)
+            return (CIImage(cvPixelBuffer: currentSource), nil, nil, "TEMPORAL DROP · INTERMEDIATE POOL EXHAUSTED", nil, false)
         }
+        let intermediateDestination = shouldGenerateIntermediate
+            ? makePixelBuffer(width: width, height: height)
+            : nil
 
         let result = temporalRenderer.reconstruct(
             currentSource: currentSource,
@@ -619,6 +715,7 @@ final class LiveVideoProcessingPipeline {
             alignedSource: alignedSource,
             alignedHistory: alignedHistory,
             destination: destination,
+            intermediateDestination: intermediateDestination,
             previousMotion: previous.motion,
             currentMotion: motion,
             configuration: configuration
@@ -630,8 +727,25 @@ final class LiveVideoProcessingPipeline {
             history: resolved,
             motion: motion
         )
+        let generatedImage = result.generatedIntermediateFrame
+            ? intermediateDestination.map { CIImage(cvPixelBuffer: $0) }
+            : nil
+        let midpointTiming: VideoFrameTiming? = generatedImage.map { _ in
+            let deltaTime = CMTimeSubtract(timing.presentationTime, previous.timing.presentationTime)
+            return VideoFrameTiming(
+                rtpTimestamp: timing.rtpTimestamp,
+                presentationTime: CMTimeAdd(previous.timing.presentationTime, CMTimeMultiplyByRatio(
+                    deltaTime,
+                    multiplier: 1,
+                    divisor: 2
+                )),
+                nominalDuration: CMTime(value: 2_000, timescale: 90_000)
+            )
+        }
         return (
             CIImage(cvPixelBuffer: resolved),
+            generatedImage,
+            midpointTiming,
             result.status,
             result.flowLatencyMilliseconds,
             result.usedHistory
@@ -812,12 +926,14 @@ final class LiveVideoProcessingPipeline {
 
     private func recordStats(
         latencyMilliseconds: Double,
+        outputFrameCount: Int,
         outputWidth: Int,
         outputHeight: Int,
         rollingShutterConfiguration: RollingShutterProcessingConfiguration,
         rollingShutterStatus: String
     ) {
-        processedInWindow += 1
+        processedInWindow += outputFrameCount
+        processingPassesInWindow += 1
         latencyInWindow += latencyMilliseconds
         lastOutputWidth = outputWidth
         lastOutputHeight = outputHeight
@@ -831,7 +947,7 @@ final class LiveVideoProcessingPipeline {
             droppedBeforeProcessing: dropped,
             outputWidth: lastOutputWidth,
             outputHeight: lastOutputHeight,
-            averageLatencyMilliseconds: latencyInWindow / Double(max(1, processedInWindow)),
+            averageLatencyMilliseconds: latencyInWindow / Double(max(1, processingPassesInWindow)),
             temporalHistoryDepth: temporalHistory.count,
             temporalHistoryAgeMilliseconds: temporalHistoryAgeMilliseconds,
             temporalMotionAvailable: temporalHistory.last?.motion != nil,
@@ -856,6 +972,7 @@ final class LiveVideoProcessingPipeline {
             rollingShutterStatus: rollingShutterStatus
         )
         processedInWindow = 0
+        processingPassesInWindow = 0
         latencyInWindow = 0
         statsWindowStarted = Date()
         DispatchQueue.main.async { [weak self] in self?.onStats?(stats) }

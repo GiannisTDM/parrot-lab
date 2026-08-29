@@ -135,6 +135,8 @@ enum ParrotLabSelfTest {
               H264StreamRecorder.selfTest(), ProcessedH264Recorder.selfTest(),
               H264MP4Converter.selfTest(),
               ARSDKPhotoCaptureSelfTest.run(),
+              AircraftSupportSelfTest.run(),
+              FlightControlSelfTest.run(),
               ARSDKTelemetryReducer.selfTest(),
               DroneMediaFTP.selfTest() else {
             fputs("Self-test failed: local media capture\n", stderr)

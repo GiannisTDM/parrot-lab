@@ -68,6 +68,7 @@ struct TelemetrySnapshot: Equatable {
     var videoJitterMs: Double?
 
     var connectionLabel = "Disconnected"
+    var connectionRouteLabel = "SC2 DIRECT"
 
     mutating func markUpdated() {
         updatedAt = Date()
@@ -157,6 +158,9 @@ struct ARSDKTelemetryReducer {
 
         case .satelliteCount(let count):
             snapshot.satelliteCount = count
+
+        case .aircraftConnection, .productVersion:
+            return false
         }
         snapshot.markUpdated()
         return true

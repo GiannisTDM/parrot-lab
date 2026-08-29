@@ -1,8 +1,10 @@
 # Parrot Lab for macOS
 
-Parrot Lab is a native macOS HUD and diagnostic client for the Parrot SkyController 2 and Bebop 2. It is intentionally built from Apple system frameworks rather than Electron or an embedded browser.
+Parrot Lab is a native macOS HUD and diagnostic client for the Parrot
+SkyController 2, Bebop Drone (BB1), and Bebop 2. It is intentionally built from
+Apple system frameworks rather than Electron or an embedded browser.
 
-See [CHANGELOG.md](CHANGELOG.md) for the V1.3 release highlights and known
+See [CHANGELOG.md](CHANGELOG.md) for the V1.4 release highlights and known
 limitations.
 
 > [!WARNING]
@@ -12,15 +14,33 @@ limitations.
 > used while landed with the props removed. Do not rely on this build as a
 > flight display or as a replacement for FreeFlight.
 
-The intended production transport is the SC2 mobile link used by FreeFlight: Bebop 2 video and telemetry arrive at `mppd` over Wi-Fi and are forwarded to the mobile client through Parrot's USB `libmux` channels. Version 1.3 does not yet implement that USB video path.
+The intended production transport is the SC2 mobile link used by FreeFlight: Bebop 2 video and telemetry arrive at `mppd` over Wi-Fi and are forwarded to the mobile client through Parrot's USB `libmux` channels. Version 1.4 does not yet implement that USB video path.
 
-Version 1.3 provides:
+Version 1.4 provides:
 
-- direct, read-only Telnet connection to the SC2 at `192.168.42.88`;
+- direct, read-only Telnet connection to the configured SC2 host, including
+  the normal `192.168.42.88` route and the Apple-NCM USB route;
 - parsing of the SC2's existing `mppd`, `wifid`, and link-quality telemetry;
 - a persistent SC2-routed ARDiscovery/ARNetwork/ARCommands session for
   structured drone battery, flight state, GPS, speed, attitude, satellite and
   camera events;
+- automatic BB1/BB2 model detection from the authoritative SkyController
+  `ConnexionChanged` product ID (`0x0901` / `0x090c`), with direct Bonjour
+  discovery of `_arsdk-0901._udp` and `_arsdk-090c._udp`;
+- stock Compatibility video, telemetry, piloting, camera control and genuine
+  4K fisheye capture on both BB1 and BB2;
+- automatic safety gating that keeps BB2-only modified Dragon, calibrated
+  rolling-shutter, persistent-Telnet and RF/MOD workflows disabled on BB1 or
+  an unidentified aircraft;
+- an optional standalone BB1/BB2 route using direct ARDiscovery at
+  `192.168.42.1:44444`, the discovery-returned command port, and announced
+  ARStream2 client ports;
+- native macOS GameController input for Xbox, PlayStation and MFi controllers,
+  plus app-focused remappable keyboard controls that require a safety-hold key
+  for movement;
+- SC2-style 20 Hz PCMD control, acknowledged take-off/landing/RTH commands,
+  camera pan/tilt control, automatic neutral input on focus/connection loss,
+  and an intentionally unassigned emergency command;
 - per-chain RSSI, noise, SNR, PHY rate, flight state, altitude, attitude, controller battery and temperature;
 - a graphical video HUD with the RF Lab red/yellow/green/cyan signal gradient;
 - an artificial horizon and live link/video statistics;
@@ -39,6 +59,10 @@ Version 1.3 provides:
 - experimental, developer-controlled 900p temporal reconstruction with
   synchronized IMU alignment, dense residual optical flow and occlusion/
   ghost rejection;
+- performance-scaled residual flow plus optional motion-compensated 2:1
+  midpoint generation (30 source + 15 generated frames for a 45 FPS output);
+- an automatic temporal-performance governor and bounded 45 Hz presentation
+  queue, targeting at least 30 displayed FPS without allowing latency to grow;
 - a guarded, non-persistent Dragon Video Lab for resolution and bitrate tests;
 - verified one-click deployment of Dragon Lab and the RF/MOD Suite from the
   native **Tools** menu;
@@ -48,19 +72,19 @@ Version 1.3 provides:
   embedded in the application bundle;
 - an ad-hoc-signed, double-clickable Apple-silicon `.app` bundle.
 
-RF/NVM writes occur only through the explicit, confirmed RF power workflow,
-which creates and verifies recovery backups on both devices. Parrot Lab never
-edits `persist.dragon-prog.post_cmd`. Dragon Lab can explicitly stop and
-relaunch Dragon with runtime-only arguments after its applicable safety check.
-Applying a profile is immediate and does not show an additional confirmation
-sheet.
+The program performs no RF/NVM writes and never edits
+`persist.dragon-prog.post_cmd`. Dragon Lab can explicitly stop and relaunch
+Dragon with runtime-only arguments after a landed-state check. Applying a
+profile is immediate and does not show an additional confirmation sheet.
 
 ## Requirements
 
 - macOS 13 or later on Apple silicon;
-- SC2 and Bebop 2 powered and associated;
-- a network route from the Mac to `192.168.42.88`;
-- the project's explicitly enabled SC2 Telnet service on TCP 23;
+- a Bebop Drone or Bebop 2, optionally associated with an SC2;
+- either a direct aircraft route at `192.168.42.1`, or a route to the SC2 at
+  `192.168.42.88` / its usual `192.168.53.1` Apple-NCM USB address;
+- for SC2 mode and device tools, the project's explicitly enabled SC2 Telnet
+  service on TCP 23;
 - Local Network access when macOS requests it.
 
 ## Current macOS release status
@@ -385,7 +409,7 @@ a normal termination first and uses `SIGKILL` only if Dragon does not exit.
 `/usr/bin/DragonStarter.sh`.
 
 Drone battery and navigation state now arrive as native ARCommands through the
-SC2 at controller RF range. Version 1.3 no longer opens a periodic Telnet relay
+SC2 at controller RF range. Version 1.4 no longer opens a periodic Telnet relay
 or direct-drone Telnet connection to scrape battery logs. The persistent ARSDK
 session requests all states after connecting and refreshes them periodically;
 the stock 4K fisheye capture reuses the same command connection.
@@ -431,9 +455,6 @@ The native macOS **Tools** menu contains deployment and discovery actions:
 - **Upload RF/MOD Suite to SkyController 2** uses the address currently shown
   in **SC2 HOST** and installs the same script at
   `/data/lib/ftp/internal_000/parrot_rf_lab.sh`;
-- **Enable/Disable RF Power Mod…** explicitly applies the tested profile to
-  both devices or restores their preserved original baselines. It creates and
-  verifies backups before writing and then performs controlled reboots;
 - **Find SC2 IP through Bebop 2…** uploads a read-only helper to the Bebop,
   correlates the associated Parrot station with the Bebop ARP/dnsmasq lease
   state, then fills **SC2 HOST** and caches the bridge-side DHCP address;
@@ -448,8 +469,7 @@ the script: they do not run it, apply an RF profile, edit NVM, or touch factory
 files. It can be launched explicitly from the corresponding device shell with
 `sh <device-path> menu`.
 
-The persistent Telnet action accepts the supported Bebop 2 firmware builds
-4.4.2 and 4.7.1. Installer
+The persistent Telnet action is restricted to Bebop 2 firmware 4.4.2. Installer
 and upload actions do not require an established Parrot Lab telemetry session;
 their confirmation sheets remain available for bench-safety checks. It verifies
 `install_bebop2_persistent_telnet.sh`, connects directly to
@@ -511,10 +531,32 @@ It separately publishes per-chain Broadcom values, link-quality percentages, con
 
 Values of `500` used by `mppd` as unavailable altitude/position sentinels are deliberately shown as unavailable rather than as real telemetry.
 
+## Standalone BB1/BB2 and input controls
+
+Open **Parrot Lab → Settings** to enable **Standalone aircraft**. Join the BB1
+or BB2 Wi-Fi first; the app then locks the target to `192.168.42.1`, identifies
+the model from its official Bonjour service, performs ARDiscovery on TCP 44444,
+and uses the command UDP port returned by the aircraft. Standalone and
+SkyController routes are mutually exclusive.
+
+The same Settings panel can enable keyboard and native gamepad control for
+either route. **Configure mappings…** changes every keyboard action and all
+discrete gamepad buttons. The analog gamepad layout follows the SC2: left
+stick controls yaw/gaz and right stick controls roll/pitch. Keyboard movement
+only operates while the configured safety-hold key is down, and only while the
+main flight window has focus. Controller disconnect, app focus loss, route
+changes and ARSDK disconnect all force neutral PCMD.
+
+The emergency action has no default keyboard or controller binding. Direct
+piloting and direct ARStream2 reception are new development features and must
+be validated on the ground with propellers removed before any flight use.
+
 ## Video transport
 
 The **Start video** control uses the live-proven SC2 restream path available in
-the current lab setup.
+the current lab setup. In standalone mode, ARDiscovery advertises the selected
+local RTP port and its adjacent ARStream2 control port to the drone, then sends
+`MediaStreaming.VideoEnable` instead of probing the SC2 restream service.
 
 The app:
 
