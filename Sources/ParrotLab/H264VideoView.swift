@@ -223,8 +223,9 @@ final class H264VideoView: NSView {
     private var displayFormatDescription: CMVideoFormatDescription?
     private var displayFormatKey: String?
     private let hardwareFrameLock = NSLock()
-    private var pendingHardwareFrame: ProcessedVideoFrame?
+    private var pendingHardwareFrames: [ProcessedVideoFrame] = []
     private var hardwareFrameDeliveryScheduled = false
+    private var generatedDisplayTimer: DispatchSourceTimer?
     private let frameRateLock = NSLock()
     private var decodedFramesInWindow = 0
     private var displayedFramesInWindow = 0
@@ -403,9 +404,11 @@ final class H264VideoView: NSView {
         lastDroneVideoQuaternion = nil
         lastFrameVideoQuaternion = nil
         hardwareFrameLock.lock()
-        pendingHardwareFrame = nil
+        pendingHardwareFrames.removeAll(keepingCapacity: false)
         hardwareFrameDeliveryScheduled = false
         hardwareFrameLock.unlock()
+        generatedDisplayTimer?.cancel()
+        generatedDisplayTimer = nil
         videoLayer.flushAndRemoveImage()
         latestProcessedPixelBuffer = nil
         displayFormatDescription = nil
@@ -690,45 +693,75 @@ final class H264VideoView: NSView {
 
     private func enqueueLatestHardwareFrame(_ frame: ProcessedVideoFrame) {
         hardwareFrameLock.lock()
-        pendingHardwareFrame = frame
+        if frame.targetFrameRate > 30 {
+            if pendingHardwareFrames.count >= 4 { pendingHardwareFrames.removeFirst() }
+            pendingHardwareFrames.append(frame)
+            hardwareFrameLock.unlock()
+            DispatchQueue.main.async { [weak self] in self?.ensureGeneratedDisplayTimer() }
+            return
+        } else {
+            pendingHardwareFrames = [frame]
+        }
         let shouldSchedule = !hardwareFrameDeliveryScheduled
         if shouldSchedule { hardwareFrameDeliveryScheduled = true }
         hardwareFrameLock.unlock()
 
         if shouldSchedule {
-            DispatchQueue.main.async { [weak self] in self?.deliverLatestHardwareFrame() }
+            DispatchQueue.main.async { [weak self] in
+                self?.generatedDisplayTimer?.cancel()
+                self?.generatedDisplayTimer = nil
+                self?.deliverLatestHardwareFrame()
+            }
         }
     }
 
     private func deliverLatestHardwareFrame() {
         hardwareFrameLock.lock()
-        let frame = pendingHardwareFrame
-        pendingHardwareFrame = nil
+        let frame = pendingHardwareFrames.isEmpty ? nil : pendingHardwareFrames.removeFirst()
         hardwareFrameLock.unlock()
 
-        if let frame {
-            hardwareFallbackWorkItem?.cancel()
-            hardwareFallbackWorkItem = nil
-            latestProcessedPixelBuffer = frame.pixelBuffer
-            if videoLayer.status == .failed { videoLayer.flush() }
-            if videoLayer.isReadyForMoreMediaData,
-               let sampleBuffer = displaySampleBuffer(for: frame) {
-                videoLayer.enqueue(sampleBuffer)
-                recordFrameRate(decoded: 0, displayed: 1)
-                if !reportedFirstDecodedFrame {
-                    reportedFirstDecodedFrame = true
-                    onDebug?("First processed IOSurface displayed: \(frame.width)x\(frame.height)")
-                    onFrameReady?()
-                }
-            }
-        }
+        if let frame { present(frame) }
 
         hardwareFrameLock.lock()
-        let shouldContinue = pendingHardwareFrame != nil
+        let shouldContinue = !pendingHardwareFrames.isEmpty
         if !shouldContinue { hardwareFrameDeliveryScheduled = false }
         hardwareFrameLock.unlock()
         if shouldContinue {
             DispatchQueue.main.async { [weak self] in self?.deliverLatestHardwareFrame() }
+        }
+    }
+
+    private func ensureGeneratedDisplayTimer() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard generatedDisplayTimer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now(), repeating: .milliseconds(22), leeway: .milliseconds(2))
+        timer.setEventHandler { [weak self] in self?.deliverGeneratedHardwareFrame() }
+        generatedDisplayTimer = timer
+        timer.resume()
+    }
+
+    private func deliverGeneratedHardwareFrame() {
+        hardwareFrameLock.lock()
+        let frame = pendingHardwareFrames.isEmpty ? nil : pendingHardwareFrames.removeFirst()
+        hardwareFrameLock.unlock()
+        if let frame { present(frame) }
+    }
+
+    private func present(_ frame: ProcessedVideoFrame) {
+        hardwareFallbackWorkItem?.cancel()
+        hardwareFallbackWorkItem = nil
+        if !frame.isSynthetic { latestProcessedPixelBuffer = frame.pixelBuffer }
+        if videoLayer.status == .failed { videoLayer.flush() }
+        if videoLayer.isReadyForMoreMediaData,
+           let sampleBuffer = displaySampleBuffer(for: frame) {
+            videoLayer.enqueue(sampleBuffer)
+            recordFrameRate(decoded: 0, displayed: 1)
+            if !reportedFirstDecodedFrame {
+                reportedFirstDecodedFrame = true
+                onDebug?("First processed IOSurface displayed: \(frame.width)x\(frame.height)")
+                onFrameReady?()
+            }
         }
     }
 

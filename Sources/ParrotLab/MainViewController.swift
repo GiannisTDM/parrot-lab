@@ -82,6 +82,12 @@ final class MainViewController: NSViewController {
     private let rawArchiveRecorder = H264StreamRecorder()
     private let mp4Converter = H264MP4Converter()
     private let arsdkClient = ARSDKCommandClient()
+    private let directAircraftDiscovery = DirectAircraftProductDiscovery()
+    private let flightInputManager = FlightInputManager()
+    private var flightControlConfiguration = FlightControlConfiguration.load()
+    private var flightControlStatus = "WAITING FOR ARSDK · 0 GAMEPADS"
+    private var cameraTilt: Int8 = 0
+    private var cameraPan: Int8 = 0
     private lazy var droneFisheyeCapture = DroneFisheyeCaptureController(client: arsdkClient)
     private let droneMediaFTP = DroneMediaFTP()
     private let toolInstaller = BebopToolInstaller()
@@ -90,6 +96,10 @@ final class MainViewController: NSViewController {
     private var arsdkSessionWanted = false
     private var arsdkConnectionInFlight = false
     private var arsdkConnected = false
+    private var directVideoPortNegotiated: UInt16?
+    private var aircraftModel: ParrotAircraftModel = .unknown
+    private var aircraftFirmwareSoftware: String?
+    private var aircraftFirmwareHardware: String?
     private var lastARSDKTelemetryAt: Date?
     private var telemetryFreshnessTimer: Timer?
     private var lastFlightStateUpdate: Date?
@@ -118,7 +128,11 @@ final class MainViewController: NSViewController {
         latencyBudgetMilliseconds: Self.storedDouble("ParrotLab.Temporal.LatencyBudgetMs", fallback: 65.0),
         usesBidirectionalFlow: UserDefaults.standard.object(forKey: "ParrotLab.Temporal.Bidirectional") == nil
             ? true
-            : UserDefaults.standard.bool(forKey: "ParrotLab.Temporal.Bidirectional")
+            : UserDefaults.standard.bool(forKey: "ParrotLab.Temporal.Bidirectional"),
+        flowResolutionScale: Self.storedDouble("ParrotLab.Temporal.FlowResolutionScale", fallback: 0.375),
+        generatesIntermediateFrames: UserDefaults.standard.bool(
+            forKey: "ParrotLab.Temporal.FrameGeneration45"
+        )
     )
     private var processedRecordingStats: ProcessedRecordingStats?
     private var videoConversionInFlight = false
@@ -173,7 +187,9 @@ final class MainViewController: NSViewController {
     private static let cachedSC2USBHostPreferenceKey = "ParrotLabCachedSC2USBHost"
 
     private let hudView = VideoHUDView(frame: .zero)
+    private let workbenchSubtitle = NSTextField(labelWithString: "BEBOP VIDEO & RF WORKBENCH")
     private let hostField = NSTextField(string: "192.168.42.88")
+    private let hostSectionLabel = NSTextField(labelWithString: "SC2 HOST")
     private let rtpPortField = NSTextField(string: "55004")
     private let connectButton = NSButton(title: "Connect SC2", target: nil, action: nil)
     private let videoModePopup = NSPopUpButton(frame: .zero, pullsDown: false)
@@ -199,6 +215,7 @@ final class MainViewController: NSViewController {
     private let flightLabel = NSTextField(labelWithString: "Waiting for flight telemetry")
     private let navigationLabel = NSTextField(labelWithString: "Waiting for ARSDK navigation")
     private let healthLabel = NSTextField(labelWithString: "Waiting for controller health")
+    private let flightControlLabel = NSTextField(labelWithString: "Flight controls disabled")
     private let videoLabel = NSTextField(labelWithString: "Restream idle")
     private let console = NSTextView(frame: .zero)
 
@@ -209,7 +226,9 @@ final class MainViewController: NSViewController {
         }
         let savedUSBHost = UserDefaults.standard.string(forKey: Self.cachedSC2USBHostPreferenceKey) ?? ""
         let savedBridgeHost = UserDefaults.standard.string(forKey: Self.cachedSC2HostPreferenceKey) ?? ""
-        if Self.isValidIPv4Host(savedUSBHost) {
+        if flightControlConfiguration.standaloneBebopEnabled {
+            hostField.stringValue = "192.168.42.1"
+        } else if Self.isValidIPv4Host(savedUSBHost) {
             hostField.stringValue = savedUSBHost
         } else if Self.isValidIPv4Host(savedBridgeHost) {
             hostField.stringValue = savedBridgeHost
@@ -218,6 +237,7 @@ final class MainViewController: NSViewController {
         view.appearance = NSAppearance(named: .darkAqua)
         buildInterface()
         wireDataSources()
+        flightInputManager.apply(flightControlConfiguration)
         applyRollingShutterConfiguration()
         applyTemporalReconstructionConfiguration()
         updateInterface()
@@ -225,7 +245,7 @@ final class MainViewController: NSViewController {
 
     override func viewDidAppear() {
         super.viewDidAppear()
-        view.window?.title = "Parrot Lab — Bebop 2 / SkyController 2"
+        updateWindowIdentity()
         view.window?.minSize = NSSize(width: 1180, height: 720)
     }
 
@@ -304,7 +324,7 @@ final class MainViewController: NSViewController {
         let title = NSTextField(labelWithString: "PARROT LAB")
         title.font = .systemFont(ofSize: 17, weight: .bold)
         title.textColor = .white
-        let version = NSTextField(labelWithString: "V1.3")
+        let version = NSTextField(labelWithString: "V1.4")
         version.font = .monospacedSystemFont(ofSize: 8.5, weight: .bold)
         version.textColor = LabVisualStyle.accent
         let titleRow = NSStackView()
@@ -313,11 +333,10 @@ final class MainViewController: NSViewController {
         titleRow.spacing = 7
         titleRow.addArrangedSubview(title)
         titleRow.addArrangedSubview(version)
-        let subtitle = NSTextField(labelWithString: "BEBOP 2 VIDEO & RF WORKBENCH")
-        subtitle.font = .systemFont(ofSize: 9.5, weight: .semibold)
-        subtitle.textColor = LabVisualStyle.mutedText
+        workbenchSubtitle.font = .systemFont(ofSize: 9.5, weight: .semibold)
+        workbenchSubtitle.textColor = LabVisualStyle.mutedText
         identity.addArrangedSubview(titleRow)
-        identity.addArrangedSubview(subtitle)
+        identity.addArrangedSubview(workbenchSubtitle)
         topRow.addArrangedSubview(identity)
 
         let topSpacer = NSView()
@@ -360,7 +379,9 @@ final class MainViewController: NSViewController {
         configureStatusPill()
         topRow.addArrangedSubview(statusLabel)
 
-        topRow.addArrangedSubview(sectionLabel("SC2 HOST"))
+        hostSectionLabel.font = .systemFont(ofSize: 10, weight: .bold)
+        hostSectionLabel.textColor = LabVisualStyle.mutedText
+        topRow.addArrangedSubview(hostSectionLabel)
         styleTextField(hostField, width: 132)
         topRow.addArrangedSubview(hostField)
 
@@ -430,6 +451,7 @@ final class MainViewController: NSViewController {
         stack.addArrangedSubview(card(title: "RF LINK", body: rfLabel))
         stack.addArrangedSubview(card(title: "FLIGHT", body: flightLabel))
         stack.addArrangedSubview(card(title: "ARSDK NAVIGATION", body: navigationLabel))
+        stack.addArrangedSubview(card(title: "FLIGHT CONTROL", body: flightControlLabel))
         stack.addArrangedSubview(card(title: "SC2 HEALTH", body: healthLabel))
 
         let notice = NSTextField(wrappingLabelWithString: "Dragon video profiles change runtime options only. They never write the persistent Dragon property or replace the stock system binary.")
@@ -720,6 +742,14 @@ final class MainViewController: NSViewController {
     }
 
     private func wireDataSources() {
+        directAircraftDiscovery.onDetected = { [weak self] model, serviceName in
+            guard let self, self.standaloneBebopEnabled else { return }
+            self.appendLog("Direct aircraft identified as \(model.displayName) by Bonjour service \(serviceName)")
+            self.applyDetectedAircraft(model, source: "direct Bonjour")
+        }
+        directAircraftDiscovery.onLog = { [weak self] message in
+            self?.appendLog(message)
+        }
         telnet.onState = { [weak self] state in
             guard let self else { return }
             switch state {
@@ -762,6 +792,18 @@ final class MainViewController: NSViewController {
         telnet.onDebug = { [weak self] message in self?.appendLog(message) }
         arsdkClient.onTelemetryEvent = { [weak self] event in
             self?.consumeARSDKTelemetry(event)
+        }
+        flightInputManager.onPilotingInput = { [weak self] input in
+            guard let self, self.arsdkConnected, self.flightControlsEnabled else { return }
+            self.arsdkClient.updatePilotingInput(input)
+        }
+        flightInputManager.onAction = { [weak self] action in
+            self?.performFlightControlAction(action)
+        }
+        flightInputManager.onStatus = { [weak self] status in
+            guard let self else { return }
+            self.flightControlStatus = status
+            self.updateInterface()
         }
         dragonControlTelnet.onLine = { [weak self] line in
             self?.handleDragonControlLine(line)
@@ -928,19 +970,41 @@ final class MainViewController: NSViewController {
 
     @objc private func toggleConnection() {
         if connectButton.title == "Disconnect" {
+            directAircraftDiscovery.stop()
             stopARSDKTelemetry()
             telnet.stop()
+            if flightControlConfiguration.standaloneBebopEnabled {
+                setDisconnectedInterface()
+            }
             return
         }
-        let host = hostField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let standalone = flightControlConfiguration.standaloneBebopEnabled
+        let host = standalone
+            ? "192.168.42.1"
+            : hostField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !host.isEmpty else { return }
         parser.reset()
         arsdkTelemetryReducer.reset()
+        applyDetectedAircraft(.unknown, source: "new connection")
+        aircraftFirmwareSoftware = nil
+        aircraftFirmwareHardware = nil
         snapshot = TelemetrySnapshot()
         lastFlightStateUpdate = nil
+        connectButton.title = "Disconnect"
         updateInterface()
-        appendLog("Connecting to SC2 Telnet at \(host):23")
-        telnet.connect(host: host)
+        if standalone {
+            hostField.stringValue = host
+            snapshot.connectionLabel = "Connecting Bebop"
+            statusLabel.stringValue = "CONNECTING"
+            statusLabel.textColor = .systemYellow
+            startTelemetryFreshnessTimer()
+            appendLog("Connecting directly to Bebop ARDiscovery at \(host):44444")
+            directAircraftDiscovery.start()
+            startARSDKTelemetry(host: host)
+        } else {
+            appendLog("Connecting to SC2 Telnet at \(host):23")
+            telnet.connect(host: host)
+        }
     }
 
     private func startARSDKTelemetry(host: String, forceReconnect: Bool = false) {
@@ -954,8 +1018,15 @@ final class MainViewController: NSViewController {
         guard !arsdkConnected, !arsdkConnectionInFlight else { return }
 
         arsdkConnectionInFlight = true
-        appendLog("Opening persistent ARSDK telemetry through SC2 \(host):44444")
-        arsdkClient.connect(host: host) { [weak self] result in
+        let standalone = flightControlConfiguration.standaloneBebopEnabled
+        let route: ARSDKConnectionRoute = standalone ? .directBebop : .skyController
+        appendLog("Opening persistent ARSDK session through \(route.displayName) \(host):44444")
+        let directVideoPort = standalone ? UInt16(rtpPortField.stringValue) : nil
+        arsdkClient.connect(
+            host: host,
+            route: route,
+            videoStreamPort: directVideoPort
+        ) { [weak self] result in
             guard let self else { return }
             self.arsdkConnectionInFlight = false
             guard self.arsdkSessionWanted, self.connectButton.title == "Disconnect" else {
@@ -966,13 +1037,34 @@ final class MainViewController: NSViewController {
             case .success:
                 self.arsdkConnected = true
                 self.lastARSDKTelemetryAt = Date()
-                self.appendLog("ARSDK telemetry connected; requesting all drone and controller states")
+                if standalone {
+                    self.directVideoPortNegotiated = directVideoPort
+                    self.snapshot.connectionLabel = "Live \(self.aircraftModel.shortLabel)"
+                    self.statusLabel.stringValue = "LIVE DIRECT"
+                    self.statusLabel.textColor = .systemGreen
+                    if self.dragonRuntimeStatus == "SC2 OFFLINE" || self.dragonRuntimeStatus.hasSuffix("OFFLINE") {
+                        self.dragonRuntimeStatus = "READY · LANDED ONLY"
+                    }
+                    self.appendLog("Direct Bebop ARSDK connected; requesting settings/states and enabling video")
+                    self.arsdkClient.sendVideoEnable(true)
+                } else {
+                    self.appendLog("ARSDK telemetry connected; requesting all drone and controller states")
+                }
+                self.arsdkClient.sendRequestAllSettings()
                 self.arsdkClient.sendRequestAllStates()
-                self.arsdkClient.sendRequestSkyControllerAllStates()
+                if !standalone { self.arsdkClient.sendRequestSkyControllerAllStates() }
+                self.updateFlightControlAvailability()
                 self.startARSDKRefreshTimer(host: host)
+                self.updateInterface()
             case .failure(let error):
                 self.arsdkConnected = false
                 self.appendLog("ARSDK telemetry unavailable: \(error.localizedDescription)")
+                self.updateFlightControlAvailability()
+                if standalone {
+                    self.statusLabel.stringValue = "RECONNECTING"
+                    self.statusLabel.textColor = .systemYellow
+                    self.updateInterface()
+                }
                 self.scheduleARSDKReconnect(host: host)
             }
         }
@@ -986,11 +1078,16 @@ final class MainViewController: NSViewController {
             if !self.dronePhotoInFlight,
                let last = self.lastARSDKTelemetryAt,
                Date().timeIntervalSince(last) > 12 {
-                self.appendLog("ARSDK telemetry became stale; reconnecting through SC2")
+                let route = self.flightControlConfiguration.standaloneBebopEnabled
+                    ? "direct Bebop"
+                    : "SC2"
+                self.appendLog("ARSDK telemetry became stale; reconnecting through \(route)")
                 self.startARSDKTelemetry(host: host, forceReconnect: true)
             } else {
                 self.arsdkClient.sendRequestAllStates()
-                self.arsdkClient.sendRequestSkyControllerAllStates()
+                if !self.flightControlConfiguration.standaloneBebopEnabled {
+                    self.arsdkClient.sendRequestSkyControllerAllStates()
+                }
             }
         }
     }
@@ -1003,16 +1100,117 @@ final class MainViewController: NSViewController {
     }
 
     private func stopARSDKTelemetry() {
+        arsdkClient.neutralizePilotingInput()
+        arsdkClient.stopPiloting()
         arsdkSessionWanted = false
         arsdkRefreshTimer?.invalidate()
         arsdkRefreshTimer = nil
         arsdkConnectionInFlight = false
         arsdkConnected = false
         lastARSDKTelemetryAt = nil
+        directVideoPortNegotiated = nil
+        flightInputManager.setControlsAvailable(false)
         arsdkClient.stop()
     }
 
+    private func setDisconnectedInterface() {
+        directAircraftDiscovery.stop()
+        stopTelemetryFreshnessTimer()
+        snapshot.connectionLabel = "Disconnected"
+        statusLabel.stringValue = "DISCONNECTED"
+        statusLabel.textColor = .systemOrange
+        connectButton.title = standaloneBebopEnabled ? "Connect Bebop" : "Connect SC2"
+        dragonRuntimeStatus = standaloneBebopEnabled ? "BEBOP OFFLINE" : "SC2 OFFLINE"
+        updateInterface()
+    }
+
+    private var flightControlsEnabled: Bool {
+        flightControlConfiguration.keyboardEnabled || flightControlConfiguration.controllerEnabled
+    }
+
+    private func updateFlightControlAvailability() {
+        let available = arsdkConnected && flightControlsEnabled
+        flightInputManager.setControlsAvailable(available)
+        if available {
+            arsdkClient.startPiloting()
+        } else {
+            arsdkClient.stopPiloting()
+        }
+    }
+
+    private func performFlightControlAction(_ action: FlightControlAction) {
+        guard arsdkConnected, flightControlsEnabled else { return }
+        switch action {
+        case .takeOffLand:
+            if snapshot.flightState == "LANDED" {
+                appendLog("Flight control: take off")
+                arsdkClient.sendTakeOff()
+            } else if snapshot.flightState != "UNKNOWN" {
+                appendLog("Flight control: land")
+                arsdkClient.sendLanding()
+            } else {
+                appendLog("Flight control ignored take-off/land: flying state is unknown")
+            }
+        case .returnHome:
+            appendLog("Flight control: return home")
+            flightInputManager.neutralize()
+            arsdkClient.sendNavigateHome(start: true)
+        case .cancelReturnHome:
+            appendLog("Flight control: cancel return home")
+            arsdkClient.sendNavigateHome(start: false)
+        case .emergency:
+            appendLog("Flight control: EMERGENCY command")
+            flightInputManager.neutralize()
+            arsdkClient.sendEmergency()
+        case .cameraUp: adjustCamera(tilt: 8, pan: 0)
+        case .cameraDown: adjustCamera(tilt: -8, pan: 0)
+        case .cameraLeft: adjustCamera(tilt: 0, pan: -8)
+        case .cameraRight: adjustCamera(tilt: 0, pan: 8)
+        case .cameraCenter:
+            cameraTilt = 0
+            cameraPan = 0
+            arsdkClient.sendCameraOrientation(tilt: 0, pan: 0)
+        default: break
+        }
+    }
+
+    private func adjustCamera(tilt: Int, pan: Int) {
+        cameraTilt = Int8(clamping: Int(cameraTilt) + tilt)
+        cameraPan = Int8(clamping: Int(cameraPan) + pan)
+        cameraTilt = min(100, max(-100, cameraTilt))
+        cameraPan = min(100, max(-100, cameraPan))
+        arsdkClient.sendCameraOrientation(tilt: cameraTilt, pan: cameraPan)
+    }
+
     private func consumeARSDKTelemetry(_ event: ARSDKTelemetryEvent) {
+        switch event {
+        case .aircraftConnection(let status, let deviceName, let productID):
+            lastARSDKTelemetryAt = Date()
+            let model = ParrotAircraftModel(productID: productID)
+            appendLog(
+                String(
+                    format: "ARSDK aircraft %@ · status %u · product 0x%04x (%@)",
+                    deviceName,
+                    status,
+                    productID,
+                    model.displayName
+                )
+            )
+            if status == 2 {
+                applyDetectedAircraft(model, source: "SkyController product event")
+            }
+            updateInterface()
+            return
+        case .productVersion(let software, let hardware):
+            lastARSDKTelemetryAt = Date()
+            aircraftFirmwareSoftware = software
+            aircraftFirmwareHardware = hardware
+            appendLog("ARSDK aircraft firmware \(software) · hardware \(hardware)")
+            updateInterface()
+            return
+        default:
+            break
+        }
         guard arsdkTelemetryReducer.consume(event, into: &snapshot) else { return }
         lastARSDKTelemetryAt = Date()
         if case .flyingState = event {
@@ -1021,6 +1219,31 @@ final class MainViewController: NSViewController {
             lastFlightStateUpdate = Date()
         }
         updateInterface()
+    }
+
+    private func applyDetectedAircraft(_ model: ParrotAircraftModel, source: String) {
+        guard aircraftModel != model else { return }
+        aircraftModel = model
+        if standaloneBebopEnabled, arsdkConnected {
+            snapshot.connectionLabel = "Live \(model.shortLabel)"
+        }
+        if !model.capabilities.supportsBB2DragonLab && selectedVideoMode != .compatibility {
+            if videoRunning { startVideo() }
+            videoModePopup.selectItem(withTag: VideoReceiveMode.compatibility.rawValue)
+            hudView.videoView.receiveMode = .compatibility
+            appendLog("Switched to stock Compatibility video because \(model.displayName) has no validated BB2 Dragon profile")
+        }
+        applyRollingShutterConfiguration()
+        appendLog("Aircraft support model: \(model.displayName) · source \(source)")
+        updateWindowIdentity()
+        updateInterface()
+        NSApp.mainMenu?.update()
+    }
+
+    private func updateWindowIdentity() {
+        let route = standaloneBebopEnabled ? "Standalone" : "SkyController 2"
+        view.window?.title = "Parrot Lab — \(aircraftModel.displayName) / \(route)"
+        workbenchSubtitle.stringValue = "\(aircraftModel.shortLabel) VIDEO & RF WORKBENCH"
     }
 
     private func startTelemetryFreshnessTimer() {
@@ -1042,6 +1265,13 @@ final class MainViewController: NSViewController {
     @objc private func videoModeChanged() {
         guard !videoRunning else { return }
         let mode = selectedVideoMode
+        guard mode == .compatibility || aircraftCapabilities.supportsBB2DragonLab else {
+            videoModePopup.selectItem(withTag: VideoReceiveMode.compatibility.rawValue)
+            hudView.videoView.receiveMode = .compatibility
+            showMediaAlert("Modified 900p Dragon profiles are supported only on a detected Bebop 2. Bebop Drone uses stock Compatibility video.")
+            updateInterface()
+            return
+        }
         hudView.videoView.receiveMode = mode
         applyRollingShutterConfiguration()
         videoFormatStatus = "FORMAT waiting"
@@ -1089,6 +1319,13 @@ final class MainViewController: NSViewController {
     }
 
     @objc private func applyDragonProfile() {
+        guard aircraftCapabilities.supportsBB2DragonLab else {
+            showDragonAlert(
+                title: "Bebop 2 required",
+                message: "Dragon Lab profiles are disabled until the SkyController or direct Bonjour discovery identifies a Bebop 2."
+            )
+            return
+        }
         guard canApplySelectedDragonProfile else {
             showDragonAlert(
                 title: "Dragon controls are locked",
@@ -1148,6 +1385,10 @@ final class MainViewController: NSViewController {
     }
 
     @objc private func restoreStockDragon() {
+        guard aircraftCapabilities.supportsBB2DragonLab else {
+            showDragonAlert(title: "Bebop 2 required", message: "Stock Dragon restore is a Bebop 2-only tool.")
+            return
+        }
         guard canAdjustDragon else {
             showDragonAlert(
                 title: "Stock restore is locked",
@@ -1164,6 +1405,13 @@ final class MainViewController: NSViewController {
     }
 
     func installDragonLabOnBebop2() {
+        guard aircraftCapabilities.supportsBB2DragonLab else {
+            showToolAlert(
+                title: "Bebop 2 required",
+                message: "Connect first and wait for Parrot Lab to identify a Bebop 2. Dragon Lab is not compatible with Bebop Drone."
+            )
+            return
+        }
         guard !toolUploadInFlight, !persistentTelnetInstallInFlight else {
             showToolAlert(title: "Upload already running", message: "Wait for the current FTP transfer to finish.")
             return
@@ -1214,6 +1462,13 @@ final class MainViewController: NSViewController {
     }
 
     func enablePersistentTelnetOnBebop2() {
+        guard aircraftCapabilities.supportsBB2PersistentTelnetInstall else {
+            showToolAlert(
+                title: "Bebop 2 required",
+                message: "The persistent Telnet installer is validated only for Bebop 2 firmware."
+            )
+            return
+        }
         guard !toolUploadInFlight, !dragonCommandInFlight,
               !persistentTelnetInstallInFlight, !sc2DriverInstallInFlight else {
             showToolAlert(
@@ -1273,6 +1528,13 @@ final class MainViewController: NSViewController {
     }
 
     func uploadRFModSuiteToBebop2() {
+        guard aircraftCapabilities.supportsValidatedRFMod else {
+            showToolAlert(
+                title: "Bebop 2 required",
+                message: "RF/MOD deployment is disabled because this aircraft is not a detected, validated Bebop 2."
+            )
+            return
+        }
         uploadRFModSuite(
             host: BebopToolPackage.ftpHost,
             targetName: "Bebop 2",
@@ -1281,6 +1543,13 @@ final class MainViewController: NSViewController {
     }
 
     func uploadRFModSuiteToSkyController2() {
+        guard aircraftCapabilities.supportsValidatedRFMod else {
+            showToolAlert(
+                title: "Validated Bebop 2 required",
+                message: "The paired RF/MOD workflow is disabled for Bebop Drone and unknown aircraft."
+            )
+            return
+        }
         let host = hostField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         uploadRFModSuite(
             host: host,
@@ -1290,6 +1559,13 @@ final class MainViewController: NSViewController {
     }
 
     func configureRFPowerMod() {
+        guard aircraftCapabilities.supportsValidatedRFMod else {
+            showToolAlert(
+                title: "Validated Bebop 2 required",
+                message: "The tested RF power profile has not been validated on Bebop Drone."
+            )
+            return
+        }
         guard !toolUploadInFlight, !dragonCommandInFlight,
               !persistentTelnetInstallInFlight, !sc2DriverInstallInFlight,
               !sc2DiscoveryInFlight, !rfPowerOperationInFlight else {
@@ -1404,6 +1680,10 @@ final class MainViewController: NSViewController {
 
     @discardableResult
     func setCalibratedRollingShutterEnabled(_ enabled: Bool) -> Bool {
+        if enabled, !aircraftCapabilities.supportsBB2CameraCalibration {
+            showMediaAlert("Calibrated rolling-shutter correction is available only after a Bebop 2 is detected.")
+            return false
+        }
         calibratedRollingShutterEnabled = enabled
         UserDefaults.standard.set(enabled, forKey: "ParrotLab.Calibrated471RollingShutterV2")
         applyRollingShutterConfiguration()
@@ -1427,16 +1707,60 @@ final class MainViewController: NSViewController {
 
     var isDeveloperVideoDiagnosticsEnabled: Bool { developerVideoDiagnosticsEnabled }
 
+    var currentFlightControlConfiguration: FlightControlConfiguration {
+        flightControlConfiguration
+    }
+
+    var standaloneBebopEnabled: Bool {
+        flightControlConfiguration.standaloneBebopEnabled
+    }
+
+    var detectedAircraftModel: ParrotAircraftModel { aircraftModel }
+    var aircraftCapabilities: ParrotAircraftCapabilities { aircraftModel.capabilities }
+
+    func setFlightControlConfiguration(_ value: FlightControlConfiguration) {
+        let routeChanged = value.standaloneBebopEnabled != flightControlConfiguration.standaloneBebopEnabled
+        if routeChanged, connectButton.title == "Disconnect" {
+            directAircraftDiscovery.stop()
+            stopARSDKTelemetry()
+            telnet.stop()
+        }
+        var sanitized = value
+        sanitized.controllerDeadzone = min(0.45, max(0, value.controllerDeadzone))
+        sanitized.controllerSensitivity = min(1, max(0.25, value.controllerSensitivity))
+        flightControlConfiguration = sanitized
+        flightInputManager.apply(sanitized)
+        if sanitized.standaloneBebopEnabled {
+            hostField.stringValue = "192.168.42.1"
+        } else if let cached = UserDefaults.standard.string(forKey: Self.cachedSC2USBHostPreferenceKey),
+                  Self.isValidIPv4Host(cached) {
+            hostField.stringValue = cached
+        }
+        if routeChanged { setDisconnectedInterface() }
+        updateFlightControlAvailability()
+        updateWindowIdentity()
+        appendLog(sanitized.standaloneBebopEnabled
+            ? "Standalone Bebop mode enabled · automatic BB1/BB2 detection · direct ARSDK target 192.168.42.1"
+            : "SkyController 2 routing restored")
+        updateInterface()
+    }
+
     var currentTemporalReconstructionConfiguration: TemporalReconstructionConfiguration {
         temporalReconstructionConfiguration
     }
 
     func setTemporalReconstructionConfiguration(_ value: TemporalReconstructionConfiguration) {
+        guard !streamRecorder.isActive else {
+            appendLog("Stop the processed recording before changing temporal reconstruction or frame generation")
+            return
+        }
         var sanitized = value
         sanitized.historyWeight = min(0.85, max(0, value.historyWeight))
         sanitized.ghostRejection = min(1, max(0, value.ghostRejection))
         sanitized.consistencyThresholdPixels = min(8, max(0.5, value.consistencyThresholdPixels))
         sanitized.latencyBudgetMilliseconds = min(120, max(15, value.latencyBudgetMilliseconds))
+        sanitized.flowResolutionScale = min(1, max(0.18, value.flowResolutionScale))
+        if !sanitized.usesBidirectionalFlow { sanitized.generatesIntermediateFrames = false }
         temporalReconstructionConfiguration = sanitized
         UserDefaults.standard.set(sanitized.isEnabled, forKey: "ParrotLab.Temporal.Enabled")
         UserDefaults.standard.set(sanitized.historyWeight, forKey: "ParrotLab.Temporal.HistoryWeight")
@@ -1444,14 +1768,18 @@ final class MainViewController: NSViewController {
         UserDefaults.standard.set(sanitized.consistencyThresholdPixels, forKey: "ParrotLab.Temporal.ConsistencyPixels")
         UserDefaults.standard.set(sanitized.latencyBudgetMilliseconds, forKey: "ParrotLab.Temporal.LatencyBudgetMs")
         UserDefaults.standard.set(sanitized.usesBidirectionalFlow, forKey: "ParrotLab.Temporal.Bidirectional")
+        UserDefaults.standard.set(sanitized.flowResolutionScale, forKey: "ParrotLab.Temporal.FlowResolutionScale")
+        UserDefaults.standard.set(sanitized.generatesIntermediateFrames, forKey: "ParrotLab.Temporal.FrameGeneration45")
         applyTemporalReconstructionConfiguration()
         appendLog(sanitized.isEnabled
             ? String(
-                format: "Experimental temporal reconstruction enabled · history %.0f%% · ghost rejection %.0f%% · budget %.0f ms · %@ flow",
+                format: "Experimental temporal reconstruction enabled · history %.0f%% · ghost rejection %.0f%% · budget %.0f ms · %@ flow at %.0f%%%@",
                 sanitized.historyWeight * 100,
                 sanitized.ghostRejection * 100,
                 sanitized.latencyBudgetMilliseconds,
-                sanitized.usesBidirectionalFlow ? "bidirectional" : "single-direction"
+                sanitized.usesBidirectionalFlow ? "bidirectional" : "single-direction",
+                sanitized.flowResolutionScale * 100,
+                sanitized.generatesIntermediateFrames ? " · 45 FPS midpoint generation" : ""
             )
             : "Experimental temporal reconstruction disabled")
         updateInterface()
@@ -1463,7 +1791,7 @@ final class MainViewController: NSViewController {
 
     private func applyRollingShutterConfiguration() {
         hudView.videoView.rollingShutterConfiguration = RollingShutterProcessingConfiguration(
-            isEnabled: calibratedRollingShutterEnabled,
+            isEnabled: calibratedRollingShutterEnabled && aircraftCapabilities.supportsBB2CameraCalibration,
             calibrationProfile: .firmware471GPUFixedRaised,
             quaternionConvention: VideoQuaternionConvention(
                 action: .active,
@@ -2381,7 +2709,8 @@ final class MainViewController: NSViewController {
     }
 
     private var canAdjustDragon: Bool {
-        connectButton.title == "Disconnect" &&
+        aircraftCapabilities.supportsBB2DragonLab &&
+            connectButton.title == "Disconnect" &&
             hasFreshLandedTelemetry &&
             !dragonCommandInFlight &&
             !toolUploadInFlight &&
@@ -2390,7 +2719,8 @@ final class MainViewController: NSViewController {
     }
 
     private var canApplySelectedDragonProfile: Bool {
-        connectButton.title == "Disconnect" &&
+        aircraftCapabilities.supportsBB2DragonLab &&
+            connectButton.title == "Disconnect" &&
             (temporalDragonModeSelected || hasFreshLandedTelemetry) &&
             !dragonCommandInFlight &&
             !toolUploadInFlight &&
@@ -2730,6 +3060,19 @@ final class MainViewController: NSViewController {
             return
         }
 
+        if standaloneBebopEnabled {
+            videoStatus = "\(aircraftModel.shortLabel) DIRECT · UDP \(port) ready"
+            if directVideoPortNegotiated != port {
+                appendLog("Reconnecting direct ARDiscovery to advertise the updated ARStream2 UDP port \(port)")
+                startARSDKTelemetry(host: "192.168.42.1", forceReconnect: true)
+            } else {
+                arsdkClient.sendVideoEnable(true)
+                appendLog("Requested direct Bebop video over the active ARSDK session; UDP \(port) is ready")
+            }
+            updateInterface()
+            return
+        }
+
         let host = hostField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         restreamProbe.probe(host: host) { [weak self] result in
             guard let self else { return }
@@ -2787,6 +3130,11 @@ final class MainViewController: NSViewController {
     }
 
     private func updateInterface() {
+        snapshot.connectionRouteLabel = standaloneBebopEnabled
+            ? "\(aircraftModel.shortLabel) DIRECT"
+            : "SC2 · \(aircraftModel.shortLabel)"
+        hostSectionLabel.stringValue = standaloneBebopEnabled ? "BEBOP HOST" : "SC2 HOST"
+        if standaloneBebopEnabled { hostField.stringValue = "192.168.42.1" }
         updateStatusPillAppearance()
         hudView.update(snapshot: snapshot)
         rfLabel.stringValue = [
@@ -2814,19 +3162,37 @@ final class MainViewController: NSViewController {
         case nil: gpsState = "WAITING"
         }
         navigationLabel.stringValue = [
+            "AIRCRAFT \(aircraftModel.displayName.uppercased())",
+            "FIRMWARE \(aircraftFirmwareSoftware ?? "—")",
             "GPS \(gpsState) · \(snapshot.satelliteCount.map { "\($0) SAT" } ?? "— SAT")",
             "LAT \(snapshot.latitude.map { String(format: "%.6f", $0) } ?? "—")",
             "LON \(snapshot.longitude.map { String(format: "%.6f", $0) } ?? "—")",
             "SPEED \(snapshot.horizontalSpeed.map { String(format: "%.1f m/s", $0) } ?? "—")",
             "HOME \(snapshot.distanceFromHome.map { String(format: "%.0f m", $0) } ?? "—")",
-            arsdkConnected ? "SOURCE ARSDK · SC2" : "SOURCE WAITING"
+            arsdkConnected
+                ? "SOURCE ARSDK · \(standaloneBebopEnabled ? "\(aircraftModel.shortLabel) DIRECT" : "SC2")"
+                : "SOURCE WAITING"
         ].joined(separator: "\n")
 
-        healthLabel.stringValue = [
-            "BATTERY \(number(snapshot.sc2BatteryPercent, "%"))",
-            "CPU \(number(snapshot.sc2TemperatureC, "°C"))",
-            snapshot.sc2PowerState ?? "—"
-        ].joined(separator: "\n")
+        healthLabel.stringValue = standaloneBebopEnabled
+            ? ["STANDALONE \(aircraftModel.shortLabel)", aircraftModel.displayName.uppercased(), "NO SKYCONTROLLER", "HOST 192.168.42.1"].joined(separator: "\n")
+            : [
+                "BATTERY \(number(snapshot.sc2BatteryPercent, "%"))",
+                "CPU \(number(snapshot.sc2TemperatureC, "°C"))",
+                snapshot.sc2PowerState ?? "—"
+            ].joined(separator: "\n")
+
+        let inputModes = [
+            flightControlConfiguration.keyboardEnabled ? "KEYBOARD" : nil,
+            flightControlConfiguration.controllerEnabled ? "GAMEPAD" : nil
+        ].compactMap { $0 }.joined(separator: " + ")
+        flightControlLabel.stringValue = [
+            flightControlsEnabled ? flightControlStatus : "DISABLED IN SETTINGS",
+            "ROUTE \(standaloneBebopEnabled ? "\(aircraftModel.shortLabel) DIRECT" : "THROUGH SC2")",
+            "INPUT \(inputModes.isEmpty ? "OFF" : inputModes)",
+            flightControlConfiguration.keyboardEnabled ? "KEYBOARD MOTION REQUIRES SAFETY HOLD" : nil,
+            "EMERGENCY \(flightControlConfiguration.controllerButtons[.emergency] == .unassigned && flightControlConfiguration.keyboardKeys[.emergency] == UInt16.max ? "UNASSIGNED" : "MAPPED")"
+        ].compactMap { $0 }.joined(separator: "\n")
 
         var videoLines = [
             "MODE \(selectedVideoMode.statusLabel) · ENH \(hudView.videoView.enhancementPreset.statusLabel)",
@@ -2860,11 +3226,18 @@ final class MainViewController: NSViewController {
         let landed = hasFreshLandedTelemetry
         let deviceOperationActive = toolUploadInFlight || dragonCommandInFlight || dronePhotoInFlight ||
             persistentTelnetInstallInFlight || sc2DriverInstallInFlight
-        hostField.isEnabled = !deviceOperationActive
+        hostField.isEnabled = !deviceOperationActive && !standaloneBebopEnabled
         connectButton.isEnabled = !deviceOperationActive
+        if connectButton.title != "Disconnect" {
+            connectButton.title = standaloneBebopEnabled ? "Connect Bebop" : "Connect SC2"
+        }
+        for item in videoModePopup.itemArray {
+            item.isEnabled = item.tag == VideoReceiveMode.compatibility.rawValue ||
+                aircraftCapabilities.supportsBB2DragonLab
+        }
         let profileSelectionEnabled = connected && !dragonCommandInFlight &&
             !toolUploadInFlight && !persistentTelnetInstallInFlight &&
-            !sc2DriverInstallInFlight
+            !sc2DriverInstallInFlight && aircraftCapabilities.supportsBB2DragonLab
         let customSelected = customDragonModeSelected
         let profileApplyEnabled = profileSelectionEnabled && (temporalDragonModeSelected || landed)
         dragonResolutionPopup.isEnabled = profileSelectionEnabled
@@ -2882,13 +3255,19 @@ final class MainViewController: NSViewController {
         recordingButton.isEnabled = videoRunning && (!recordingActive || streamRecorder.isRecording)
         pictureFormatPopup.isEnabled = !pictureWriteInFlight
         pictureButton.isEnabled = videoRunning && hudView.videoView.latestFrameImage() != nil && !pictureWriteInFlight
-        droneFisheyeButton.isEnabled = connected && !dronePhotoInFlight && !deviceOperationActive
+        droneFisheyeButton.isEnabled = connected && aircraftCapabilities.supportsStockFisheyePhoto &&
+            !dronePhotoInFlight && !deviceOperationActive
 
         if dragonCommandInFlight {
             dragonStatusLabel.stringValue = dragonRuntimeStatus
             dragonStatusLabel.textColor = .systemYellow
+        } else if !aircraftCapabilities.supportsBB2DragonLab {
+            dragonStatusLabel.stringValue = aircraftModel == .unknown
+                ? "DETECTING AIRCRAFT"
+                : "\(aircraftModel.shortLabel) · STOCK FEATURES ONLY"
+            dragonStatusLabel.textColor = LabVisualStyle.mutedText
         } else if !connected {
-            dragonStatusLabel.stringValue = "SC2 OFFLINE"
+            dragonStatusLabel.stringValue = standaloneBebopEnabled ? "BB2 OFFLINE" : "SC2 OFFLINE"
             dragonStatusLabel.textColor = LabVisualStyle.mutedText
         } else if !landed && temporalDragonModeSelected {
             dragonStatusLabel.stringValue = "TEMPORAL READY · NO FLIGHT INTERLOCK"
@@ -2963,13 +3342,18 @@ final class MainViewController: NSViewController {
         }
         let started = Date()
         do {
-            let temporaryURL = try streamRecorder.start(directory: mediaDirectoryURL, at: started)
+            let temporaryURL = try streamRecorder.start(
+                directory: mediaDirectoryURL,
+                at: started,
+                aircraftToken: aircraftModel.mediaFilenameToken
+            )
             if rawH264ArchiveEnabled {
                 do {
                     let rawURL = try rawArchiveRecorder.start(
                         directory: mediaDirectoryURL,
                         at: started,
-                        rawArchive: true
+                        rawArchive: true,
+                        aircraftToken: aircraftModel.mediaFilenameToken
                     )
                     appendLog("Untouched diagnostic H.264 archive started: \(rawURL.path)")
                 } catch {
@@ -3141,7 +3525,11 @@ final class MainViewController: NSViewController {
             showMediaAlert("Could not create the media directory: \(error.localizedDescription)")
             return
         }
-        let url = MediaFileNamer.pictureURL(directory: mediaDirectoryURL, format: format)
+        let url = MediaFileNamer.pictureURL(
+            directory: mediaDirectoryURL,
+            format: format,
+            aircraftToken: aircraftModel.mediaFilenameToken
+        )
         pictureWriteInFlight = true
         pictureButton.title = "Saving…"
         updateInterface()
@@ -3246,6 +3634,7 @@ final class MainViewController: NSViewController {
     }
 
     func prepareForTermination() {
+        directAircraftDiscovery.stop()
         mp4Converter.cancel()
         toolInstaller.cancel()
         sc2USBDiscovery.cancel()

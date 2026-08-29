@@ -6,6 +6,7 @@ import simd
 
 struct TemporalReconstructionRenderResult {
     let usedHistory: Bool
+    let generatedIntermediateFrame: Bool
     let totalLatencyMilliseconds: Double
     let flowLatencyMilliseconds: Double
     let status: String
@@ -19,6 +20,10 @@ struct TemporalReconstructionRenderResult {
 /// prediction. The resolve shader rejects history using photometric residuals
 /// and, in quality mode, forward/backward flow consistency.
 final class TemporalReconstructionRenderer {
+    private struct FlowPoolKey: Hashable {
+        let width: Int
+        let height: Int
+    }
     private struct AlignmentUniforms {
         var previousQuaternion: SIMD4<Float>
         var currentQuaternion: SIMD4<Float>
@@ -58,6 +63,17 @@ final class TemporalReconstructionRenderer {
         float consistencyThresholdPixels;
         uint useBidirectionalFlow;
     };
+
+    kernel void downscaleTemporalFlowInput(
+        texture2d<float, access::sample> source [[texture(0)]],
+        texture2d<float, access::write> destination [[texture(1)]],
+        uint2 gid [[thread_position_in_grid]]) {
+        uint2 outputSize(destination.get_width(), destination.get_height());
+        if (any(gid >= outputSize)) return;
+        constexpr sampler linearSampler(coord::normalized, address::clamp_to_edge, filter::linear);
+        float2 uv = (float2(gid) + 0.5f) / float2(outputSize);
+        destination.write(source.sample(linearSampler, uv), gid);
+    }
 
     float4 normalizedQuaternion(float4 value) {
         float lengthSquared = dot(value, value);
@@ -187,27 +203,96 @@ final class TemporalReconstructionRenderer {
         float historyWeight = clamp(uniforms.historyWeight * confidence, 0.0f, 0.92f);
         destination.write(mix(current, previousHistory, historyWeight), gid);
     }
+
+    kernel void interpolateTemporalMidpoint(
+        texture2d<float, access::sample> currentHistory [[texture(0)]],
+        texture2d<float, access::sample> alignedPreviousHistory [[texture(1)]],
+        texture2d<float, access::sample> backwardFlow [[texture(2)]],
+        texture2d<float, access::sample> forwardFlow [[texture(3)]],
+        texture2d<float, access::write> destination [[texture(4)]],
+        constant ResolveUniforms& uniforms [[buffer(0)]],
+        uint2 gid [[thread_position_in_grid]]) {
+        if (any(gid >= uniforms.dimensions)) return;
+        constexpr sampler linearSampler(coord::normalized, address::clamp_to_edge, filter::linear);
+        float2 dimensions = float2(uniforms.dimensions);
+        float2 flowDimensions = max(float2(uniforms.flowDimensions), float2(1.0f));
+        float2 uv = (float2(gid) + 0.5f) / dimensions;
+        float2 flowScale = dimensions / flowDimensions;
+        float2 backward = backwardFlow.sample(linearSampler, uv).xy * flowScale;
+        float2 forward = forwardFlow.sample(linearSampler, uv).xy * flowScale;
+
+        // The backward field is current -> previous and the forward field is
+        // previous -> current. Sample each endpoint halfway along its motion.
+        float2 currentPixel = float2(gid) - backward * 0.5f;
+        float2 previousPixel = float2(gid) - forward * 0.5f;
+        bool valid = all(currentPixel >= float2(0.0f)) &&
+            all(previousPixel >= float2(0.0f)) &&
+            all(currentPixel < dimensions - 1.0f) &&
+            all(previousPixel < dimensions - 1.0f);
+        float4 fallback = currentHistory.sample(linearSampler, uv);
+        if (!valid) {
+            destination.write(fallback, gid);
+            return;
+        }
+
+        float4 current = currentHistory.sample(linearSampler, (currentPixel + 0.5f) / dimensions);
+        float4 previous = alignedPreviousHistory.sample(linearSampler, (previousPixel + 0.5f) / dimensions);
+        float threshold = max(0.5f, uniforms.consistencyThresholdPixels);
+        float consistency = 1.0f - smoothstep(threshold * 0.5f, threshold, length(backward + forward));
+        float residual = abs(luma(current.rgb) - luma(previous.rgb));
+        float photometric = 1.0f - smoothstep(0.035f, 0.16f, residual);
+        float confidence = clamp(consistency * photometric, 0.0f, 1.0f);
+        destination.write(mix(fallback, mix(previous, current, 0.5f), confidence), gid);
+    }
     """#
 
     private let device: any MTLDevice
     private let commandQueue: any MTLCommandQueue
     private let alignmentPipeline: any MTLComputePipelineState
+    private let downscalePipeline: any MTLComputePipelineState
     private let resolvePipeline: any MTLComputePipelineState
+    private let interpolationPipeline: any MTLComputePipelineState
     private var textureCache: CVMetalTextureCache?
+    private var flowInputPools: [FlowPoolKey: CVPixelBufferPool] = [:]
+    private var adaptiveFlowScale = 0.25
+    private var flowScaleCeiling = 0.375
+    private let flowQueue = DispatchQueue(
+        label: "parrotlab.temporal-flow",
+        qos: .userInteractive,
+        attributes: .concurrent
+    )
+
+    private final class FlowResultBox {
+        private let lock = NSLock()
+        private var stored: Result<CVPixelBuffer, Error>?
+        func set(_ value: Result<CVPixelBuffer, Error>) {
+            lock.lock(); stored = value; lock.unlock()
+        }
+        func get() -> Result<CVPixelBuffer, Error>? {
+            lock.lock(); defer { lock.unlock() }
+            return stored
+        }
+    }
 
     init?(device: any MTLDevice) {
         guard let commandQueue = device.makeCommandQueue(),
               let library = try? device.makeLibrary(source: Self.shaderSource, options: nil),
               let alignmentFunction = library.makeFunction(name: "alignTemporalHistory"),
+              let downscaleFunction = library.makeFunction(name: "downscaleTemporalFlowInput"),
               let resolveFunction = library.makeFunction(name: "resolveTemporalHistory"),
+              let interpolationFunction = library.makeFunction(name: "interpolateTemporalMidpoint"),
               let alignmentPipeline = try? device.makeComputePipelineState(function: alignmentFunction),
-              let resolvePipeline = try? device.makeComputePipelineState(function: resolveFunction) else {
+              let downscalePipeline = try? device.makeComputePipelineState(function: downscaleFunction),
+              let resolvePipeline = try? device.makeComputePipelineState(function: resolveFunction),
+              let interpolationPipeline = try? device.makeComputePipelineState(function: interpolationFunction) else {
             return nil
         }
         self.device = device
         self.commandQueue = commandQueue
         self.alignmentPipeline = alignmentPipeline
+        self.downscalePipeline = downscalePipeline
         self.resolvePipeline = resolvePipeline
+        self.interpolationPipeline = interpolationPipeline
         var cache: CVMetalTextureCache?
         guard CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &cache) == kCVReturnSuccess else {
             return nil
@@ -222,6 +307,7 @@ final class TemporalReconstructionRenderer {
         alignedSource: CVPixelBuffer,
         alignedHistory: CVPixelBuffer,
         destination: CVPixelBuffer,
+        intermediateDestination: CVPixelBuffer?,
         previousMotion: VerifiedVideoFrameMotion?,
         currentMotion: VerifiedVideoFrameMotion?,
         configuration: TemporalReconstructionConfiguration
@@ -245,27 +331,38 @@ final class TemporalReconstructionRenderer {
             return result(started, flow: 0, used: false, status: "TEMPORAL BYPASS · IMU ALIGNMENT FAILED")
         }
 
+        let sourceWidth = CVPixelBufferGetWidth(currentSource)
+        let sourceHeight = CVPixelBufferGetHeight(currentSource)
+        if abs(flowScaleCeiling - configuration.flowResolutionScale) > 0.001 {
+            flowScaleCeiling = configuration.flowResolutionScale
+            adaptiveFlowScale = min(flowScaleCeiling, 0.25)
+        }
+        let effectiveFlowScale = min(configuration.flowResolutionScale, adaptiveFlowScale)
+        let flowWidth = Self.flowDimension(sourceWidth, scale: effectiveFlowScale)
+        let flowHeight = Self.flowDimension(sourceHeight, scale: effectiveFlowScale)
+        guard let flowCurrent = makeBGRAFlowInput(width: flowWidth, height: flowHeight),
+              let flowPrevious = makeBGRAFlowInput(width: flowWidth, height: flowHeight),
+              downscale(currentSource, to: flowCurrent, and: alignedSource, to: flowPrevious) else {
+            return result(started, flow: 0, used: false, status: "TEMPORAL BYPASS · FLOW INPUT FAILED")
+        }
+
         let flowStarted = CFAbsoluteTimeGetCurrent()
-        let backward: CVPixelBuffer
+        let flows: (backward: CVPixelBuffer, forward: CVPixelBuffer)
+        let needsForwardFlow = configuration.usesBidirectionalFlow &&
+            (!configuration.generatesIntermediateFrames || intermediateDestination != nil)
         do {
-            // Handler=current, target=aligned previous produces a current to
-            // previous field. Vision vectors are expressed in flow pixels.
-            backward = try opticalFlow(from: currentSource, to: alignedSource)
+            flows = try opticalFlowPair(
+                current: flowCurrent,
+                previous: flowPrevious,
+                bidirectional: needsForwardFlow
+            )
         } catch {
             return result(started, flow: 0, used: false, status: "TEMPORAL BYPASS · FLOW FAILED")
         }
-
-        let forward: CVPixelBuffer
-        if configuration.usesBidirectionalFlow {
-            do {
-                forward = try opticalFlow(from: alignedSource, to: currentSource)
-            } catch {
-                return result(started, flow: 0, used: false, status: "TEMPORAL BYPASS · REVERSE FLOW FAILED")
-            }
-        } else {
-            forward = backward
-        }
+        let backward = flows.backward
+        let forward = flows.forward
         let flowLatency = (CFAbsoluteTimeGetCurrent() - flowStarted) * 1_000
+        tuneFlowResolution(measuredLatencyMilliseconds: flowLatency)
 
         guard flowLatency <= configuration.latencyBudgetMilliseconds else {
             return result(
@@ -283,20 +380,40 @@ final class TemporalReconstructionRenderer {
             backwardFlow: backward,
             forwardFlow: forward,
             destination: destination,
-            configuration: configuration
+            configuration: configuration,
+            usesBidirectionalFlow: needsForwardFlow
         ) else {
             return result(started, flow: flowLatency, used: false, status: "TEMPORAL BYPASS · GPU RESOLVE FAILED")
+        }
+        let generatedIntermediate: Bool
+        if configuration.generatesIntermediateFrames,
+           configuration.usesBidirectionalFlow,
+           let intermediateDestination {
+            generatedIntermediate = interpolateMidpoint(
+                currentHistory: destination,
+                alignedHistory: alignedHistory,
+                backwardFlow: backward,
+                forwardFlow: forward,
+                destination: intermediateDestination,
+                configuration: configuration
+            )
+        } else {
+            generatedIntermediate = false
         }
         return result(
             started,
             flow: flowLatency,
             used: true,
             status: String(
-                format: "TEMPORAL ACTIVE · %@ · %@ FLOW %.1f ms",
+                format: "TEMPORAL ACTIVE · %@ · %@ %dx%d FLOW %.1f ms%@",
                 previousMotion != nil && currentMotion != nil ? "IMU ALIGNED" : "FLOW ONLY",
-                configuration.usesBidirectionalFlow ? "BIDIRECTIONAL" : "SINGLE",
-                flowLatency
-            )
+                needsForwardFlow ? "BIDIRECTIONAL" : "FORWARD-SPARING",
+                flowWidth,
+                flowHeight,
+                flowLatency,
+                configuration.generatesIntermediateFrames ? " · FRAME GEN 45" : ""
+            ),
+            generated: generatedIntermediate
         )
     }
 
@@ -352,7 +469,8 @@ final class TemporalReconstructionRenderer {
         backwardFlow: CVPixelBuffer,
         forwardFlow: CVPixelBuffer,
         destination: CVPixelBuffer,
-        configuration: TemporalReconstructionConfiguration
+        configuration: TemporalReconstructionConfiguration,
+        usesBidirectionalFlow: Bool
     ) -> Bool {
         let width = CVPixelBufferGetWidth(currentSource)
         let height = CVPixelBufferGetHeight(currentSource)
@@ -373,7 +491,7 @@ final class TemporalReconstructionRenderer {
             historyWeight: Float(configuration.historyWeight),
             ghostRejection: Float(configuration.ghostRejection),
             consistencyThresholdPixels: Float(configuration.consistencyThresholdPixels),
-            useBidirectionalFlow: configuration.usesBidirectionalFlow ? 1 : 0
+            useBidirectionalFlow: usesBidirectionalFlow ? 1 : 0
         )
         encoder.setComputePipelineState(resolvePipeline)
         encoder.setTexture(currentTexture, index: 0)
@@ -388,6 +506,151 @@ final class TemporalReconstructionRenderer {
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
         return commandBuffer.status == .completed
+    }
+
+    private func downscale(
+        _ firstSource: CVPixelBuffer,
+        to firstDestination: CVPixelBuffer,
+        and secondSource: CVPixelBuffer,
+        to secondDestination: CVPixelBuffer
+    ) -> Bool {
+        guard let firstSourceTexture = bgraTexture(firstSource),
+              let firstDestinationTexture = bgraTexture(firstDestination),
+              let secondSourceTexture = bgraTexture(secondSource),
+              let secondDestinationTexture = bgraTexture(secondDestination),
+              let commandBuffer = commandQueue.makeCommandBuffer() else { return false }
+        for (source, destination) in [
+            (firstSourceTexture, firstDestinationTexture),
+            (secondSourceTexture, secondDestinationTexture)
+        ] {
+            guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return false }
+            encoder.setComputePipelineState(downscalePipeline)
+            encoder.setTexture(source, index: 0)
+            encoder.setTexture(destination, index: 1)
+            dispatch(
+                encoder,
+                pipeline: downscalePipeline,
+                width: destination.width,
+                height: destination.height
+            )
+            encoder.endEncoding()
+        }
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        return commandBuffer.status == .completed
+    }
+
+    private func interpolateMidpoint(
+        currentHistory: CVPixelBuffer,
+        alignedHistory: CVPixelBuffer,
+        backwardFlow: CVPixelBuffer,
+        forwardFlow: CVPixelBuffer,
+        destination: CVPixelBuffer,
+        configuration: TemporalReconstructionConfiguration
+    ) -> Bool {
+        let width = CVPixelBufferGetWidth(currentHistory)
+        let height = CVPixelBufferGetHeight(currentHistory)
+        let flowWidth = CVPixelBufferGetWidth(backwardFlow)
+        let flowHeight = CVPixelBufferGetHeight(backwardFlow)
+        guard let currentTexture = bgraTexture(currentHistory),
+              let historyTexture = bgraTexture(alignedHistory),
+              let backwardTexture = flowTexture(backwardFlow),
+              let forwardTexture = flowTexture(forwardFlow),
+              let destinationTexture = bgraTexture(destination),
+              let commandBuffer = commandQueue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else { return false }
+        var uniforms = ResolveUniforms(
+            dimensions: SIMD2<UInt32>(UInt32(width), UInt32(height)),
+            flowDimensions: SIMD2<UInt32>(UInt32(flowWidth), UInt32(flowHeight)),
+            historyWeight: Float(configuration.historyWeight),
+            ghostRejection: Float(configuration.ghostRejection),
+            consistencyThresholdPixels: Float(configuration.consistencyThresholdPixels),
+            useBidirectionalFlow: 1
+        )
+        encoder.setComputePipelineState(interpolationPipeline)
+        encoder.setTexture(currentTexture, index: 0)
+        encoder.setTexture(historyTexture, index: 1)
+        encoder.setTexture(backwardTexture, index: 2)
+        encoder.setTexture(forwardTexture, index: 3)
+        encoder.setTexture(destinationTexture, index: 4)
+        encoder.setBytes(&uniforms, length: MemoryLayout<ResolveUniforms>.stride, index: 0)
+        dispatch(encoder, pipeline: interpolationPipeline, width: width, height: height)
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        return commandBuffer.status == .completed
+    }
+
+    private func opticalFlowPair(
+        current: CVPixelBuffer,
+        previous: CVPixelBuffer,
+        bidirectional: Bool
+    ) throws -> (backward: CVPixelBuffer, forward: CVPixelBuffer) {
+        guard bidirectional else {
+            let backward = try opticalFlow(from: current, to: previous)
+            return (backward, backward)
+        }
+        let backwardBox = FlowResultBox()
+        let forwardBox = FlowResultBox()
+        let group = DispatchGroup()
+        group.enter()
+        flowQueue.async { [weak self] in
+            defer { group.leave() }
+            guard let self else { return }
+            backwardBox.set(Result { try self.opticalFlow(from: current, to: previous) })
+        }
+        group.enter()
+        flowQueue.async { [weak self] in
+            defer { group.leave() }
+            guard let self else { return }
+            forwardBox.set(Result { try self.opticalFlow(from: previous, to: current) })
+        }
+        group.wait()
+        guard let backwardResult = backwardBox.get(),
+              let forwardResult = forwardBox.get() else {
+            throw NSError(domain: "ParrotLab.TemporalFlow", code: 2)
+        }
+        return (try backwardResult.get(), try forwardResult.get())
+    }
+
+    private func makeBGRAFlowInput(width: Int, height: Int) -> CVPixelBuffer? {
+        let key = FlowPoolKey(width: width, height: height)
+        let pool: CVPixelBufferPool
+        if let cached = flowInputPools[key] {
+            pool = cached
+        } else {
+            flowInputPools.removeAll(keepingCapacity: false)
+            let poolAttributes: [CFString: Any] = [
+                kCVPixelBufferPoolMinimumBufferCountKey: 4
+            ]
+            let pixelAttributes: [CFString: Any] = [
+                kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferWidthKey: width,
+                kCVPixelBufferHeightKey: height,
+                kCVPixelBufferIOSurfacePropertiesKey: [:],
+                kCVPixelBufferMetalCompatibilityKey: true
+            ]
+            var created: CVPixelBufferPool?
+            guard CVPixelBufferPoolCreate(
+                kCFAllocatorDefault,
+                poolAttributes as CFDictionary,
+                pixelAttributes as CFDictionary,
+                &created
+            ) == kCVReturnSuccess, let created else { return nil }
+            flowInputPools[key] = created
+            pool = created
+        }
+        let auxiliary: [CFString: Any] = [
+            kCVPixelBufferPoolAllocationThresholdKey: 6
+        ]
+        var buffer: CVPixelBuffer?
+        guard CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(
+            kCFAllocatorDefault,
+            pool,
+            auxiliary as CFDictionary,
+            &buffer
+        ) == kCVReturnSuccess else { return nil }
+        return buffer
     }
 
     private func opticalFlow(from source: CVPixelBuffer, to target: CVPixelBuffer) throws -> CVPixelBuffer {
@@ -456,10 +719,12 @@ final class TemporalReconstructionRenderer {
         _ started: CFAbsoluteTime,
         flow: Double,
         used: Bool,
-        status: String
+        status: String,
+        generated: Bool = false
     ) -> TemporalReconstructionRenderResult {
         TemporalReconstructionRenderResult(
             usedHistory: used,
+            generatedIntermediateFrame: generated,
             totalLatencyMilliseconds: (CFAbsoluteTimeGetCurrent() - started) * 1_000,
             flowLatencyMilliseconds: flow,
             status: status
@@ -469,6 +734,23 @@ final class TemporalReconstructionRenderer {
     private static func vector(_ quaternion: VideoMetadataQuaternion?) -> SIMD4<Float> {
         let value = quaternion?.normalized ?? VideoMetadataQuaternion(w: 1, x: 0, y: 0, z: 0)
         return SIMD4<Float>(Float(value.w), Float(value.x), Float(value.y), Float(value.z))
+    }
+
+    private static func flowDimension(_ source: Int, scale: Double) -> Int {
+        let scaled = Int((Double(source) * min(1, max(0.18, scale))).rounded())
+        return max(32, min(source, scaled) & ~1)
+    }
+
+    private func tuneFlowResolution(measuredLatencyMilliseconds: Double) {
+        // Reserve roughly half of a 30 fps frame budget for the rest of the
+        // processing chain. Move down quickly after a miss and recover quality
+        // slowly when the machine has sustained headroom.
+        if measuredLatencyMilliseconds > 18 {
+            let ratio = sqrt(16 / max(18, measuredLatencyMilliseconds))
+            adaptiveFlowScale = max(0.18, adaptiveFlowScale * ratio)
+        } else if measuredLatencyMilliseconds < 11 {
+            adaptiveFlowScale = min(flowScaleCeiling, adaptiveFlowScale + 0.01)
+        }
     }
 
     static func selfTest() -> Bool {
@@ -493,6 +775,7 @@ final class TemporalReconstructionRenderer {
             alignedSource: alignedSource,
             alignedHistory: alignedHistory,
             destination: destination,
+            intermediateDestination: nil,
             previousMotion: nil,
             currentMotion: nil,
             configuration: configuration
@@ -505,7 +788,25 @@ final class TemporalReconstructionRenderer {
         }
         let stride = CVPixelBufferGetBytesPerRow(destination)
         let value = bytes[27 * stride + 48 * 4]
-        return (118...142).contains(value)
+        guard (118...142).contains(value),
+              let bidirectionalDestination = makeTestBuffer(width: 96, height: 54, value: 0),
+              let intermediate = makeTestBuffer(width: 96, height: 54, value: 0) else { return false }
+        configuration.usesBidirectionalFlow = true
+        configuration.generatesIntermediateFrames = true
+        configuration.flowResolutionScale = 0.5
+        let generated = renderer.reconstruct(
+            currentSource: current,
+            previousSource: previousSource,
+            previousHistory: previousHistory,
+            alignedSource: alignedSource,
+            alignedHistory: alignedHistory,
+            destination: bidirectionalDestination,
+            intermediateDestination: intermediate,
+            previousMotion: nil,
+            currentMotion: nil,
+            configuration: configuration
+        )
+        return generated.usedHistory && generated.generatedIntermediateFrame
     }
 
     private static func makeTestBuffer(width: Int, height: Int, value: UInt8) -> CVPixelBuffer? {

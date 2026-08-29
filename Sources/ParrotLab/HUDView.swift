@@ -74,7 +74,7 @@ final class HUDOverlayView: NSView {
         let color: NSColor = snapshot.connectionLabel.contains("Live") ? .systemGreen : .systemOrange
         drawPill(snapshot.connectionLabel.uppercased(), at: CGPoint(x: 18, y: bounds.height - 36), color: color)
         drawText(
-            "PARROT LAB  •  SC2 DIRECT",
+            "PARROT LAB  •  \(snapshot.connectionRouteLabel)",
             at: CGPoint(x: bounds.width - 230, y: bounds.height - 31),
             font: .monospacedSystemFont(ofSize: 11, weight: .semibold),
             color: NSColor.white.withAlphaComponent(0.72)

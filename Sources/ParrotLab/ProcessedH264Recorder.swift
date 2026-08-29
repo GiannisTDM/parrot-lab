@@ -43,7 +43,8 @@ final class ProcessedH264Recorder {
     private let maximumEncoderFramesInFlight = 3
     private let maximumPendingDiskBytes = 16 * 1_024 * 1_024
     private var state = State.idle
-    private var pendingFrame: ProcessedVideoFrame?
+    private let maximumPendingEncoderFrames = 6
+    private var pendingFrames: [ProcessedVideoFrame] = []
     private var encoderDrainScheduled = false
     private var encoderFinishScheduled = false
     private var encoderFinished = false
@@ -75,6 +76,7 @@ final class ProcessedH264Recorder {
     private var lastStatsEmission = Date.distantPast
     private var statsWindowStarted = Date()
     private var encodedFramesInStatsWindow = 0
+    private var aircraftToken = "BB2"
 
     var isRecording: Bool {
         stateLock.lock()
@@ -89,9 +91,17 @@ final class ProcessedH264Recorder {
     }
 
     @discardableResult
-    func start(directory: URL, at date: Date = Date()) throws -> URL {
+    func start(
+        directory: URL,
+        at date: Date = Date(),
+        aircraftToken: String = "BB2"
+    ) throws -> URL {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let temporaryURL = MediaFileNamer.temporaryVideoURL(directory: directory, date: date)
+        let temporaryURL = MediaFileNamer.temporaryVideoURL(
+            directory: directory,
+            date: date,
+            aircraftToken: aircraftToken
+        )
         guard FileManager.default.createFile(atPath: temporaryURL.path, contents: nil) else {
             throw processedRecordingError("Could not create \(temporaryURL.lastPathComponent)")
         }
@@ -111,7 +121,7 @@ final class ProcessedH264Recorder {
             throw processedRecordingError("A recording is already active")
         }
         state = .recording
-        pendingFrame = nil
+        pendingFrames.removeAll(keepingCapacity: true)
         encoderDrainScheduled = false
         encoderFinishScheduled = false
         encoderFinished = false
@@ -143,6 +153,7 @@ final class ProcessedH264Recorder {
         lastStatsEmission = .distantPast
         statsWindowStarted = date
         encodedFramesInStatsWindow = 0
+        self.aircraftToken = aircraftToken
         stateLock.unlock()
         return temporaryURL
     }
@@ -153,8 +164,11 @@ final class ProcessedH264Recorder {
             stateLock.unlock()
             return
         }
-        if pendingFrame != nil { droppedBeforeEncoder += 1 }
-        pendingFrame = frame
+        if pendingFrames.count >= maximumPendingEncoderFrames {
+            pendingFrames.removeFirst()
+            droppedBeforeEncoder += 1
+        }
+        pendingFrames.append(frame)
         let shouldSchedule = !encoderDrainScheduled
         if shouldSchedule { encoderDrainScheduled = true }
         stateLock.unlock()
@@ -171,7 +185,7 @@ final class ProcessedH264Recorder {
         }
         state = .finishing
         endedAt = Date()
-        pendingFrame = nil
+        pendingFrames.removeAll(keepingCapacity: true)
         scheduleEncoderFinishLocked()
         stateLock.unlock()
     }
@@ -187,12 +201,12 @@ final class ProcessedH264Recorder {
             stateLock.lock()
             guard state == .recording,
                   framesInFlight < maximumEncoderFramesInFlight,
-                  let frame = pendingFrame else {
+                  !pendingFrames.isEmpty else {
                 encoderDrainScheduled = false
                 stateLock.unlock()
                 return
             }
-            pendingFrame = nil
+            let frame = pendingFrames.removeFirst()
             stateLock.unlock()
 
             guard ensureCompressionSession(for: frame) else {
@@ -248,6 +262,7 @@ final class ProcessedH264Recorder {
         if compressionSession != nil { return true }
         let width = frame.width
         let height = frame.height
+        targetFPS = frame.targetFrameRate
         let bitrate = Self.qualityPriorityBitrate(width: width, height: height, fps: targetFPS)
         let specification: [CFString: Any] = [
             kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: true
@@ -324,7 +339,7 @@ final class ProcessedH264Recorder {
         if infoFlags.contains(.frameDropped) {
             stateLock.lock()
             droppedByEncoder += 1
-            let shouldResumeEncoder = state == .recording && pendingFrame != nil && !encoderDrainScheduled
+            let shouldResumeEncoder = state == .recording && !pendingFrames.isEmpty && !encoderDrainScheduled
             if shouldResumeEncoder { encoderDrainScheduled = true }
             emitStatsLockedIfNeeded(force: true)
             stateLock.unlock()
@@ -354,7 +369,7 @@ final class ProcessedH264Recorder {
         encodedFrames += 1
         encodedFramesInStatsWindow += 1
         scheduleIODrainLocked()
-        let shouldResumeEncoder = state == .recording && pendingFrame != nil && !encoderDrainScheduled
+        let shouldResumeEncoder = state == .recording && !pendingFrames.isEmpty && !encoderDrainScheduled
         if shouldResumeEncoder { encoderDrainScheduled = true }
         emitStatsLockedIfNeeded()
         stateLock.unlock()
@@ -370,7 +385,7 @@ final class ProcessedH264Recorder {
         if state == .recording {
             state = .finishing
             endedAt = Date()
-            pendingFrame = nil
+            pendingFrames.removeAll(keepingCapacity: true)
         }
         scheduleEncoderFinishLocked()
         stateLock.unlock()
@@ -467,6 +482,7 @@ final class ProcessedH264Recorder {
         let sourceDuration: TimeInterval?
         let bytesWritten: UInt64
         let encodedFrames: UInt64
+        let aircraftToken: String
         var errorDescription: String?
     }
 
@@ -491,6 +507,7 @@ final class ProcessedH264Recorder {
             sourceDuration: sourceDuration,
             bytesWritten: bytesWritten,
             encodedFrames: encodedFrames,
+            aircraftToken: aircraftToken,
             errorDescription: finishError
         )
         handle = nil
@@ -505,12 +522,13 @@ final class ProcessedH264Recorder {
         pendingChunks.removeAll(keepingCapacity: false)
         pendingChunkHead = 0
         pendingDiskBytes = 0
-        pendingFrame = nil
+        pendingFrames.removeAll(keepingCapacity: false)
         state = .idle
         ioDrainScheduled = false
         encoderDrainScheduled = false
         encoderFinishScheduled = false
         encoderFinished = false
+        aircraftToken = "BB2"
         return result
     }
 
@@ -529,13 +547,15 @@ final class ProcessedH264Recorder {
         }
         var resultURL = state.temporary ?? MediaFileNamer.temporaryVideoURL(
             directory: state.directory ?? MediaFileNamer.defaultDirectory,
-            date: state.startedAt
+            date: state.startedAt,
+            aircraftToken: state.aircraftToken
         )
         if let directory = state.directory, let temporary = state.temporary {
             let completed = MediaFileNamer.completedVideoURL(
                 directory: directory,
                 date: state.startedAt,
-                duration: duration
+                duration: duration,
+                aircraftToken: state.aircraftToken
             )
             do {
                 try FileManager.default.moveItem(at: temporary, to: completed)

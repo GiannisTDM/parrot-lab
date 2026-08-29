@@ -39,11 +39,12 @@ enum MediaFileNamer {
         directory: URL,
         date: Date = Date(),
         format: PictureFileFormat,
+        aircraftToken: String = "BB2",
         timeZone: TimeZone = .current
     ) -> URL {
         uniqueURL(
             directory.appendingPathComponent(
-                "PictureBB2-\(dateStamp(date, timeZone: timeZone)).\(format.fileExtension)"
+                "Picture\(safeAircraftToken(aircraftToken))-\(dateStamp(date, timeZone: timeZone)).\(format.fileExtension)"
             )
         )
     }
@@ -51,10 +52,11 @@ enum MediaFileNamer {
     static func temporaryVideoURL(
         directory: URL,
         date: Date = Date(),
+        aircraftToken: String = "BB2",
         timeZone: TimeZone = .current
     ) -> URL {
         uniqueURL(directory.appendingPathComponent(
-            "VideoBB2-\(dateStamp(date, timeZone: timeZone))-recording.h264"
+            "Video\(safeAircraftToken(aircraftToken))-\(dateStamp(date, timeZone: timeZone))-recording.h264"
         ))
     }
 
@@ -62,20 +64,22 @@ enum MediaFileNamer {
         directory: URL,
         date: Date,
         duration: TimeInterval,
+        aircraftToken: String = "BB2",
         timeZone: TimeZone = .current
     ) -> URL {
         uniqueURL(directory.appendingPathComponent(
-            "VideoBB2-\(dateStamp(date, timeZone: timeZone))-\(durationStamp(duration)).h264"
+            "Video\(safeAircraftToken(aircraftToken))-\(dateStamp(date, timeZone: timeZone))-\(durationStamp(duration)).h264"
         ))
     }
 
     static func temporaryRawArchiveURL(
         directory: URL,
         date: Date = Date(),
+        aircraftToken: String = "BB2",
         timeZone: TimeZone = .current
     ) -> URL {
         uniqueURL(directory.appendingPathComponent(
-            "RawVideoBB2-\(dateStamp(date, timeZone: timeZone))-recording.h264"
+            "RawVideo\(safeAircraftToken(aircraftToken))-\(dateStamp(date, timeZone: timeZone))-recording.h264"
         ))
     }
 
@@ -83,10 +87,11 @@ enum MediaFileNamer {
         directory: URL,
         date: Date,
         duration: TimeInterval,
+        aircraftToken: String = "BB2",
         timeZone: TimeZone = .current
     ) -> URL {
         uniqueURL(directory.appendingPathComponent(
-            "RawVideoBB2-\(dateStamp(date, timeZone: timeZone))-\(durationStamp(duration)).h264"
+            "RawVideo\(safeAircraftToken(aircraftToken))-\(dateStamp(date, timeZone: timeZone))-\(durationStamp(duration)).h264"
         ))
     }
 
@@ -104,8 +109,20 @@ enum MediaFileNamer {
         let date = Date(timeIntervalSince1970: 1_700_000_000)
         guard dateStamp(date, timeZone: TimeZone(secondsFromGMT: 0)!) == "2023-11-14_22-13-20",
               durationStamp(65) == "01m05s",
-              durationStamp(3_723) == "01h02m03s" else { return false }
+              durationStamp(3_723) == "01h02m03s",
+              pictureURL(
+                directory: URL(fileURLWithPath: "/tmp"),
+                date: date,
+                format: .jpeg,
+                aircraftToken: "BB1",
+                timeZone: TimeZone(secondsFromGMT: 0)!
+              ).lastPathComponent.hasPrefix("PictureBB1-") else { return false }
         return true
+    }
+
+    private static func safeAircraftToken(_ value: String) -> String {
+        let safe = value.uppercased().filter { $0.isLetter || $0.isNumber }
+        return safe.isEmpty ? "BEBOP" : safe
     }
 
     private static func dateStamp(_ date: Date, timeZone: TimeZone) -> String {
@@ -217,6 +234,7 @@ final class H264StreamRecorder {
     private var cachedSPS: Data?
     private var cachedPPS: Data?
     private var rawArchiveNaming = false
+    private var aircraftToken = "BB2"
 
     var isRecording: Bool {
         stateLock.lock()
@@ -234,12 +252,17 @@ final class H264StreamRecorder {
     func start(
         directory: URL,
         at date: Date = Date(),
-        rawArchive: Bool = false
+        rawArchive: Bool = false,
+        aircraftToken: String = "BB2"
     ) throws -> URL {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let temporaryURL = rawArchive
-            ? MediaFileNamer.temporaryRawArchiveURL(directory: directory, date: date)
-            : MediaFileNamer.temporaryVideoURL(directory: directory, date: date)
+            ? MediaFileNamer.temporaryRawArchiveURL(
+                directory: directory, date: date, aircraftToken: aircraftToken
+            )
+            : MediaFileNamer.temporaryVideoURL(
+                directory: directory, date: date, aircraftToken: aircraftToken
+            )
         guard FileManager.default.createFile(atPath: temporaryURL.path, contents: nil) else {
             throw captureError("Could not create \(temporaryURL.lastPathComponent)")
         }
@@ -268,6 +291,7 @@ final class H264StreamRecorder {
         recordedAccessUnits = 0
         finishError = nil
         rawArchiveNaming = rawArchive
+        self.aircraftToken = aircraftToken
         pendingChunks.removeAll(keepingCapacity: true)
         pendingHead = 0
         pendingBytes = 0
@@ -426,6 +450,7 @@ final class H264StreamRecorder {
             let written = bytesWritten
             let accessUnits = recordedAccessUnits
             let usesRawArchiveName = rawArchiveNaming
+            let recordingAircraftToken = aircraftToken
             var errorDescription = finishError
             self.handle = nil
             directoryURL = nil
@@ -434,6 +459,7 @@ final class H264StreamRecorder {
             endedAt = nil
             recordedAccessUnits = 0
             rawArchiveNaming = false
+            aircraftToken = "BB2"
             pendingChunks.removeAll(keepingCapacity: false)
             pendingHead = 0
             pendingBytes = 0
@@ -455,23 +481,27 @@ final class H264StreamRecorder {
             var resultURL = temporary ?? (usesRawArchiveName
                 ? MediaFileNamer.temporaryRawArchiveURL(
                     directory: directory ?? MediaFileNamer.defaultDirectory,
-                    date: started
+                    date: started,
+                    aircraftToken: recordingAircraftToken
                 )
                 : MediaFileNamer.temporaryVideoURL(
                     directory: directory ?? MediaFileNamer.defaultDirectory,
-                    date: started
+                    date: started,
+                    aircraftToken: recordingAircraftToken
                 ))
             if let directory, let temporary {
                 let completed = usesRawArchiveName
                     ? MediaFileNamer.completedRawArchiveURL(
                         directory: directory,
                         date: started,
-                        duration: duration
+                        duration: duration,
+                        aircraftToken: recordingAircraftToken
                     )
                     : MediaFileNamer.completedVideoURL(
                         directory: directory,
                         date: started,
-                        duration: duration
+                        duration: duration,
+                        aircraftToken: recordingAircraftToken
                     )
                 do {
                     try FileManager.default.moveItem(at: temporary, to: completed)

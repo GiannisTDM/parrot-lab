@@ -1,20 +1,35 @@
 import AppKit
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private var window: NSWindow?
     private var controller: MainViewController?
     private var settingsWindow: NSWindow?
+    private var flightMappingsWindow: NSWindow?
+    private weak var standaloneBebopCheckbox: NSButton?
+    private weak var keyboardFlightCheckbox: NSButton?
+    private weak var controllerFlightCheckbox: NSButton?
+    private weak var controllerDeadzoneSlider: NSSlider?
+    private weak var controllerSensitivitySlider: NSSlider?
+    private weak var controllerDeadzoneValue: NSTextField?
+    private weak var controllerSensitivityValue: NSTextField?
+    private weak var invertPitchCheckbox: NSButton?
+    private weak var invertGazCheckbox: NSButton?
+    private var keyboardMappingPopups: [FlightControlAction: NSPopUpButton] = [:]
+    private var controllerMappingPopups: [FlightControlAction: NSPopUpButton] = [:]
     private weak var developerDiagnosticsCheckbox: NSButton?
     private weak var temporalEnabledCheckbox: NSButton?
     private weak var temporalBidirectionalCheckbox: NSButton?
+    private weak var temporalFrameGenerationCheckbox: NSButton?
     private weak var temporalHistorySlider: NSSlider?
     private weak var temporalGhostSlider: NSSlider?
     private weak var temporalConsistencySlider: NSSlider?
     private weak var temporalLatencySlider: NSSlider?
+    private weak var temporalFlowResolutionSlider: NSSlider?
     private weak var temporalHistoryValue: NSTextField?
     private weak var temporalGhostValue: NSTextField?
     private weak var temporalConsistencyValue: NSTextField?
     private weak var temporalLatencyValue: NSTextField?
+    private weak var temporalFlowResolutionValue: NSTextField?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if let brandIcon = LabVisualStyle.brandIcon() {
@@ -52,7 +67,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 520, height: 500),
+            contentRect: NSRect(x: 0, y: 0, width: 540, height: 820),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -61,7 +76,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.isReleasedWhenClosed = false
         panel.appearance = NSAppearance(named: .darkAqua)
 
-        let content = LabBackgroundView(frame: panel.contentView?.bounds ?? .zero)
+        let scroll = NSScrollView(frame: panel.contentView?.bounds ?? .zero)
+        scroll.drawsBackground = false
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.borderType = .noBorder
+        let content = LabFlippedBackgroundView(frame: NSRect(x: 0, y: 0, width: 540, height: 1_100))
         let stack = NSStackView()
         stack.orientation = .vertical
         stack.alignment = .leading
@@ -75,6 +95,94 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             stack.topAnchor.constraint(equalTo: content.topAnchor),
             stack.bottomAnchor.constraint(lessThanOrEqualTo: content.bottomAnchor)
         ])
+
+        let flightTitle = NSTextField(labelWithString: "Connection and flight control")
+        flightTitle.font = .systemFont(ofSize: 15, weight: .semibold)
+        flightTitle.textColor = .white
+        stack.addArrangedSubview(flightTitle)
+
+        let standaloneCheckbox = NSButton(
+            checkboxWithTitle: "Enable standalone aircraft (Bebop Drone / Bebop 2)",
+            target: self,
+            action: #selector(flightControlSettingChanged(_:))
+        )
+        standaloneCheckbox.font = .systemFont(ofSize: 13, weight: .medium)
+        stack.addArrangedSubview(standaloneCheckbox)
+
+        let standaloneExplanation = NSTextField(wrappingLabelWithString:
+            "Use while the Mac is joined directly to the aircraft Wi-Fi at 192.168.42.1. Parrot Lab automatically detects BB1 or BB2; this route is mutually exclusive with SkyController routing."
+        )
+        standaloneExplanation.font = .systemFont(ofSize: 11.5)
+        standaloneExplanation.textColor = LabVisualStyle.mutedText
+        standaloneExplanation.maximumNumberOfLines = 2
+        standaloneExplanation.widthAnchor.constraint(equalToConstant: 480).isActive = true
+        stack.addArrangedSubview(standaloneExplanation)
+
+        let keyboardCheckbox = NSButton(
+            checkboxWithTitle: "Enable remappable keyboard flight control",
+            target: self,
+            action: #selector(flightControlSettingChanged(_:))
+        )
+        keyboardCheckbox.font = .systemFont(ofSize: 13, weight: .medium)
+        stack.addArrangedSubview(keyboardCheckbox)
+
+        let controllerCheckbox = NSButton(
+            checkboxWithTitle: "Enable native gamepad control (Xbox / PlayStation / MFi)",
+            target: self,
+            action: #selector(flightControlSettingChanged(_:))
+        )
+        controllerCheckbox.font = .systemFont(ofSize: 13, weight: .medium)
+        stack.addArrangedSubview(controllerCheckbox)
+
+        let controllerNote = NSTextField(wrappingLabelWithString:
+            "macOS uses Apple's GameController system rather than XInput. Stick layout matches the SC2: left yaw/gaz, right roll/pitch."
+        )
+        controllerNote.font = .systemFont(ofSize: 11.5)
+        controllerNote.textColor = LabVisualStyle.mutedText
+        controllerNote.maximumNumberOfLines = 2
+        controllerNote.widthAnchor.constraint(equalToConstant: 480).isActive = true
+        stack.addArrangedSubview(controllerNote)
+
+        let controllerTuning = NSStackView()
+        controllerTuning.orientation = .horizontal
+        controllerTuning.spacing = 14
+        let deadzoneRow = makeCompactFlightSlider(
+            title: "Deadzone", minimum: 0, maximum: 0.45,
+            action: #selector(flightControlSettingChanged(_:))
+        )
+        let sensitivityRow = makeCompactFlightSlider(
+            title: "Stick limit", minimum: 0.25, maximum: 1,
+            action: #selector(flightControlSettingChanged(_:))
+        )
+        controllerTuning.addArrangedSubview(deadzoneRow.container)
+        controllerTuning.addArrangedSubview(sensitivityRow.container)
+        stack.addArrangedSubview(controllerTuning)
+
+        let invertRow = NSStackView()
+        invertRow.orientation = .horizontal
+        invertRow.spacing = 20
+        let invertPitch = NSButton(
+            checkboxWithTitle: "Invert pitch", target: self,
+            action: #selector(flightControlSettingChanged(_:))
+        )
+        let invertGaz = NSButton(
+            checkboxWithTitle: "Invert gaz", target: self,
+            action: #selector(flightControlSettingChanged(_:))
+        )
+        invertRow.addArrangedSubview(invertPitch)
+        invertRow.addArrangedSubview(invertGaz)
+        let mappingsButton = NSButton(
+            title: "Configure mappings…", target: self,
+            action: #selector(showFlightControlMappings(_:))
+        )
+        mappingsButton.bezelStyle = .rounded
+        invertRow.addArrangedSubview(mappingsButton)
+        stack.addArrangedSubview(invertRow)
+
+        let flightSeparator = NSBox()
+        flightSeparator.boxType = .separator
+        flightSeparator.widthAnchor.constraint(equalToConstant: 480).isActive = true
+        stack.addArrangedSubview(flightSeparator)
 
         let title = NSTextField(labelWithString: "Developer options")
         title.font = .systemFont(ofSize: 15, weight: .semibold)
@@ -96,12 +204,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         explanation.font = .systemFont(ofSize: 11.5)
         explanation.textColor = LabVisualStyle.mutedText
         explanation.maximumNumberOfLines = 3
-        explanation.widthAnchor.constraint(equalToConstant: 460).isActive = true
+        explanation.widthAnchor.constraint(equalToConstant: 480).isActive = true
         stack.addArrangedSubview(explanation)
 
         let separator = NSBox()
         separator.boxType = .separator
-        separator.widthAnchor.constraint(equalToConstant: 460).isActive = true
+        separator.widthAnchor.constraint(equalToConstant: 480).isActive = true
         stack.addArrangedSubview(separator)
 
         let temporalTitle = NSTextField(labelWithString: "Experimental temporal reconstruction")
@@ -133,6 +241,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         bidirectionalCheckbox.font = .systemFont(ofSize: 12, weight: .medium)
         stack.addArrangedSubview(bidirectionalCheckbox)
+
+        let frameGenerationCheckbox = NSButton(
+            checkboxWithTitle: "Generate one midpoint every two source frames (target 45 FPS)",
+            target: self,
+            action: #selector(temporalSettingChanged(_:))
+        )
+        frameGenerationCheckbox.font = .systemFont(ofSize: 12, weight: .medium)
+        stack.addArrangedSubview(frameGenerationCheckbox)
+
+        let flowResolutionRow = makeTemporalSliderRow(
+            title: "Residual flow quality ceiling (auto performance governor)",
+            minimum: 0.18,
+            maximum: 1,
+            action: #selector(temporalSettingChanged(_:))
+        )
+        stack.addArrangedSubview(flowResolutionRow.container)
 
         let historyRow = makeTemporalSliderRow(
             title: "History strength",
@@ -166,12 +290,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         stack.addArrangedSubview(latencyRow.container)
 
-        panel.contentView = content
+        scroll.documentView = content
+        panel.contentView = scroll
         panel.center()
         settingsWindow = panel
+        standaloneBebopCheckbox = standaloneCheckbox
+        keyboardFlightCheckbox = keyboardCheckbox
+        controllerFlightCheckbox = controllerCheckbox
+        controllerDeadzoneSlider = deadzoneRow.slider
+        controllerDeadzoneValue = deadzoneRow.value
+        controllerSensitivitySlider = sensitivityRow.slider
+        controllerSensitivityValue = sensitivityRow.value
+        invertPitchCheckbox = invertPitch
+        invertGazCheckbox = invertGaz
         developerDiagnosticsCheckbox = checkbox
         temporalEnabledCheckbox = temporalCheckbox
         temporalBidirectionalCheckbox = bidirectionalCheckbox
+        temporalFrameGenerationCheckbox = frameGenerationCheckbox
+        temporalFlowResolutionSlider = flowResolutionRow.slider
+        temporalFlowResolutionValue = flowResolutionRow.value
         temporalHistorySlider = historyRow.slider
         temporalHistoryValue = historyRow.value
         temporalGhostSlider = ghostRow.slider
@@ -224,11 +361,207 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return (container, slider, value)
     }
 
+    private func makeCompactFlightSlider(
+        title: String,
+        minimum: Double,
+        maximum: Double,
+        action: Selector
+    ) -> (container: NSStackView, slider: NSSlider, value: NSTextField) {
+        let container = NSStackView()
+        container.orientation = .vertical
+        container.spacing = 3
+        container.widthAnchor.constraint(equalToConstant: 226).isActive = true
+        let heading = NSStackView()
+        heading.orientation = .horizontal
+        let label = NSTextField(labelWithString: title)
+        label.font = .systemFont(ofSize: 11.5, weight: .medium)
+        heading.addArrangedSubview(label)
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        heading.addArrangedSubview(spacer)
+        let value = NSTextField(labelWithString: "—")
+        value.font = .monospacedSystemFont(ofSize: 11, weight: .semibold)
+        value.textColor = LabVisualStyle.accent
+        heading.addArrangedSubview(value)
+        container.addArrangedSubview(heading)
+        let slider = NSSlider(value: minimum, minValue: minimum, maxValue: maximum, target: self, action: action)
+        slider.isContinuous = false
+        slider.widthAnchor.constraint(equalToConstant: 226).isActive = true
+        container.addArrangedSubview(slider)
+        return (container, slider, value)
+    }
+
+    @objc private func flightControlSettingChanged(_ sender: Any?) {
+        guard let controller else { return }
+        var configuration = controller.currentFlightControlConfiguration
+        configuration.standaloneBebopEnabled = standaloneBebopCheckbox?.state == .on
+        configuration.keyboardEnabled = keyboardFlightCheckbox?.state == .on
+        configuration.controllerEnabled = controllerFlightCheckbox?.state == .on
+        configuration.controllerDeadzone = controllerDeadzoneSlider?.doubleValue
+            ?? configuration.controllerDeadzone
+        configuration.controllerSensitivity = controllerSensitivitySlider?.doubleValue
+            ?? configuration.controllerSensitivity
+        configuration.invertPitch = invertPitchCheckbox?.state == .on
+        configuration.invertGaz = invertGazCheckbox?.state == .on
+        controller.setFlightControlConfiguration(configuration)
+        refreshSettingsControls()
+    }
+
+    @objc private func showFlightControlMappings(_ sender: Any?) {
+        if let flightMappingsWindow {
+            refreshFlightMappingControls()
+            flightMappingsWindow.makeKeyAndOrderFront(nil)
+            return
+        }
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 650, height: 720),
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        panel.title = "Parrot Lab Flight Control Mappings"
+        panel.isReleasedWhenClosed = false
+        panel.appearance = NSAppearance(named: .darkAqua)
+
+        let scroll = NSScrollView()
+        scroll.drawsBackground = false
+        scroll.hasVerticalScroller = true
+        let document = LabFlippedView(frame: NSRect(x: 0, y: 0, width: 630, height: 920))
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 8
+        stack.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        document.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: document.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: document.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: document.topAnchor),
+            stack.bottomAnchor.constraint(equalTo: document.bottomAnchor)
+        ])
+
+        let title = NSTextField(labelWithString: "Keyboard and gamepad actions")
+        title.font = .systemFont(ofSize: 16, weight: .semibold)
+        stack.addArrangedSubview(title)
+        let note = NSTextField(wrappingLabelWithString:
+            "Keyboard movement is active only while its safety-hold key is pressed. Gamepad axes use the SC2 layout. Emergency has no default binding and should remain unassigned unless deliberately configured."
+        )
+        note.textColor = LabVisualStyle.mutedText
+        note.maximumNumberOfLines = 3
+        note.widthAnchor.constraint(equalToConstant: 590).isActive = true
+        stack.addArrangedSubview(note)
+
+        let headings = NSStackView()
+        headings.orientation = .horizontal
+        headings.spacing = 10
+        for (text, width) in [("Action", 200.0), ("Keyboard", 175.0), ("Gamepad button", 195.0)] {
+            let label = NSTextField(labelWithString: text)
+            label.font = .systemFont(ofSize: 11, weight: .bold)
+            label.textColor = LabVisualStyle.mutedText
+            label.widthAnchor.constraint(equalToConstant: width).isActive = true
+            headings.addArrangedSubview(label)
+        }
+        stack.addArrangedSubview(headings)
+
+        keyboardMappingPopups.removeAll()
+        controllerMappingPopups.removeAll()
+        for action in FlightControlAction.allCases {
+            let row = NSStackView()
+            row.orientation = .horizontal
+            row.alignment = .centerY
+            row.spacing = 10
+            let label = NSTextField(labelWithString: action.title)
+            label.widthAnchor.constraint(equalToConstant: 200).isActive = true
+            label.textColor = action == .emergency ? .systemRed : .labelColor
+            row.addArrangedSubview(label)
+
+            let keyboard = NSPopUpButton(frame: .zero, pullsDown: false)
+            for key in FlightKeyboardKey.choices {
+                keyboard.addItem(withTitle: key.title)
+                keyboard.lastItem?.tag = Int(key.keyCode)
+            }
+            keyboard.target = self
+            keyboard.action = #selector(flightMappingChanged(_:))
+            keyboard.identifier = NSUserInterfaceItemIdentifier("keyboard.\(action.rawValue)")
+            keyboard.widthAnchor.constraint(equalToConstant: 175).isActive = true
+            keyboardMappingPopups[action] = keyboard
+            row.addArrangedSubview(keyboard)
+
+            let gamepad = NSPopUpButton(frame: .zero, pullsDown: false)
+            for (index, button) in FlightControllerButton.allCases.enumerated() {
+                gamepad.addItem(withTitle: button.title)
+                gamepad.lastItem?.tag = index
+            }
+            gamepad.target = self
+            gamepad.action = #selector(flightMappingChanged(_:))
+            gamepad.identifier = NSUserInterfaceItemIdentifier("gamepad.\(action.rawValue)")
+            gamepad.widthAnchor.constraint(equalToConstant: 195).isActive = true
+            gamepad.isEnabled = !action.isContinuousAxis
+            controllerMappingPopups[action] = gamepad
+            row.addArrangedSubview(gamepad)
+            stack.addArrangedSubview(row)
+        }
+
+        let reset = NSButton(title: "Restore default mappings", target: self, action: #selector(resetFlightMappings(_:)))
+        reset.bezelStyle = .rounded
+        stack.addArrangedSubview(reset)
+        scroll.documentView = document
+        panel.contentView = scroll
+        panel.minSize = NSSize(width: 650, height: 480)
+        panel.center()
+        flightMappingsWindow = panel
+        refreshFlightMappingControls()
+        panel.makeKeyAndOrderFront(nil)
+    }
+
+    @objc private func flightMappingChanged(_ sender: Any?) {
+        guard let popup = sender as? NSPopUpButton,
+              let identifier = popup.identifier?.rawValue,
+              let actionName = identifier.split(separator: ".").last,
+              let action = FlightControlAction(rawValue: String(actionName)),
+              let controller else { return }
+        var configuration = controller.currentFlightControlConfiguration
+        if identifier.hasPrefix("keyboard.") {
+            configuration.keyboardKeys[action] = UInt16(clamping: popup.selectedTag())
+        } else if identifier.hasPrefix("gamepad."),
+                  FlightControllerButton.allCases.indices.contains(popup.selectedTag()) {
+            configuration.controllerButtons[action] = FlightControllerButton.allCases[popup.selectedTag()]
+        }
+        controller.setFlightControlConfiguration(configuration)
+        refreshFlightMappingControls()
+    }
+
+    @objc private func resetFlightMappings(_ sender: Any?) {
+        guard let controller else { return }
+        var configuration = controller.currentFlightControlConfiguration
+        configuration.keyboardKeys = FlightControlConfiguration.defaultKeyboardKeys
+        configuration.controllerButtons = FlightControlConfiguration.defaultControllerButtons
+        controller.setFlightControlConfiguration(configuration)
+        refreshFlightMappingControls()
+    }
+
+    private func refreshFlightMappingControls() {
+        guard let configuration = controller?.currentFlightControlConfiguration else { return }
+        for action in FlightControlAction.allCases {
+            keyboardMappingPopups[action]?.selectItem(
+                withTag: Int(configuration.keyboardKeys[action] ?? UInt16.max)
+            )
+            let selected = configuration.controllerButtons[action] ?? .unassigned
+            controllerMappingPopups[action]?.selectItem(
+                withTag: FlightControllerButton.allCases.firstIndex(of: selected) ?? 0
+            )
+        }
+    }
+
     @objc private func temporalSettingChanged(_ sender: Any?) {
         guard let controller else { return }
         var configuration = controller.currentTemporalReconstructionConfiguration
         configuration.isEnabled = temporalEnabledCheckbox?.state == .on
         configuration.usesBidirectionalFlow = temporalBidirectionalCheckbox?.state == .on
+        configuration.generatesIntermediateFrames = temporalFrameGenerationCheckbox?.state == .on
+        configuration.flowResolutionScale = temporalFlowResolutionSlider?.doubleValue
+            ?? configuration.flowResolutionScale
         configuration.historyWeight = temporalHistorySlider?.doubleValue ?? configuration.historyWeight
         configuration.ghostRejection = temporalGhostSlider?.doubleValue ?? configuration.ghostRejection
         configuration.consistencyThresholdPixels = temporalConsistencySlider?.doubleValue
@@ -241,9 +574,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func refreshSettingsControls() {
         developerDiagnosticsCheckbox?.state = controller?.isDeveloperVideoDiagnosticsEnabled == true ? .on : .off
+        if let flight = controller?.currentFlightControlConfiguration {
+            standaloneBebopCheckbox?.state = flight.standaloneBebopEnabled ? .on : .off
+            keyboardFlightCheckbox?.state = flight.keyboardEnabled ? .on : .off
+            controllerFlightCheckbox?.state = flight.controllerEnabled ? .on : .off
+            controllerDeadzoneSlider?.doubleValue = flight.controllerDeadzone
+            controllerSensitivitySlider?.doubleValue = flight.controllerSensitivity
+            controllerDeadzoneValue?.stringValue = String(format: "%.0f%%", flight.controllerDeadzone * 100)
+            controllerSensitivityValue?.stringValue = String(format: "%.0f%%", flight.controllerSensitivity * 100)
+            invertPitchCheckbox?.state = flight.invertPitch ? .on : .off
+            invertGazCheckbox?.state = flight.invertGaz ? .on : .off
+            controllerDeadzoneSlider?.isEnabled = flight.controllerEnabled
+            controllerSensitivitySlider?.isEnabled = flight.controllerEnabled
+            invertPitchCheckbox?.isEnabled = flight.controllerEnabled
+            invertGazCheckbox?.isEnabled = flight.controllerEnabled
+        }
         guard let configuration = controller?.currentTemporalReconstructionConfiguration else { return }
         temporalEnabledCheckbox?.state = configuration.isEnabled ? .on : .off
         temporalBidirectionalCheckbox?.state = configuration.usesBidirectionalFlow ? .on : .off
+        temporalFrameGenerationCheckbox?.state = configuration.generatesIntermediateFrames ? .on : .off
+        temporalFlowResolutionSlider?.doubleValue = configuration.flowResolutionScale
         temporalHistorySlider?.doubleValue = configuration.historyWeight
         temporalGhostSlider?.doubleValue = configuration.ghostRejection
         temporalConsistencySlider?.doubleValue = configuration.consistencyThresholdPixels
@@ -252,8 +602,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         temporalGhostValue?.stringValue = String(format: "%.0f%%", configuration.ghostRejection * 100)
         temporalConsistencyValue?.stringValue = String(format: "%.1f px", configuration.consistencyThresholdPixels)
         temporalLatencyValue?.stringValue = String(format: "%.0f ms", configuration.latencyBudgetMilliseconds)
+        temporalFlowResolutionValue?.stringValue = String(format: "%.0f%%", configuration.flowResolutionScale * 100)
         let controlsEnabled = configuration.isEnabled
         temporalBidirectionalCheckbox?.isEnabled = controlsEnabled
+        temporalFrameGenerationCheckbox?.isEnabled = controlsEnabled && configuration.usesBidirectionalFlow
+        temporalFlowResolutionSlider?.isEnabled = controlsEnabled
         temporalHistorySlider?.isEnabled = controlsEnabled
         temporalGhostSlider?.isEnabled = controlsEnabled
         temporalConsistencySlider?.isEnabled = controlsEnabled && configuration.usesBidirectionalFlow
@@ -324,6 +677,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func findSC2USBHost(_ sender: Any?) {
         controller?.findSC2USBHost()
+    }
+
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        guard let controller else { return false }
+        let action = menuItem.action
+        if action == #selector(installDragonLabOnBebop2(_:)) {
+            return controller.aircraftCapabilities.supportsBB2DragonLab
+        }
+        if action == #selector(enablePersistentTelnetOnBebop2(_:)) {
+            return controller.aircraftCapabilities.supportsBB2PersistentTelnetInstall
+        }
+        if action == #selector(uploadRFModSuiteToBebop2(_:)) ||
+            action == #selector(uploadRFModSuiteToSkyController2(_:)) ||
+            action == #selector(configureRFPowerMod(_:)) {
+            return controller.aircraftCapabilities.supportsValidatedRFMod
+        }
+        if action == #selector(toggleCalibratedRollingShutter(_:)) {
+            return controller.aircraftCapabilities.supportsBB2CameraCalibration ||
+                controller.isCalibratedRollingShutterEnabled
+        }
+        return true
     }
 
     func applicationWillTerminate(_ notification: Notification) {

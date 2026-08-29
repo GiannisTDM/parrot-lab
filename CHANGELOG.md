@@ -1,61 +1,108 @@
 # Changelog
 
-## 1.3.0 — 2026-08-28
+## 1.4.0 — 2026-08-29
 
-Version 1.3 turns Parrot Lab into a broader all-in-one Bebop 2 workbench while
-keeping every live-video queue explicitly bounded.
+Version 1.4 adds first-class Bebop Drone support, guarded standalone aircraft
+control and a faster, bounded temporal-video pipeline.
 
-### Added
+### Added and improved
 
-- Added firmware-matched **1600 × 900** Dragon profiles for Bebop firmware
-  4.4.2 and 4.7.1. The helper verifies the installed firmware and selects only
-  its matching binary before touching the running Dragon process.
-- Added processed H.264 recording of Parrot Lab's enhanced output, original-
-  quality H.264-to-MP4 remuxing at 100%, and an optional quality-controlled
-  MP4 re-encode.
-- Added Apple MetalFX Spatial output through 4K, processed-resolution PNG/JPEG
-  screenshots and independent enhancement controls.
-- Added optional GPU repair for isolated green/odd-colour H.264 blocks and
-  confidence-gated temporal mosquito-noise cleanup.
-- Added experimental 900p temporal reconstruction using synchronized
-  `frame_quat` alignment, Apple Vision residual optical flow, confidence
-  rejection and bidirectional occlusion checks. It remains off by default.
-- Added calibrated 4.7.1 900p rolling-shutter/jello correction with curved
-  sensor-row timing and frame-synchronized camera orientation.
-- Added VideoMetadataV2 parsing and timestamp association for synchronized
-  drone/view quaternions, exposure, camera position and motion data.
-
-### Changed
-
-- Removed the unsustainable 1080p experiment from the interface and replaced
-  it with firmware-specific 900p Modified and 900p Temporal profiles.
-- Normal recording now encodes the same processed GPU output shown by the live
-  view. The untouched incoming Annex-B stream remains available as a separate
-  developer archive.
-- Added standard macOS application, Edit, Services and Window menus plus
-  developer video/settings controls.
-- Release builds now compile optimized Swift files in parallel and emit a
-  matching SHA-256 file beside the distributable ZIP.
-
-### Fixed and hardened
-
-- Latest-frame-only decode, processing and recording branches prevent slow GPU
-  or disk work from accumulating live-display latency or unbounded history.
-- Temporal and artifact-repair history resets safely across timestamps,
-  dimensions, presets and failed/late motion estimates.
-- Unsupported Bebop firmware is rejected before a patched Dragon launch, and
-  stock restoration remains available through the detached helper workflow.
-- The self-contained Apple-silicon release continues to verify bundled FFmpeg,
-  ad-hoc signing, archive integrity and the exact post-extraction app.
+- Added first-class Bebop Drone (BB1) support through the same native ARSDK
+  transport as BB2: stock video, telemetry, flight control, camera control and
+  genuine fisheye JPEG capture work through SC2 or direct Wi-Fi.
+- Aircraft model is derived from the SC2 `ConnexionChanged` product ID, or the
+  official direct `_arsdk-0901` / `_arsdk-090c` Bonjour service. The detected
+  model, route, firmware and model-specific media filename prefix are reflected
+  in the UI and logs.
+- BB2-only Dragon 900p, calibrated camera correction, persistent-Telnet and
+  RF/MOD actions are disabled for BB1 and unknown products; unknown aircraft
+  retain only safe stock ARDrone3 capabilities.
+- Residual temporal flow now runs at a selectable reduced resolution after IMU
+  alignment, then scales vectors into the full-resolution temporal resolve.
+- Forward and reverse flow requests run concurrently to remove the previous
+  full-resolution sequential-flow bottleneck.
+- Optional motion-compensated midpoint generation adds one synthetic frame for
+  every two real frames, targeting a bounded 45 FPS display and recording.
+- An automatic flow-resolution governor preserves a 30 FPS minimum target by
+  reducing residual-flow cost before sacrificing real-frame cadence; reverse
+  flow is computed only on midpoint-generation intervals in 45 FPS mode.
+- Generated frames use a dedicated 45 Hz bounded presentation queue and a
+  lower-cost GPU scaling path so they no longer block or arrive late behind
+  the real-frame display path.
+- Generated display and processed-recording queues remain explicitly bounded;
+  overload drops frames instead of increasing FPV latency.
+- Added mutually exclusive standalone BB1/BB2 mode with direct TCP 44444
+  discovery, discovery-returned command UDP routing, direct ARStream2 port
+  advertisement, and stock `MediaStreaming.VideoEnable`.
+- Added universal native macOS GameController support for Xbox, PlayStation and
+  MFi pads, plus fully remappable app-focused keyboard actions.
+- Added SC2-equivalent 20 Hz PCMD, acknowledged take-off/land/RTH handling,
+  camera orientation commands, configurable stick deadzone/limit/inversion,
+  and automatic neutral input on focus, controller, route or connection loss.
+- Emergency remains deliberately unassigned by default.
 
 ### Known limitations
 
-- Temporal reconstruction is experimental, requires decoded 1600 × 900 input
-  and can reduce processed FPS on slower Macs.
-- Direct production USB/libmux video transport is not implemented; video uses
-  the established SkyController restream path.
+- Standalone piloting and direct ARStream2 setup follow the confirmed Parrot
+  protocol but still require careful, props-off hardware validation before use.
+- Direct production USB/libmux video transport is not implemented; the current
+  video path uses the established SkyController restream route.
+- Temporal reconstruction remains experimental and can reduce processed FPS on
+  slower Macs despite the new automatic governor.
 - The public build is ad-hoc signed and not notarized. Parrot Lab remains a
   development workbench, not a certified flight display.
+
+## 1.3.0 — 2026-08-28
+
+V1.3 turns Parrot Lab into a practical all-in-one Bebop 2 workbench while
+keeping every live-video queue explicitly bounded.
+
+### Highlights
+
+- Firmware-matched 1600 × 900 Dragon profiles for Bebop firmware 4.4.2 and
+  4.7.1, with the unsustainable 1080p experiment removed from the UI.
+- Processed H.264 recording: the normal recording contains Parrot Lab's
+  enhanced/MetalFX output and the 100% MP4 option remuxes it without another
+  lossy generation.
+- Apple MetalFX Spatial output through 4K, independent image-enhancement
+  presets, and processed-resolution PNG/JPEG screenshots.
+- Optional H.264 repair for isolated green/odd-color blocks and temporal
+  mosquito noise.
+- Experimental 900p temporal reconstruction using synchronized `frame_quat`
+  alignment, Apple Vision residual optical flow, confidence rejection and
+  bidirectional occlusion checks. Tuning remains off by default under
+  **Parrot Lab → Settings**.
+- Calibrated 4.7.1 900p rolling-shutter/jello correction with curved sensor-row
+  timing and frame-synchronized camera orientation.
+- Native ARSDK telemetry through the SkyController 2 for battery, flight state,
+  GPS, attitude and camera state, plus stock Dragon 4K fisheye capture and
+  unchanged JPEG download.
+- One-click deployment/update tools for Dragon Video, persistent Bebop Telnet,
+  RF/MOD Suite and the SkyController 2 Apple-NCM driver patch.
+- Four distinct live-rate diagnostics: encoded access-unit FPS, unique RTP
+  timestamp FPS, decoded-frame FPS and display refresh FPS.
+
+### Reliability and distribution
+
+- Latest-frame-only decode/processing/recording branches prevent slow GPU or
+  disk work from growing live-display latency or retaining an unbounded frame
+  history.
+- Self-contained Apple-silicon release ZIP with bundled FFmpeg, ad-hoc signing,
+  signature/archive verification and a matching SHA-256 file.
+- Standard macOS application, Edit, Services and Window menus; no Apple account,
+  paid certificate, provisioning profile or secret is required to package it.
+
+### Known limitations
+
+- The public build is ad-hoc signed and not notarized. Follow the first-launch
+  steps in [README.md](README.md).
+- Temporal reconstruction is experimental, requires decoded 1600 × 900 input
+  for activation, and may reduce processed FPS on slower Macs.
+- Direct production USB/libmux video transport is not implemented; the current
+  video path uses the established SkyController restream route.
+- Standalone piloting and direct ARStream2 setup are implemented from the
+  confirmed protocol but still require ground-only hardware validation.
+- Parrot Lab remains a development workbench, not a certified flight display.
 
 ## 1.2.0 — 2026-08-26
 

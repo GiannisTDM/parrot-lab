@@ -54,6 +54,8 @@ enum ARSDKTelemetryEvent: Equatable {
     case attitude(roll: Float, pitch: Float, yaw: Float)
     case gpsFix(Bool)
     case satelliteCount(Int)
+    case aircraftConnection(status: UInt32, deviceName: String, productID: UInt16)
+    case productVersion(software: String, hardware: String)
 }
 
 enum ARSDKPhotoCommand {
@@ -62,6 +64,64 @@ enum ARSDKPhotoCommand {
     static let takePictureV2 = Data([1, 7, 2, 0])
     static let requestAllStates = Data([0, 4, 0, 0])
     static let requestSkyControllerAllStates = Data([4, 6, 0, 0])
+    static let requestAllSettings = Data([0, 2, 0, 0])
+    static let takeOff = Data([1, 0, 1, 0])
+    static let landing = Data([1, 0, 3, 0])
+    static let emergency = Data([1, 0, 4, 0])
+
+    static func navigateHome(start: Bool) -> Data {
+        Data([1, 0, 5, 0, start ? 1 : 0])
+    }
+
+    static func videoEnable(_ enabled: Bool) -> Data {
+        Data([1, 21, 0, 0, enabled ? 1 : 0])
+    }
+
+    static func cameraOrientation(tilt: Int8, pan: Int8) -> Data {
+        Data([1, 1, 0, 0, UInt8(bitPattern: tilt), UInt8(bitPattern: pan)])
+    }
+
+    static func pcmd(
+        flag: Bool,
+        roll: Int8,
+        pitch: Int8,
+        yaw: Int8,
+        gaz: Int8,
+        timestampAndSequence: UInt32
+    ) -> Data {
+        var result = Data([
+            1, 0, 2, 0,
+            flag ? 1 : 0,
+            UInt8(bitPattern: roll), UInt8(bitPattern: pitch),
+            UInt8(bitPattern: yaw), UInt8(bitPattern: gaz)
+        ])
+        result.append(contentsOf: (0..<4).map {
+            UInt8((timestampAndSequence >> UInt32($0 * 8)) & 0xff)
+        })
+        return result
+    }
+}
+
+enum ARSDKConnectionRoute: Equatable {
+    case skyController
+    case directBebop
+
+    var displayName: String {
+        switch self {
+        case .skyController: return "SkyController 2"
+        case .directBebop: return "Bebop direct"
+        }
+    }
+}
+
+struct BebopPilotingInput: Equatable {
+    var roll: Int8 = 0
+    var pitch: Int8 = 0
+    var yaw: Int8 = 0
+    var gaz: Int8 = 0
+
+    var flag: Bool { roll != 0 || pitch != 0 }
+    static let neutral = BebopPilotingInput()
 }
 
 enum ARSDKPhotoProtocol {
@@ -158,7 +218,35 @@ enum ARSDKTelemetryProtocol {
         if project == 1, commandClass == 31, command == 0, data.count >= 5 {
             return .satelliteCount(Int(data[4]))
         }
+        if project == 4, commandClass == 3, command == 1,
+           let status = uint32(data, at: 4),
+           let name = cString(data, at: 8),
+           let productID = uint16(data, at: name.nextOffset) {
+            return .aircraftConnection(
+                status: status,
+                deviceName: name.value,
+                productID: productID
+            )
+        }
+        if project == 0, commandClass == 3, command == 3,
+           let software = cString(data, at: 4),
+           let hardware = cString(data, at: software.nextOffset) {
+            return .productVersion(software: software.value, hardware: hardware.value)
+        }
         return nil
+    }
+
+    private static func uint16(_ data: Data, at offset: Int) -> UInt16? {
+        guard data.count >= offset + 2 else { return nil }
+        return UInt16(data[offset]) | UInt16(data[offset + 1]) << 8
+    }
+
+    private static func cString(_ data: Data, at offset: Int) -> (value: String, nextOffset: Int)? {
+        guard offset < data.count,
+              let end = data[offset...].firstIndex(of: 0) else { return nil }
+        let bytes = data[offset..<end]
+        guard let value = String(data: bytes, encoding: .utf8) else { return nil }
+        return (value, end + 1)
     }
 
     private static func uint32(_ data: Data, at offset: Int) -> UInt32? {
@@ -193,12 +281,12 @@ enum ARSDKPhotoConnectionError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .invalidHost: return "The SC2 host is not a valid IPv4 address."
+        case .invalidHost: return "The ARSDK host is not a valid IPv4 address."
         case .socket(let detail): return "Could not open the ARSDK command socket: \(detail)"
-        case .discovery(let detail): return "SC2 ARDiscovery failed: \(detail)"
-        case .discoveryTimeout: return "SC2 ARDiscovery timed out."
-        case .connectionRejected(let status): return "The SC2 rejected the ARSDK connection (status \(status))."
-        case .missingCommandPort: return "The SC2 discovery reply did not contain a command port."
+        case .discovery(let detail): return "ARDiscovery failed: \(detail)"
+        case .discoveryTimeout: return "ARDiscovery timed out."
+        case .connectionRejected(let status): return "The ARSDK endpoint rejected the connection (status \(status))."
+        case .missingCommandPort: return "The discovery reply did not contain a command port."
         }
     }
 }
@@ -218,15 +306,28 @@ final class ARSDKCommandClient {
     private var remoteAddress: sockaddr_in?
     private var sequenceByBuffer: [UInt8: UInt8] = [:]
     private struct PendingAcknowledgement {
+        let buffer: UInt8
+        let sequence: UInt8
         let packet: Data
         var retries: Int
+        let maximumRetries: Int?
     }
-    private var pendingAcknowledgements: [UInt8: PendingAcknowledgement] = [:]
+    private var pendingAcknowledgements: [UInt16: PendingAcknowledgement] = [:]
     private var connectionCompletions: [(Result<Void, Error>) -> Void] = []
     private var connectingHost: String?
     private var connectedHost: String?
+    private var connectionRoute = ARSDKConnectionRoute.skyController
+    private var requestedVideoStreamPort: UInt16?
+    private var pcmdTimer: DispatchSourceTimer?
+    private var pilotingInput = BebopPilotingInput.neutral
+    private var pcmdSequence: UInt8 = 0
 
-    func connect(host: String, completion: @escaping (Result<Void, Error>) -> Void) {
+    func connect(
+        host: String,
+        route: ARSDKConnectionRoute = .skyController,
+        videoStreamPort: UInt16? = nil,
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
         queue.async { [weak self] in
             guard let self else { return }
             if self.remoteAddress != nil, self.connectedHost == host {
@@ -240,6 +341,8 @@ final class ARSDKCommandClient {
             self.stopLocked()
             self.connectionCompletions = [completion]
             self.connectingHost = host
+            self.connectionRoute = route
+            self.requestedVideoStreamPort = videoStreamPort
             do {
                 let localPort = try self.openUDPSocket()
                 try self.startDiscovery(host: host, localPort: localPort)
@@ -254,6 +357,52 @@ final class ARSDKCommandClient {
     func sendRequestAllStates() { sendCommand(ARSDKPhotoCommand.requestAllStates) }
     func sendRequestSkyControllerAllStates() {
         sendCommand(ARSDKPhotoCommand.requestSkyControllerAllStates)
+    }
+    func sendRequestAllSettings() { sendCommand(ARSDKPhotoCommand.requestAllSettings) }
+    func sendVideoEnable(_ enabled: Bool) { sendCommand(ARSDKPhotoCommand.videoEnable(enabled)) }
+    func sendTakeOff() { sendAcknowledgedCommand(ARSDKPhotoCommand.takeOff) }
+    func sendLanding() { sendAcknowledgedCommand(ARSDKPhotoCommand.landing) }
+    func sendEmergency() { sendAcknowledgedCommand(ARSDKPhotoCommand.emergency, buffer: 12, maximumRetries: nil) }
+    func sendCameraOrientation(tilt: Int8, pan: Int8) {
+        sendUnacknowledgedCommand(ARSDKPhotoCommand.cameraOrientation(tilt: tilt, pan: pan))
+    }
+
+    func sendNavigateHome(start: Bool) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.pilotingInput = .neutral
+            self.sendPCMDLocked()
+            self.queue.asyncAfter(deadline: .now() + .milliseconds(55)) { [weak self] in
+                self?.sendAcknowledgedFrame(payload: ARSDKPhotoCommand.navigateHome(start: start))
+            }
+        }
+    }
+
+    func startPiloting() {
+        queue.async { [weak self] in
+            guard let self, self.pcmdTimer == nil else { return }
+            self.pilotingInput = .neutral
+            let timer = DispatchSource.makeTimerSource(queue: self.queue)
+            timer.schedule(deadline: .now(), repeating: .milliseconds(50), leeway: .milliseconds(4))
+            timer.setEventHandler { [weak self] in self?.sendPCMDLocked() }
+            self.pcmdTimer = timer
+            timer.resume()
+        }
+    }
+
+    func updatePilotingInput(_ input: BebopPilotingInput) {
+        queue.async { [weak self] in self?.pilotingInput = input }
+    }
+
+    func neutralizePilotingInput() {
+        queue.async { [weak self] in
+            self?.pilotingInput = .neutral
+            self?.sendPCMDLocked()
+        }
+    }
+
+    func stopPiloting() {
+        queue.async { [weak self] in self?.stopPilotingLocked() }
     }
 
     func stop() {
@@ -315,12 +464,17 @@ final class ARSDKCommandClient {
             guard let self else { return }
             switch state {
             case .ready:
-                let body: [String: Any] = [
+                var body: [String: Any] = [
                     "controller_name": "Parrot Lab",
                     "controller_type": "computer",
                     "d2c_port": Int(localPort),
                     "qos_mode": 0
                 ]
+                if self.connectionRoute == .directBebop,
+                   let videoPort = self.requestedVideoStreamPort {
+                    body["arstream2_client_stream_port"] = Int(videoPort)
+                    body["arstream2_client_control_port"] = Int(videoPort &+ 1)
+                }
                 do {
                     let data = try JSONSerialization.data(withJSONObject: body)
                     connection.send(content: data, completion: .contentProcessed { [weak self] error in
@@ -371,7 +525,17 @@ final class ARSDKCommandClient {
                 remote.sin_addr = ipv4
                 self.remoteAddress = remote
                 self.connectedHost = host
-                self.log("ARSDK connected through SC2 \(host) · command UDP \(port)")
+                self.log("ARSDK connected to \(self.connectionRoute.displayName) \(host) · command UDP \(port)")
+                if self.connectionRoute == .directBebop,
+                   let clientPort = self.requestedVideoStreamPort {
+                    let serverStream = object["arstream2_server_stream_port"] as? Int
+                    let serverControl = object["arstream2_server_control_port"] as? Int
+                    self.log(
+                        "ARStream2 direct client UDP \(clientPort)/\(clientPort &+ 1) · " +
+                        "drone UDP \(serverStream.map(String.init) ?? "not announced")/" +
+                        "\(serverControl.map(String.init) ?? "not announced")"
+                    )
+                }
                 self.finishConnection(.success(()))
                 return
             }
@@ -401,7 +565,41 @@ final class ARSDKCommandClient {
     }
 
     private func sendCommand(_ payload: Data) {
-        queue.async { [weak self] in self?.sendFrame(type: 4, id: 11, payload: payload) }
+        sendAcknowledgedCommand(payload)
+    }
+
+    private func sendAcknowledgedCommand(
+        _ payload: Data,
+        buffer: UInt8 = 11,
+        maximumRetries: Int? = 5
+    ) {
+        queue.async { [weak self] in
+            self?.sendAcknowledgedFrame(payload: payload, buffer: buffer, maximumRetries: maximumRetries)
+        }
+    }
+
+    private func sendAcknowledgedFrame(
+        payload: Data,
+        buffer: UInt8 = 11,
+        maximumRetries: Int? = 5
+    ) {
+        guard socketFD >= 0, var remoteAddress else { return }
+        let sequence = nextSequence(for: buffer)
+        let packet = ARSDKPhotoProtocol.frame(type: 4, id: buffer, sequence: sequence, payload: payload)
+        sendPacket(packet, to: &remoteAddress)
+        let key = acknowledgementKey(buffer: buffer, sequence: sequence)
+        pendingAcknowledgements[key] = PendingAcknowledgement(
+            buffer: buffer,
+            sequence: sequence,
+            packet: packet,
+            retries: 0,
+            maximumRetries: maximumRetries
+        )
+        scheduleRetry(key: key)
+    }
+
+    private func sendUnacknowledgedCommand(_ payload: Data) {
+        queue.async { [weak self] in self?.sendFrame(type: 2, id: 10, payload: payload) }
     }
 
     private func sendFrame(type: UInt8, id: UInt8, payload: Data) {
@@ -409,10 +607,6 @@ final class ARSDKCommandClient {
         let sequence = nextSequence(for: id)
         let packet = ARSDKPhotoProtocol.frame(type: type, id: id, sequence: sequence, payload: payload)
         sendPacket(packet, to: &remoteAddress)
-        if type == 4, id == 11 {
-            pendingAcknowledgements[sequence] = PendingAcknowledgement(packet: packet, retries: 0)
-            scheduleRetry(sequence: sequence)
-        }
     }
 
     private func sendPacket(_ packet: Data, to remoteAddress: inout sockaddr_in) {
@@ -425,20 +619,47 @@ final class ARSDKCommandClient {
         }
     }
 
-    private func scheduleRetry(sequence: UInt8) {
+    private func scheduleRetry(key: UInt16) {
         queue.asyncAfter(deadline: .now() + .milliseconds(150)) { [weak self] in
-            guard let self, var pending = self.pendingAcknowledgements[sequence],
+            guard let self, var pending = self.pendingAcknowledgements[key],
                   var remote = self.remoteAddress else { return }
-            guard pending.retries < 5 else {
-                self.pendingAcknowledgements.removeValue(forKey: sequence)
-                self.log("ARSDK command acknowledgement timed out")
+            if let maximumRetries = pending.maximumRetries, pending.retries >= maximumRetries {
+                self.pendingAcknowledgements.removeValue(forKey: key)
+                self.log("ARSDK buffer \(pending.buffer) command acknowledgement timed out")
                 return
             }
             pending.retries += 1
-            self.pendingAcknowledgements[sequence] = pending
+            self.pendingAcknowledgements[key] = pending
             self.sendPacket(pending.packet, to: &remote)
-            self.scheduleRetry(sequence: sequence)
+            self.scheduleRetry(key: key)
         }
+    }
+
+    private func acknowledgementKey(buffer: UInt8, sequence: UInt8) -> UInt16 {
+        UInt16(buffer) << 8 | UInt16(sequence)
+    }
+
+    private func sendPCMDLocked() {
+        guard remoteAddress != nil else { return }
+        pcmdSequence &+= 1
+        let milliseconds = UInt32((DispatchTime.now().uptimeNanoseconds / 1_000_000) & 0x00ff_ffff)
+        let timestampAndSequence = UInt32(pcmdSequence) << 24 | milliseconds
+        let payload = ARSDKPhotoCommand.pcmd(
+            flag: pilotingInput.flag,
+            roll: pilotingInput.roll,
+            pitch: pilotingInput.pitch,
+            yaw: pilotingInput.yaw,
+            gaz: pilotingInput.gaz,
+            timestampAndSequence: timestampAndSequence
+        )
+        sendFrame(type: 2, id: 10, payload: payload)
+    }
+
+    private func stopPilotingLocked() {
+        pilotingInput = .neutral
+        sendPCMDLocked()
+        pcmdTimer?.cancel()
+        pcmdTimer = nil
     }
 
     private func nextSequence(for id: UInt8) -> UInt8 {
@@ -470,8 +691,11 @@ final class ARSDKCommandClient {
                 UInt32(datagram[offset + 6]) << 24)
             guard size >= 7, offset + size <= datagram.count else { return }
             let payload = datagram.subdata(in: (offset + 7)..<(offset + size))
-            if type == 1, id == 139, let acknowledgedSequence = payload.first {
-                pendingAcknowledgements.removeValue(forKey: acknowledgedSequence)
+            if type == 1, (id == 139 || id == 140), let acknowledgedSequence = payload.first {
+                let sourceBuffer = id &- 128
+                pendingAcknowledgements.removeValue(
+                    forKey: acknowledgementKey(buffer: sourceBuffer, sequence: acknowledgedSequence)
+                )
             }
             if type == 4 {
                 sendFrame(type: 1, id: id &+ 128, payload: Data([sequence]))
@@ -489,6 +713,7 @@ final class ARSDKCommandClient {
     }
 
     private func stopLocked() {
+        stopPilotingLocked()
         discoveryTimeout?.cancel()
         discoveryTimeout = nil
         discoveryConnection?.cancel()
@@ -497,8 +722,10 @@ final class ARSDKCommandClient {
         connectingHost = nil
         remoteAddress = nil
         connectedHost = nil
+        requestedVideoStreamPort = nil
         sequenceByBuffer.removeAll()
         pendingAcknowledgements.removeAll()
+        pcmdSequence = 0
         if let source = readSource {
             source.cancel()
             readSource = nil
@@ -753,7 +980,24 @@ enum ARSDKPhotoCaptureSelfTest {
         appendLittleEndian(Double(21.7), to: &position)
         appendLittleEndian(Double(100), to: &position)
         position.append(contentsOf: [1, 1, 2])
-        return ARSDKTelemetryProtocol.decode(position) == .gpsPosition(latitude: 38.1, longitude: 21.7)
+        guard ARSDKTelemetryProtocol.decode(position) == .gpsPosition(latitude: 38.1, longitude: 21.7) else {
+            return false
+        }
+
+        var product = Data([4, 3, 1, 0])
+        product.append(contentsOf: [2, 0, 0, 0])
+        product.append(contentsOf: Data("BebopDrone\0".utf8))
+        product.append(contentsOf: [0x01, 0x09])
+        var version = Data([0, 3, 3, 0])
+        version.append(contentsOf: Data("4.0.6\0HW_01\0".utf8))
+        return ARSDKTelemetryProtocol.decode(product) == .aircraftConnection(
+            status: 2,
+            deviceName: "BebopDrone",
+            productID: 0x0901
+        ) && ARSDKTelemetryProtocol.decode(version) == .productVersion(
+            software: "4.0.6",
+            hardware: "HW_01"
+        )
     }
 
     private static func appendLittleEndian(_ value: Float, to data: inout Data) {
