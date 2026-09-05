@@ -1,10 +1,18 @@
 import Foundation
 import Network
 
+enum RestreamVideoCodec: String, Equatable {
+    case h264
+    case jpeg
+}
+
 struct RestreamDescriptor: Equatable {
     let requestPort: UInt16
     let videoAddress: String?
     let videoPort: UInt16?
+    let payloadType: UInt8?
+    let codec: RestreamVideoCodec?
+    let clockRate: Int?
     let response: String
 }
 
@@ -87,7 +95,8 @@ final class RestreamProbe {
                     tryNext(error)
                     return
                 }
-                if isComplete || response.range(of: Data("\r\n\r\n".utf8)) != nil {
+                let currentText = String(data: response, encoding: .utf8) ?? ""
+                if isComplete || currentText.range(of: #"m=video\s+\d+"#, options: .regularExpression) != nil {
                     let text = String(data: response, encoding: .utf8) ?? ""
                     guard text.contains("200") || text.contains("m=video") else {
                         let error = NSError(
@@ -98,12 +107,7 @@ final class RestreamProbe {
                         tryNext(error)
                         return
                     }
-                    let descriptor = RestreamDescriptor(
-                        requestPort: port,
-                        videoAddress: Self.firstCapture(#"c=IN IP4\s+([^\s\r\n]+)"#, in: text),
-                        videoPort: Self.firstCapture(#"m=video\s+(\d+)"#, in: text).flatMap(UInt16.init),
-                        response: text
-                    )
+                    let descriptor = Self.descriptor(from: text, requestPort: port)
                     self.debug("SC2 restream endpoint answered on port \(port)")
                     finish(.success(descriptor))
                     return
@@ -147,6 +151,44 @@ final class RestreamProbe {
               match.numberOfRanges > 1,
               let valueRange = Range(match.range(at: 1), in: text) else { return nil }
         return String(text[valueRange])
+    }
+
+    static func descriptor(from response: String, requestPort: UInt16) -> RestreamDescriptor {
+        let payload = firstCapture(#"m=video\s+\d+\s+RTP/AVP\s+(\d+)"#, in: response).flatMap(UInt8.init)
+        var codec: RestreamVideoCodec?
+        var clockRate: Int?
+        if let payload {
+            let pattern = #"a=rtpmap:\#(payload)\s+([^\s/]+)/([0-9]+)"#
+            if let expression = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]),
+               let match = expression.firstMatch(
+                in: response,
+                range: NSRange(response.startIndex..<response.endIndex, in: response)
+               ), match.numberOfRanges >= 3,
+               let codecRange = Range(match.range(at: 1), in: response),
+               let rateRange = Range(match.range(at: 2), in: response) {
+                switch response[codecRange].uppercased() {
+                case "H264": codec = .h264
+                case "JPEG", "MJPEG": codec = .jpeg
+                default: codec = nil
+                }
+                clockRate = Int(response[rateRange])
+            }
+            // RTP payload type 26 is the RFC 2435 static JPEG assignment and
+            // does not require an rtpmap attribute.
+            if payload == 26, codec == nil {
+                codec = .jpeg
+                clockRate = 90_000
+            }
+        }
+        return RestreamDescriptor(
+            requestPort: requestPort,
+            videoAddress: firstCapture(#"c=IN IP4\s+([^\s\r\n]+)"#, in: response),
+            videoPort: firstCapture(#"m=video\s+(\d+)"#, in: response).flatMap(UInt16.init),
+            payloadType: payload,
+            codec: codec,
+            clockRate: clockRate,
+            response: response
+        )
     }
 
     private func debug(_ message: String) {

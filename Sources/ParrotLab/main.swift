@@ -14,6 +14,14 @@ if let index = CommandLine.arguments.firstIndex(of: "--render-app-preview"),
     exit(PreviewRenderer.renderApplication(to: CommandLine.arguments[index + 1]) ? 0 : 1)
 }
 
+if let index = CommandLine.arguments.firstIndex(of: "--render-ground-preview"),
+   CommandLine.arguments.indices.contains(index + 1) {
+    exit(PreviewRenderer.renderApplication(
+        to: CommandLine.arguments[index + 1],
+        groundMode: true
+    ) ? 0 : 1)
+}
+
 let application = NSApplication.shared
 let delegate = AppDelegate()
 application.delegate = delegate
@@ -65,6 +73,21 @@ menu.addItem(editItem)
 
 let toolsItem = NSMenuItem(title: "Tools", action: nil, keyEquivalent: "")
 let toolsMenu = NSMenu(title: "Tools")
+let flatTrimItem = NSMenuItem(
+    title: "Bebop Flat Trim",
+    action: #selector(AppDelegate.performBebopFlatTrim(_:)),
+    keyEquivalent: ""
+)
+flatTrimItem.target = delegate
+toolsMenu.addItem(flatTrimItem)
+let magnetometerCalibrationItem = NSMenuItem(
+    title: "Start Bebop Magnetometer Calibration",
+    action: #selector(AppDelegate.toggleBebopMagnetometerCalibration(_:)),
+    keyEquivalent: ""
+)
+magnetometerCalibrationItem.target = delegate
+toolsMenu.addItem(magnetometerCalibrationItem)
+toolsMenu.addItem(NSMenuItem.separator())
 let installDragonItem = NSMenuItem(
     title: "Install/Update Dragon Lab on Bebop 2",
     action: #selector(AppDelegate.installDragonLabOnBebop2(_:)),
@@ -179,6 +202,15 @@ menu.addItem(metalFXItem)
 
 let videoItem = NSMenuItem(title: "Video", action: nil, keyEquivalent: "")
 let videoMenu = NSMenu(title: "Video")
+let sumoTemporalItem = NSMenuItem(
+    title: "Sumo · 720p + 30→45 FPS Optical Flow",
+    action: #selector(AppDelegate.toggleGroundTemporal720p45(_:)),
+    keyEquivalent: ""
+)
+sumoTemporalItem.target = delegate
+sumoTemporalItem.toolTip = "Image-only temporal cleanup, confidence/occlusion rejection and one generated frame per two real frames. Preserves aspect ratio; requires 30 FPS input for the 45 FPS target. Tune in Settings."
+videoMenu.addItem(sumoTemporalItem)
+videoMenu.addItem(.separator())
 let convertVideoItem = NSMenuItem(
     title: "Convert Finished H.264 to MP4…",
     action: #selector(AppDelegate.convertFinishedH264ToMP4(_:)),

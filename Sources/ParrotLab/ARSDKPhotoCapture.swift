@@ -42,8 +42,26 @@ enum ARSDKPhotoEvent: Equatable {
     case pictureEvent(ARSDKPictureEventKind, ARSDKPictureEventError)
 }
 
+enum ARSDKMagnetometerAxis: UInt32, Equatable {
+    case x = 0
+    case y = 1
+    case z = 2
+    case none = 3
+
+    var displayName: String {
+        switch self {
+        case .x: return "X axis"
+        case .y: return "Y axis"
+        case .z: return "Z axis"
+        case .none: return "complete"
+        }
+    }
+}
+
 enum ARSDKTelemetryEvent: Equatable {
     case droneBattery(Int)
+    case wifiSignal(Int)
+    case jumpingSumoLinkQuality(Int)
     case controllerBattery(Int)
     case controllerBatteryState(UInt32)
     case flyingState(UInt32)
@@ -56,9 +74,19 @@ enum ARSDKTelemetryEvent: Equatable {
     case satelliteCount(Int)
     case aircraftConnection(status: UInt32, deviceName: String, productID: UInt16)
     case productVersion(software: String, hardware: String)
+    case flatTrimChanged
+    case magnetometerCalibrationState(x: Bool, y: Bool, z: Bool, failed: Bool)
+    case magnetometerCalibrationRequired(Bool)
+    case magnetometerCalibrationAxis(ARSDKMagnetometerAxis)
+    case magnetometerCalibrationStarted(Bool)
 }
 
 enum ARSDKPhotoCommand {
+    enum JumpingSumoJumpType: UInt8 {
+        case long = 0
+        case high = 1
+    }
+
     // ARCommands payloads are project, class, command (little-endian), args.
     static let setFisheye = Data([1, 19, 0, 0, 3, 0, 0, 0])
     static let takePictureV2 = Data([1, 7, 2, 0])
@@ -68,6 +96,11 @@ enum ARSDKPhotoCommand {
     static let takeOff = Data([1, 0, 1, 0])
     static let landing = Data([1, 0, 3, 0])
     static let emergency = Data([1, 0, 4, 0])
+    static let flatTrim = Data([1, 0, 0, 0])
+
+    static func magnetometerCalibration(start: Bool) -> Data {
+        Data([0, 13, 0, 0, start ? 1 : 0])
+    }
 
     static func navigateHome(start: Bool) -> Data {
         Data([1, 0, 5, 0, start ? 1 : 0])
@@ -100,16 +133,33 @@ enum ARSDKPhotoCommand {
         })
         return result
     }
+
+    /// Jumping Sumo project 3, Piloting class 0, PCMD command 0.
+    /// The installed Sumo firmware's libarcommands generator defines the wire
+    /// arguments as flag, signed speed and signed turn.
+    static func jumpingSumoPCMD(flag: Bool, speed: Int8, turn: Int8) -> Data {
+        Data([3, 0, 0, 0, flag ? 1 : 0, UInt8(bitPattern: speed), UInt8(bitPattern: turn)])
+    }
+
+    /// JumpingSumo.Animations.Jump (project 3, class 2, command 3).
+    static func jumpingSumoJump(_ type: JumpingSumoJumpType) -> Data {
+        Data([3, 2, 3, 0, type.rawValue])
+    }
+
+    /// Jumping Sumo project 3, MediaStreaming class 18, VideoEnable command 0.
+    static func jumpingSumoVideoEnable(_ enabled: Bool) -> Data {
+        Data([3, 18, 0, 0, enabled ? 1 : 0])
+    }
 }
 
 enum ARSDKConnectionRoute: Equatable {
     case skyController
-    case directBebop
+    case directProduct
 
     var displayName: String {
         switch self {
         case .skyController: return "SkyController 2"
-        case .directBebop: return "Bebop direct"
+        case .directProduct: return "Parrot product direct"
         }
     }
 }
@@ -122,6 +172,25 @@ struct BebopPilotingInput: Equatable {
 
     var flag: Bool { roll != 0 || pitch != 0 }
     static let neutral = BebopPilotingInput()
+}
+
+struct JumpingSumoPilotingInput: Equatable {
+    let speed: Int8
+    let turn: Int8
+
+    var flag: Bool { speed != 0 || turn != 0 }
+
+    init(speed: Int8, turn: Int8) {
+        self.speed = speed
+        self.turn = turn
+    }
+
+    init(sharedInput: BebopPilotingInput) {
+        // The existing right-stick / WASD mapping is forward/turn in ground
+        // mode. Left-stick yaw/gaz deliberately has no effect on a car.
+        speed = sharedInput.pitch
+        turn = sharedInput.roll
+    }
 }
 
 enum ARSDKPhotoProtocol {
@@ -161,12 +230,314 @@ enum ARSDKPhotoProtocol {
         return result
     }
 
+    static func nextSequence(after previous: UInt8?) -> UInt8 {
+        (previous ?? 0) &+ 1
+    }
+
     private static func uint32(_ data: Data, at offset: Int) -> UInt32? {
         guard data.count >= offset + 4 else { return nil }
         return UInt32(data[offset]) |
             UInt32(data[offset + 1]) << 8 |
             UInt32(data[offset + 2]) << 16 |
             UInt32(data[offset + 3]) << 24
+    }
+}
+
+enum ARSDKDiscoveryProtocol {
+    static func responseObject(from data: Data) -> [String: Any]? {
+        guard let incoming = String(data: data, encoding: .utf8) else { return nil }
+        let trimmed = incoming.trimmingCharacters(in: CharacterSet(charactersIn: "\0"))
+        guard let json = trimmed.data(using: .utf8) else { return nil }
+        return try? JSONSerialization.jsonObject(with: json) as? [String: Any]
+    }
+
+    static func arstream1Negotiation(from object: [String: Any]) -> ARStream1Negotiation {
+        ARStream1Negotiation(
+            fragmentSize: integer(object["arstream_fragment_size"]),
+            fragmentMaximumNumber: integer(object["arstream_fragment_maximum_number"]),
+            maximumAcknowledgementInterval: integer(object["arstream_max_ack_interval"])
+        )
+    }
+
+    private static func integer(_ value: Any?) -> Int? {
+        if let value = value as? Int { return value }
+        if let value = value as? NSNumber { return value.intValue }
+        if let value = value as? String { return Int(value) }
+        return nil
+    }
+}
+
+struct ARStream1Negotiation: Equatable {
+    let fragmentSize: Int?
+    let fragmentMaximumNumber: Int?
+    let maximumAcknowledgementInterval: Int?
+
+    var sendsVideoAcknowledgements: Bool {
+        maximumAcknowledgementInterval != -1
+    }
+}
+
+struct ARStream1VideoFragmentResult {
+    let acknowledgement: Data
+    let frame: ARStream1CompletedFrame?
+}
+
+struct ARStream1CompletedFrame: Equatable {
+    let frameNumber: UInt64
+    let payload: Data
+}
+
+struct ARStream1AssemblyStatistics: Equatable {
+    let receivedFragments: UInt64
+    let completedFrames: UInt64
+    let incompleteFrames: UInt64
+    let missingFragments: UInt64
+    let lastFrameNumber: UInt64?
+    let lastAssembledBytes: Int?
+}
+
+struct ARStream1VideoDiagnostics: Equatable {
+    let fragmentReceiveRate: Double
+    let assembledFrameRate: Double
+    let assembly: ARStream1AssemblyStatistics
+    let negotiation: ARStream1Negotiation
+}
+
+/// Reassembles the legacy ARStream 1 video carried inside ARNetwork buffer 125.
+/// The transport is codec-neutral: BB1 completes Annex-B H.264 frames while
+/// Jumping Sumo completes JPEG payloads through the same fragment/ACK protocol.
+struct ARStream1VideoAssembler {
+    private static let dataHeaderSize = 5
+    private static let maximumFragments = 128
+    private static let maximumPendingFrames = 4
+
+    private struct PendingFrame {
+        let fragmentCount: Int
+        var fragments: [Data?]
+        var highAcknowledgementMask: UInt64
+        var lowAcknowledgementMask: UInt64
+        var receivedCount = 0
+
+        init(fragmentCount: Int) {
+            self.fragmentCount = fragmentCount
+            fragments = [Data?](repeating: nil, count: fragmentCount)
+            if fragmentCount < 64 {
+                lowAcknowledgementMask = UInt64.max << UInt64(fragmentCount)
+                highAcknowledgementMask = UInt64.max
+            } else if fragmentCount == 64 {
+                lowAcknowledgementMask = 0
+                highAcknowledgementMask = UInt64.max
+            } else if fragmentCount < ARStream1VideoAssembler.maximumFragments {
+                lowAcknowledgementMask = 0
+                highAcknowledgementMask = UInt64.max << UInt64(fragmentCount - 64)
+            } else {
+                lowAcknowledgementMask = 0
+                highAcknowledgementMask = 0
+            }
+        }
+
+        mutating func insert(_ payload: Data, fragmentNumber: Int) {
+            guard fragments[fragmentNumber] == nil else { return }
+            fragments[fragmentNumber] = payload
+            receivedCount += 1
+            if fragmentNumber < 64 {
+                lowAcknowledgementMask |= UInt64(1) << UInt64(fragmentNumber)
+            } else {
+                highAcknowledgementMask |= UInt64(1) << UInt64(fragmentNumber - 64)
+            }
+        }
+
+        var isComplete: Bool { receivedCount == fragmentCount }
+
+        var payload: Data {
+            var result = Data()
+            result.reserveCapacity(fragments.reduce(0) { $0 + ($1?.count ?? 0) })
+            for fragment in fragments {
+                if let fragment { result.append(fragment) }
+            }
+            return result
+        }
+    }
+
+    private var pendingFrames: [UInt16: PendingFrame] = [:]
+    private var pendingOrder: [UInt16] = []
+    private var lastDeliveredFrameNumber: UInt64?
+    private var negotiatedFragmentSize: Int?
+    private var negotiatedMaximumFragments = Self.maximumFragments
+    private var receivedFragmentCount: UInt64 = 0
+    private var completedFrameCount: UInt64 = 0
+    private var incompleteFrameCount: UInt64 = 0
+    private var missingFragmentCount: UInt64 = 0
+    private var lastCompletedFrameNumber: UInt64?
+    private var lastCompletedFrameBytes: Int?
+
+    mutating func configure(fragmentSize: Int?, maximumFragments: Int?) {
+        negotiatedFragmentSize = fragmentSize.flatMap { $0 > 0 ? $0 : nil }
+        negotiatedMaximumFragments = min(
+            Self.maximumFragments,
+            max(1, maximumFragments ?? Self.maximumFragments)
+        )
+        reset()
+    }
+
+    mutating func reset() {
+        pendingFrames.removeAll(keepingCapacity: false)
+        pendingOrder.removeAll(keepingCapacity: false)
+        lastDeliveredFrameNumber = nil
+        receivedFragmentCount = 0
+        completedFrameCount = 0
+        incompleteFrameCount = 0
+        missingFragmentCount = 0
+        lastCompletedFrameNumber = nil
+        lastCompletedFrameBytes = nil
+    }
+
+    var statistics: ARStream1AssemblyStatistics {
+        ARStream1AssemblyStatistics(
+            receivedFragments: receivedFragmentCount,
+            completedFrames: completedFrameCount,
+            incompleteFrames: incompleteFrameCount,
+            missingFragments: missingFragmentCount,
+            lastFrameNumber: lastCompletedFrameNumber,
+            lastAssembledBytes: lastCompletedFrameBytes
+        )
+    }
+
+    mutating func consume(_ payload: Data) -> ARStream1VideoFragmentResult? {
+        guard payload.count >= Self.dataHeaderSize else { return nil }
+        let incomingFrameNumber = UInt16(payload[0]) | UInt16(payload[1]) << 8
+        let fragmentNumber = Int(payload[3])
+        let fragmentCount = Int(payload[4])
+        let fragmentPayloadSize = payload.count - Self.dataHeaderSize
+        guard (1...negotiatedMaximumFragments).contains(fragmentCount),
+              fragmentNumber < fragmentCount,
+              negotiatedFragmentSize.map({ fragmentPayloadSize <= $0 }) ?? true else { return nil }
+        receivedFragmentCount &+= 1
+
+        var pending: PendingFrame
+        if let existing = pendingFrames[incomingFrameNumber],
+           existing.fragmentCount == fragmentCount {
+            pending = existing
+        } else {
+            if let existing = pendingFrames[incomingFrameNumber] {
+                recordIncomplete(existing)
+            }
+            pending = PendingFrame(fragmentCount: fragmentCount)
+            pendingOrder.removeAll { $0 == incomingFrameNumber }
+            pendingOrder.append(incomingFrameNumber)
+        }
+        pending.insert(
+            Data(payload.dropFirst(Self.dataHeaderSize)),
+            fragmentNumber: fragmentNumber
+        )
+        pendingFrames[incomingFrameNumber] = pending
+        prunePendingFrames()
+
+        let acknowledgement = makeAcknowledgement(
+            frameNumber: incomingFrameNumber,
+            highMask: pending.highAcknowledgementMask,
+            lowMask: pending.lowAcknowledgementMask
+        )
+        guard pending.isComplete else {
+            return ARStream1VideoFragmentResult(acknowledgement: acknowledgement, frame: nil)
+        }
+
+        let extended = extendedFrameNumber(for: incomingFrameNumber)
+        guard lastDeliveredFrameNumber.map({ extended > $0 }) ?? true else {
+            return ARStream1VideoFragmentResult(acknowledgement: acknowledgement, frame: nil)
+        }
+        lastDeliveredFrameNumber = extended
+        let completedPayload = pending.payload
+        pendingFrames.removeValue(forKey: incomingFrameNumber)
+        pendingOrder.removeAll { $0 == incomingFrameNumber }
+        completedFrameCount &+= 1
+        lastCompletedFrameNumber = extended
+        lastCompletedFrameBytes = completedPayload.count
+        return ARStream1VideoFragmentResult(
+            acknowledgement: acknowledgement,
+            frame: ARStream1CompletedFrame(
+                frameNumber: extended,
+                payload: completedPayload
+            )
+        )
+    }
+
+    private mutating func prunePendingFrames() {
+        while pendingOrder.count > Self.maximumPendingFrames {
+            if let discarded = pendingFrames.removeValue(forKey: pendingOrder.removeFirst()) {
+                recordIncomplete(discarded)
+            }
+        }
+    }
+
+    private mutating func recordIncomplete(_ frame: PendingFrame) {
+        guard !frame.isComplete else { return }
+        incompleteFrameCount &+= 1
+        missingFragmentCount &+= UInt64(max(0, frame.fragmentCount - frame.receivedCount))
+    }
+
+    private func extendedFrameNumber(for rawValue: UInt16) -> UInt64 {
+        guard let lastDeliveredFrameNumber else { return UInt64(rawValue) }
+        let wrap = UInt64(UInt16.max) + 1
+        let halfWrap = wrap / 2
+        let base = lastDeliveredFrameNumber & ~(wrap - 1)
+        var candidate = base | UInt64(rawValue)
+        if candidate + halfWrap < lastDeliveredFrameNumber {
+            candidate += wrap
+        } else if candidate > lastDeliveredFrameNumber + halfWrap, candidate >= wrap {
+            candidate -= wrap
+        }
+        return candidate
+    }
+
+    private func makeAcknowledgement(frameNumber: UInt16, highMask: UInt64, lowMask: UInt64) -> Data {
+        var result = Data()
+        Self.appendLittleEndian(frameNumber, to: &result)
+        Self.appendLittleEndian(highMask, to: &result)
+        Self.appendLittleEndian(lowMask, to: &result)
+        return result
+    }
+
+    private static func appendLittleEndian<T: FixedWidthInteger>(_ value: T, to data: inout Data) {
+        var littleEndian = value.littleEndian
+        withUnsafeBytes(of: &littleEndian) { data.append(contentsOf: $0) }
+    }
+
+    static func splitAnnexB(_ data: Data) -> [Data] {
+        let bytes = [UInt8](data)
+        var startCodes: [(offset: Int, length: Int)] = []
+        var index = 0
+        while index + 3 <= bytes.count {
+            if index + 4 <= bytes.count,
+               bytes[index] == 0, bytes[index + 1] == 0,
+               bytes[index + 2] == 0, bytes[index + 3] == 1 {
+                startCodes.append((index, 4))
+                index += 4
+            } else if bytes[index] == 0, bytes[index + 1] == 0, bytes[index + 2] == 1 {
+                startCodes.append((index, 3))
+                index += 3
+            } else {
+                index += 1
+            }
+        }
+
+        var nalUnits: [Data] = []
+        for (position, startCode) in startCodes.enumerated() {
+            let start = startCode.offset + startCode.length
+            var end = position + 1 < startCodes.count ? startCodes[position + 1].offset : bytes.count
+            while end > start, bytes[end - 1] == 0 { end -= 1 }
+            if end > start { nalUnits.append(data.subdata(in: start..<end)) }
+        }
+        return nalUnits
+    }
+
+    static func jpegPayload(in data: Data) -> Data? {
+        guard data.count >= 4,
+              data[data.startIndex] == 0xff,
+              data[data.startIndex + 1] == 0xd8,
+              data[data.endIndex - 2] == 0xff,
+              data[data.endIndex - 1] == 0xd9 else { return nil }
+        return data
     }
 }
 
@@ -179,6 +550,35 @@ enum ARSDKTelemetryProtocol {
 
         if project == 0, commandClass == 5, command == 1, data.count >= 5 {
             return .droneBattery(Int(data[4]))
+        }
+        if project == 0, commandClass == 5, command == 7,
+           let rawRSSI = int16(data, at: 4) {
+            return .wifiSignal(Int(rawRSSI))
+        }
+        if project == 3, commandClass == 11, command == 4, data.count >= 5 {
+            return .jumpingSumoLinkQuality(Int(data[4]))
+        }
+        if project == 1, commandClass == 4, command == 0 {
+            return .flatTrimChanged
+        }
+        if project == 0, commandClass == 14, command == 0, data.count >= 8 {
+            return .magnetometerCalibrationState(
+                x: data[4] != 0,
+                y: data[5] != 0,
+                z: data[6] != 0,
+                failed: data[7] != 0
+            )
+        }
+        if project == 0, commandClass == 14, command == 1, data.count >= 5 {
+            return .magnetometerCalibrationRequired(data[4] != 0)
+        }
+        if project == 0, commandClass == 14, command == 2,
+           let rawAxis = uint32(data, at: 4),
+           let axis = ARSDKMagnetometerAxis(rawValue: rawAxis) {
+            return .magnetometerCalibrationAxis(axis)
+        }
+        if project == 0, commandClass == 14, command == 3, data.count >= 5 {
+            return .magnetometerCalibrationStarted(data[4] != 0)
         }
         if project == 4, commandClass == 8, command == 0, data.count >= 5 {
             return .controllerBattery(Int(data[4]))
@@ -241,6 +641,10 @@ enum ARSDKTelemetryProtocol {
         return UInt16(data[offset]) | UInt16(data[offset + 1]) << 8
     }
 
+    private static func int16(_ data: Data, at offset: Int) -> Int16? {
+        uint16(data, at: offset).map { Int16(bitPattern: $0) }
+    }
+
     private static func cString(_ data: Data, at offset: Int) -> (value: String, nextOffset: Int)? {
         guard offset < data.count,
               let end = data[offset...].firstIndex(of: 0) else { return nil }
@@ -296,9 +700,16 @@ enum ARSDKPhotoConnectionError: LocalizedError {
 final class ARSDKCommandClient {
     var onEvent: ((ARSDKPhotoEvent) -> Void)?
     var onTelemetryEvent: ((ARSDKTelemetryEvent) -> Void)?
+    var onVideoAccessUnit: ((H264AccessUnit) -> Void)?
+    var onMJPEGFrame: ((Data, UInt64) -> Void)?
+    var onARStream1Diagnostics: ((ARStream1VideoDiagnostics) -> Void)?
     var onLog: ((String) -> Void)?
 
     private let queue = DispatchQueue(label: "parrotlab.arsdk.command", qos: .userInitiated)
+    private let videoAssemblyQueue = DispatchQueue(
+        label: "parrotlab.arsdk.arstream1",
+        qos: .userInteractive
+    )
     private var socketFD: Int32 = -1
     private var readSource: DispatchSourceRead?
     private var discoveryConnection: NWConnection?
@@ -321,6 +732,28 @@ final class ARSDKCommandClient {
     private var pcmdTimer: DispatchSourceTimer?
     private var pilotingInput = BebopPilotingInput.neutral
     private var pcmdSequence: UInt8 = 0
+    private var productModel = ParrotProductModel.unknown
+    private var arstream1VideoAssembler = ARStream1VideoAssembler()
+    private var arstream1Negotiation = ARStream1Negotiation(
+        fragmentSize: nil,
+        fragmentMaximumNumber: nil,
+        maximumAcknowledgementInterval: nil
+    )
+    private var videoAssemblyGeneration: UInt64 = 0
+    private var activeVideoAssemblyGeneration: UInt64 = 0
+    private var diagnosticWindowStartedNanoseconds: UInt64 = 0
+    private var diagnosticWindowReceivedFragments: UInt64 = 0
+    private var diagnosticWindowCompletedFrames: UInt64 = 0
+    private var lastVideoDiagnosticLogNanoseconds: UInt64 = 0
+    private var lastInvalidJPEGLog: UInt64 = 0
+
+    func setProductModel(_ model: ParrotProductModel) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            if self.productModel != model { self.resetVideoAssemblyLocked() }
+            self.productModel = model
+        }
+    }
 
     func connect(
         host: String,
@@ -352,24 +785,57 @@ final class ARSDKCommandClient {
         }
     }
 
-    func sendSetFisheye() { sendCommand(ARSDKPhotoCommand.setFisheye) }
-    func sendTakePictureV2() { sendCommand(ARSDKPhotoCommand.takePictureV2) }
+    func sendSetFisheye() {
+        guard productModel.capabilities.supportsSharedARDrone3Commands else { return }
+        sendCommand(ARSDKPhotoCommand.setFisheye)
+    }
+    func sendTakePictureV2() {
+        guard productModel.capabilities.supportsSharedARDrone3Commands else { return }
+        sendCommand(ARSDKPhotoCommand.takePictureV2)
+    }
     func sendRequestAllStates() { sendCommand(ARSDKPhotoCommand.requestAllStates) }
     func sendRequestSkyControllerAllStates() {
         sendCommand(ARSDKPhotoCommand.requestSkyControllerAllStates)
     }
     func sendRequestAllSettings() { sendCommand(ARSDKPhotoCommand.requestAllSettings) }
-    func sendVideoEnable(_ enabled: Bool) { sendCommand(ARSDKPhotoCommand.videoEnable(enabled)) }
-    func sendTakeOff() { sendAcknowledgedCommand(ARSDKPhotoCommand.takeOff) }
-    func sendLanding() { sendAcknowledgedCommand(ARSDKPhotoCommand.landing) }
-    func sendEmergency() { sendAcknowledgedCommand(ARSDKPhotoCommand.emergency, buffer: 12, maximumRetries: nil) }
+    func sendVideoEnable(_ enabled: Bool) {
+        let payload = productModel.capabilities.supportsJumpingSumoCommands
+            ? ARSDKPhotoCommand.jumpingSumoVideoEnable(enabled)
+            : ARSDKPhotoCommand.videoEnable(enabled)
+        sendCommand(payload)
+    }
+    func sendJumpingSumoHighJump() {
+        guard productModel.capabilities.supportsJumpingSumoCommands else { return }
+        sendAcknowledgedCommand(ARSDKPhotoCommand.jumpingSumoJump(.high))
+    }
+    func sendTakeOff() {
+        guard productModel.capabilities.supportsSharedARDrone3Commands else { return }
+        sendAcknowledgedCommand(ARSDKPhotoCommand.takeOff)
+    }
+    func sendFlatTrim() {
+        guard productModel.capabilities.supportsBebopCalibration else { return }
+        sendAcknowledgedCommand(ARSDKPhotoCommand.flatTrim)
+    }
+    func sendMagnetometerCalibration(start: Bool) {
+        guard productModel.capabilities.supportsBebopCalibration else { return }
+        sendAcknowledgedCommand(ARSDKPhotoCommand.magnetometerCalibration(start: start))
+    }
+    func sendLanding() {
+        guard productModel.capabilities.supportsSharedARDrone3Commands else { return }
+        sendAcknowledgedCommand(ARSDKPhotoCommand.landing)
+    }
+    func sendEmergency() {
+        guard productModel.capabilities.supportsSharedARDrone3Commands else { return }
+        sendAcknowledgedCommand(ARSDKPhotoCommand.emergency, buffer: 12, maximumRetries: nil)
+    }
     func sendCameraOrientation(tilt: Int8, pan: Int8) {
+        guard productModel.capabilities.supportsSharedARDrone3Commands else { return }
         sendUnacknowledgedCommand(ARSDKPhotoCommand.cameraOrientation(tilt: tilt, pan: pan))
     }
 
     func sendNavigateHome(start: Bool) {
         queue.async { [weak self] in
-            guard let self else { return }
+            guard let self, self.productModel.capabilities.supportsSharedARDrone3Commands else { return }
             self.pilotingInput = .neutral
             self.sendPCMDLocked()
             self.queue.asyncAfter(deadline: .now() + .milliseconds(55)) { [weak self] in
@@ -413,6 +879,29 @@ final class ARSDKCommandClient {
         let fd = Darwin.socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
         guard fd >= 0 else { throw ARSDKPhotoConnectionError.socket(String(cString: strerror(errno))) }
         socketFD = fd
+
+        // ARStream1 can burst up to 128 fragments for one MJPEG image. Give
+        // the kernel enough room to absorb that burst while the command queue
+        // dispatches assembly work separately. macOS may clamp the request.
+        var requestedReceiveBytes: Int32 = 4 * 1_024 * 1_024
+        var receiveBufferResult = withUnsafePointer(to: &requestedReceiveBytes) {
+            setsockopt(
+                fd, SOL_SOCKET, SO_RCVBUF, $0,
+                socklen_t(MemoryLayout<Int32>.size)
+            )
+        }
+        if receiveBufferResult != 0 {
+            requestedReceiveBytes = 1_024 * 1_024
+            receiveBufferResult = withUnsafePointer(to: &requestedReceiveBytes) {
+                setsockopt(
+                    fd, SOL_SOCKET, SO_RCVBUF, $0,
+                    socklen_t(MemoryLayout<Int32>.size)
+                )
+            }
+        }
+        if receiveBufferResult != 0 {
+            log("ARSDK UDP receive-buffer enlargement was not supported; using the system default")
+        }
 
         var address = sockaddr_in()
         address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
@@ -470,7 +959,7 @@ final class ARSDKCommandClient {
                     "d2c_port": Int(localPort),
                     "qos_mode": 0
                 ]
-                if self.connectionRoute == .directBebop,
+                if self.connectionRoute == .directProduct,
                    let videoPort = self.requestedVideoStreamPort {
                     body["arstream2_client_stream_port"] = Int(videoPort)
                     body["arstream2_client_control_port"] = Int(videoPort &+ 1)
@@ -507,7 +996,7 @@ final class ARSDKCommandClient {
             guard let self else { return }
             var combined = accumulated
             if let data { combined.append(data) }
-            if let object = try? JSONSerialization.jsonObject(with: combined) as? [String: Any] {
+            if let object = ARSDKDiscoveryProtocol.responseObject(from: combined) {
                 let status = object["status"] as? Int ?? 0
                 guard status == 0 else {
                     self.finishConnection(.failure(ARSDKPhotoConnectionError.connectionRejected(status)))
@@ -526,7 +1015,25 @@ final class ARSDKCommandClient {
                 self.remoteAddress = remote
                 self.connectedHost = host
                 self.log("ARSDK connected to \(self.connectionRoute.displayName) \(host) · command UDP \(port)")
-                if self.connectionRoute == .directBebop,
+                // Buffer 125 belongs to a directly connected legacy product.
+                // An SC2 session may report that its downstream product is a
+                // Sumo, but its video still arrives through the SC2 /video
+                // restream and must never alter this transport route.
+                if self.connectionRoute == .directProduct,
+                   self.productModel.capabilities.usesARStream1Video {
+                    let negotiation = ARSDKDiscoveryProtocol.arstream1Negotiation(from: object)
+                    self.arstream1Negotiation = negotiation
+                    self.resetVideoAssemblyLocked(negotiation: negotiation)
+                    let fragmentSize = negotiation.fragmentSize.map(String.init) ?? "unspecified"
+                    let maximumFragments = negotiation.fragmentMaximumNumber.map(String.init) ?? "unspecified"
+                    let acknowledgement = negotiation.sendsVideoAcknowledgements
+                        ? "enabled (interval \(negotiation.maximumAcknowledgementInterval.map(String.init) ?? "unspecified"))"
+                        : "disabled (-1)"
+                    self.log(
+                        "ARStream1 negotiated · fragment \(fragmentSize) bytes · max \(maximumFragments) · video ACK \(acknowledgement)"
+                    )
+                }
+                if self.connectionRoute == .directProduct,
                    let clientPort = self.requestedVideoStreamPort {
                     let serverStream = object["arstream2_server_stream_port"] as? Int
                     let serverControl = object["arstream2_server_control_port"] as? Int
@@ -641,6 +1148,20 @@ final class ARSDKCommandClient {
 
     private func sendPCMDLocked() {
         guard remoteAddress != nil else { return }
+        if productModel.capabilities.supportsJumpingSumoCommands {
+            let drive = JumpingSumoPilotingInput(sharedInput: pilotingInput)
+            sendFrame(
+                type: 2,
+                id: 10,
+                payload: ARSDKPhotoCommand.jumpingSumoPCMD(
+                    flag: drive.flag,
+                    speed: drive.speed,
+                    turn: drive.turn
+                )
+            )
+            return
+        }
+        guard productModel.capabilities.supportsSharedARDrone3Commands else { return }
         pcmdSequence &+= 1
         let milliseconds = UInt32((DispatchTime.now().uptimeNanoseconds / 1_000_000) & 0x00ff_ffff)
         let timestampAndSequence = UInt32(pcmdSequence) << 24 | milliseconds
@@ -663,7 +1184,7 @@ final class ARSDKCommandClient {
     }
 
     private func nextSequence(for id: UInt8) -> UInt8 {
-        let next = (sequenceByBuffer[id] ?? 255) &+ 1
+        let next = ARSDKPhotoProtocol.nextSequence(after: sequenceByBuffer[id])
         sequenceByBuffer[id] = next
         return next
     }
@@ -691,24 +1212,146 @@ final class ARSDKCommandClient {
                 UInt32(datagram[offset + 6]) << 24)
             guard size >= 7, offset + size <= datagram.count else { return }
             let payload = datagram.subdata(in: (offset + 7)..<(offset + size))
+
+            // Command reliability always takes precedence over video work.
+            // ARStream payloads are handed to a separate serial worker below.
             if type == 1, (id == 139 || id == 140), let acknowledgedSequence = payload.first {
                 let sourceBuffer = id &- 128
                 pendingAcknowledgements.removeValue(
                     forKey: acknowledgementKey(buffer: sourceBuffer, sequence: acknowledgedSequence)
                 )
+                offset += size
+                continue
             }
             if type == 4 {
                 sendFrame(type: 1, id: id &+ 128, payload: Data([sequence]))
             }
             if type == 2, id == 0 {
                 sendFrame(type: 2, id: 1, payload: payload)
-            } else if (id == 126 || id == 127), let event = ARSDKPhotoProtocol.decode(payload) {
+            }
+
+            if connectionRoute == .directProduct,
+               productModel.capabilities.usesARStream1Video, id == 125 {
+                enqueueARStream1PayloadLocked(payload)
+                offset += size
+                continue
+            }
+
+            if (id == 126 || id == 127), let event = ARSDKPhotoProtocol.decode(payload) {
                 DispatchQueue.main.async { [weak self] in self?.onEvent?(event) }
             }
             if id == 126 || id == 127, let telemetry = ARSDKTelemetryProtocol.decode(payload) {
+                if case .aircraftConnection(let status, _, let productID) = telemetry, status == 2 {
+                    let detectedModel = ParrotProductModel(productID: productID)
+                    if productModel != detectedModel { resetVideoAssemblyLocked() }
+                    productModel = detectedModel
+                }
                 DispatchQueue.main.async { [weak self] in self?.onTelemetryEvent?(telemetry) }
             }
             offset += size
+        }
+    }
+
+    private func enqueueARStream1PayloadLocked(_ payload: Data) {
+        let generation = videoAssemblyGeneration
+        let codec = productModel.capabilities.videoCodec
+        let negotiation = arstream1Negotiation
+        videoAssemblyQueue.async { [weak self] in
+            guard let self, self.activeVideoAssemblyGeneration == generation else { return }
+            self.diagnosticWindowReceivedFragments &+= 1
+            if let result = self.arstream1VideoAssembler.consume(payload) {
+                if negotiation.sendsVideoAcknowledgements {
+                    self.queue.async { [weak self] in
+                        guard let self, self.videoAssemblyGeneration == generation else { return }
+                        self.sendFrame(type: 2, id: 13, payload: result.acknowledgement)
+                    }
+                }
+                if let frame = result.frame {
+                    self.diagnosticWindowCompletedFrames &+= 1
+                    self.deliverARStream1Frame(frame, codec: codec)
+                }
+            }
+            self.publishARStream1DiagnosticsIfNeeded(negotiation: negotiation)
+        }
+    }
+
+    private func resetVideoAssemblyLocked(negotiation: ARStream1Negotiation? = nil) {
+        videoAssemblyGeneration &+= 1
+        let generation = videoAssemblyGeneration
+        let applied = negotiation ?? arstream1Negotiation
+        videoAssemblyQueue.async { [weak self] in
+            guard let self else { return }
+            self.activeVideoAssemblyGeneration = generation
+            self.arstream1VideoAssembler.configure(
+                fragmentSize: applied.fragmentSize,
+                maximumFragments: applied.fragmentMaximumNumber
+            )
+            self.diagnosticWindowStartedNanoseconds = DispatchTime.now().uptimeNanoseconds
+            self.diagnosticWindowReceivedFragments = 0
+            self.diagnosticWindowCompletedFrames = 0
+            self.lastVideoDiagnosticLogNanoseconds = 0
+            self.lastInvalidJPEGLog = 0
+        }
+    }
+
+    private func publishARStream1DiagnosticsIfNeeded(negotiation: ARStream1Negotiation) {
+        let now = DispatchTime.now().uptimeNanoseconds
+        if diagnosticWindowStartedNanoseconds == 0 {
+            diagnosticWindowStartedNanoseconds = now
+            return
+        }
+        let elapsedNanoseconds = now &- diagnosticWindowStartedNanoseconds
+        guard elapsedNanoseconds >= 1_000_000_000 else { return }
+        let elapsed = Double(elapsedNanoseconds) / 1_000_000_000
+        let diagnostics = ARStream1VideoDiagnostics(
+            fragmentReceiveRate: Double(diagnosticWindowReceivedFragments) / elapsed,
+            assembledFrameRate: Double(diagnosticWindowCompletedFrames) / elapsed,
+            assembly: arstream1VideoAssembler.statistics,
+            negotiation: negotiation
+        )
+        diagnosticWindowStartedNanoseconds = now
+        diagnosticWindowReceivedFragments = 0
+        diagnosticWindowCompletedFrames = 0
+        DispatchQueue.main.async { [weak self] in self?.onARStream1Diagnostics?(diagnostics) }
+
+        if now &- lastVideoDiagnosticLogNanoseconds >= 5_000_000_000 {
+            lastVideoDiagnosticLogNanoseconds = now
+            let stats = diagnostics.assembly
+            log(
+                String(
+                    format: "ARStream1 RX %.1f frag/s · assembled %.1f fps · frame %@ · JPEG %@ bytes · incomplete %llu · missing %llu",
+                    diagnostics.fragmentReceiveRate,
+                    diagnostics.assembledFrameRate,
+                    stats.lastFrameNumber.map(String.init) ?? "—",
+                    stats.lastAssembledBytes.map(String.init) ?? "—",
+                    stats.incompleteFrames,
+                    stats.missingFragments
+                )
+            )
+        }
+    }
+
+    private func deliverARStream1Frame(_ frame: ARStream1CompletedFrame, codec: ParrotVideoCodec) {
+        switch codec {
+        case .h264:
+            let nalUnits = ARStream1VideoAssembler.splitAnnexB(frame.payload)
+            guard !nalUnits.isEmpty else { return }
+            let accessUnit = H264AccessUnit(
+                nalUnits: nalUnits,
+                rtpTimestamp: UInt32(truncatingIfNeeded: frame.frameNumber &* 3_000),
+                rtpHeaderExtensions: []
+            )
+            DispatchQueue.main.async { [weak self] in self?.onVideoAccessUnit?(accessUnit) }
+        case .mjpeg:
+            guard let jpeg = ARStream1VideoAssembler.jpegPayload(in: frame.payload) else {
+                let now = DispatchTime.now().uptimeNanoseconds
+                if now &- lastInvalidJPEGLog >= 2_000_000_000 {
+                    lastInvalidJPEGLog = now
+                    log("Jumping Sumo ARStream 1 dropped an invalid JPEG (missing SOI/EOI boundary)")
+                }
+                return
+            }
+            DispatchQueue.main.async { [weak self] in self?.onMJPEGFrame?(jpeg, frame.frameNumber) }
         }
     }
 
@@ -726,6 +1369,12 @@ final class ARSDKCommandClient {
         sequenceByBuffer.removeAll()
         pendingAcknowledgements.removeAll()
         pcmdSequence = 0
+        arstream1Negotiation = ARStream1Negotiation(
+            fragmentSize: nil,
+            fragmentMaximumNumber: nil,
+            maximumAcknowledgementInterval: nil
+        )
+        resetVideoAssemblyLocked(negotiation: arstream1Negotiation)
         if let source = readSource {
             source.cancel()
             readSource = nil
@@ -930,7 +1579,10 @@ enum ARSDKPhotoCaptureSelfTest {
     static func run() -> Bool {
         guard ARSDKPhotoCommand.setFisheye == Data([1, 19, 0, 0, 3, 0, 0, 0]),
               ARSDKPhotoCommand.takePictureV2 == Data([1, 7, 2, 0]),
-              ARSDKPhotoCommand.requestSkyControllerAllStates == Data([4, 6, 0, 0]) else { return false }
+              ARSDKPhotoCommand.requestSkyControllerAllStates == Data([4, 6, 0, 0]),
+              ARSDKPhotoCommand.flatTrim == Data([1, 0, 0, 0]),
+              ARSDKPhotoCommand.magnetometerCalibration(start: true) == Data([0, 13, 0, 0, 1]),
+              ARSDKPhotoCommand.magnetometerCalibration(start: false) == Data([0, 13, 0, 0, 0]) else { return false }
 
         let formatEvent = Data([1, 20, 0, 0, 3, 0, 0, 0])
         let readyEvent = Data([1, 8, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0])
@@ -959,13 +1611,118 @@ enum ARSDKPhotoCaptureSelfTest {
 
         let frame = ARSDKPhotoProtocol.frame(type: 4, id: 11, sequence: 7, payload: ARSDKPhotoCommand.takePictureV2)
         guard frame == Data([4, 11, 7, 11, 0, 0, 0, 1, 7, 2, 0]),
+              ARSDKPhotoProtocol.nextSequence(after: nil) == 1,
+              ARSDKPhotoProtocol.nextSequence(after: 255) == 0,
               ARSDKTelemetryProtocol.decode(Data([0, 5, 1, 0, 74])) == .droneBattery(74),
+              ARSDKTelemetryProtocol.decode(Data([0, 5, 7, 0, 0xc8, 0xff])) == .wifiSignal(-56),
+              ARSDKTelemetryProtocol.decode(Data([3, 11, 4, 0, 5])) == .jumpingSumoLinkQuality(5),
               ARSDKTelemetryProtocol.decode(Data([4, 8, 0, 0, 83])) == .controllerBattery(83),
               ARSDKTelemetryProtocol.decode(Data([1, 4, 1, 0, 0, 0, 0, 0])) == .flyingState(0),
               ARSDKTelemetryProtocol.decode(Data([1, 24, 2, 0, 1])) == .gpsFix(true),
-              ARSDKTelemetryProtocol.decode(Data([1, 31, 0, 0, 12])) == .satelliteCount(12) else {
+              ARSDKTelemetryProtocol.decode(Data([1, 31, 0, 0, 12])) == .satelliteCount(12),
+              ARSDKTelemetryProtocol.decode(Data([1, 4, 0, 0])) == .flatTrimChanged,
+              ARSDKTelemetryProtocol.decode(Data([0, 14, 0, 0, 1, 0, 1, 0])) ==
+                .magnetometerCalibrationState(x: true, y: false, z: true, failed: false),
+              ARSDKTelemetryProtocol.decode(Data([0, 14, 1, 0, 1])) ==
+                .magnetometerCalibrationRequired(true),
+              ARSDKTelemetryProtocol.decode(Data([0, 14, 2, 0, 2, 0, 0, 0])) ==
+                .magnetometerCalibrationAxis(.z),
+              ARSDKTelemetryProtocol.decode(Data([0, 14, 3, 0, 1])) ==
+                .magnetometerCalibrationStarted(true) else {
             return false
         }
+
+        let paddedDiscovery = Data(#"{"status":0,"c2d_port":54321}"#.utf8) + Data([0])
+        guard let discovery = ARSDKDiscoveryProtocol.responseObject(from: paddedDiscovery),
+              discovery["status"] as? Int == 0,
+              discovery["c2d_port"] as? Int == 54_321 else { return false }
+
+        let patchedSumoDiscovery = Data(
+            #"{"status":0,"c2d_port":54321,"arstream_fragment_size":1400,"arstream_fragment_maximum_number":128,"arstream_max_ack_interval":-1}"#.utf8
+        )
+        guard let patchedSumoObject = ARSDKDiscoveryProtocol.responseObject(from: patchedSumoDiscovery) else {
+            return false
+        }
+        let patchedSumoNegotiation = ARSDKDiscoveryProtocol.arstream1Negotiation(from: patchedSumoObject)
+        guard patchedSumoNegotiation == ARStream1Negotiation(
+            fragmentSize: 1_400,
+            fragmentMaximumNumber: 128,
+            maximumAcknowledgementInterval: -1
+        ), !patchedSumoNegotiation.sendsVideoAcknowledgements else { return false }
+
+        let accessUnitBytes = Data([
+            0, 0, 0, 1, 0x67, 0x11,
+            0, 0, 0, 1, 0x68, 0x22,
+            0, 0, 0, 1, 0x65, 0x33, 0x44
+        ])
+        let midpoint = 10
+        var firstFragment = Data([42, 0, 1, 0, 2])
+        firstFragment.append(accessUnitBytes.prefix(midpoint))
+        var secondFragment = Data([42, 0, 1, 1, 2])
+        secondFragment.append(accessUnitBytes.dropFirst(midpoint))
+        var arstream1 = ARStream1VideoAssembler()
+        arstream1.configure(fragmentSize: 1_400, maximumFragments: 128)
+        guard let firstResult = arstream1.consume(firstFragment),
+              firstResult.frame == nil,
+              firstResult.acknowledgement.count == 18,
+              firstResult.acknowledgement[0] == 42,
+              firstResult.acknowledgement[10] == 0xfd,
+              let completed = arstream1.consume(secondFragment)?.frame,
+              completed.payload == accessUnitBytes,
+              completed.frameNumber == 42,
+              ARStream1VideoAssembler.splitAnnexB(completed.payload) == [
+                Data([0x67, 0x11]), Data([0x68, 0x22]), Data([0x65, 0x33, 0x44])
+              ] else { return false }
+
+        let completeJPEG = Data([0xff, 0xd8, 0x11, 0x22, 0xff, 0xd9])
+        let paddedJPEG = Data([0, 1]) + completeJPEG + Data([3])
+        guard ARStream1VideoAssembler.jpegPayload(in: completeJPEG) == completeJPEG,
+              ARStream1VideoAssembler.jpegPayload(in: paddedJPEG) == nil,
+              ARStream1VideoAssembler.jpegPayload(in: Data([0xff, 0xd8, 1])) == nil,
+              ARSDKPhotoCommand.jumpingSumoPCMD(flag: true, speed: 100, turn: -100) ==
+                Data([3, 0, 0, 0, 1, 100, 156]),
+              ARSDKPhotoCommand.jumpingSumoVideoEnable(true) == Data([3, 18, 0, 0, 1]) else {
+            return false
+        }
+
+        // The patched 1400/128 geometry accepts the full negotiated fragment
+        // range while rejecting a sender that exceeds it.
+        var geometry = ARStream1VideoAssembler()
+        geometry.configure(fragmentSize: 1_400, maximumFragments: 128)
+        var fragment128 = Data([7, 0, 0, 127, 128])
+        fragment128.append(contentsOf: [0xaa])
+        var fragment129 = Data([8, 0, 0, 0, 129])
+        fragment129.append(contentsOf: [0xbb])
+        guard geometry.consume(fragment128) != nil,
+              geometry.consume(fragment129) == nil else { return false }
+
+        // When more interleaved frame IDs arrive than the bounded window can
+        // retain, the evicted frame contributes precise loss diagnostics.
+        var lossDiagnostics = ARStream1VideoAssembler()
+        for frameID: UInt8 in 1...5 {
+            var fragment = Data([frameID, 0, 0, 0, 2])
+            fragment.append(contentsOf: [0xff, 0xd8])
+            guard lossDiagnostics.consume(fragment) != nil else { return false }
+        }
+        guard lossDiagnostics.statistics.incompleteFrames == 1,
+              lossDiagnostics.statistics.missingFragments == 1 else { return false }
+
+        // A late fragment from frame 50 must not discard the newer frame 51.
+        // Both frames are assembled independently and stale completion is not
+        // delivered after a newer frame has already reached the client.
+        var interleaved = ARStream1VideoAssembler()
+        var frame50Part0 = Data([50, 0, 1, 0, 2])
+        frame50Part0.append(contentsOf: [0xff, 0xd8, 0x50])
+        var frame51Part0 = Data([51, 0, 1, 0, 2])
+        frame51Part0.append(contentsOf: [0xff, 0xd8, 0x51])
+        var frame51Part1 = Data([51, 0, 1, 1, 2])
+        frame51Part1.append(contentsOf: [0xff, 0xd9])
+        var frame50Part1 = Data([50, 0, 1, 1, 2])
+        frame50Part1.append(contentsOf: [0xff, 0xd9])
+        guard interleaved.consume(frame50Part0)?.frame == nil,
+              interleaved.consume(frame51Part0)?.frame == nil,
+              interleaved.consume(frame51Part1)?.frame?.payload == Data([0xff, 0xd8, 0x51, 0xff, 0xd9]),
+              interleaved.consume(frame50Part1)?.frame == nil else { return false }
 
         var speed = Data([1, 4, 5, 0])
         appendLittleEndian(Float(3), to: &speed)

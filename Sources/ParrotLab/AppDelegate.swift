@@ -1,13 +1,40 @@
 import AppKit
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
+    private enum VehicleInputMode: Int, CaseIterable {
+        case off
+        case keyboard
+        case gamepad
+        case keyboardAndGamepad
+
+        var title: String {
+            switch self {
+            case .off: return "Off"
+            case .keyboard: return "Keyboard"
+            case .gamepad: return "Gamepad"
+            case .keyboardAndGamepad: return "Keyboard + Gamepad"
+            }
+        }
+
+        init(keyboardEnabled: Bool, gamepadEnabled: Bool) {
+            switch (keyboardEnabled, gamepadEnabled) {
+            case (false, false): self = .off
+            case (true, false): self = .keyboard
+            case (false, true): self = .gamepad
+            case (true, true): self = .keyboardAndGamepad
+            }
+        }
+
+        var enablesKeyboard: Bool { self == .keyboard || self == .keyboardAndGamepad }
+        var enablesGamepad: Bool { self == .gamepad || self == .keyboardAndGamepad }
+    }
+
     private var window: NSWindow?
     private var controller: MainViewController?
     private var settingsWindow: NSWindow?
     private var flightMappingsWindow: NSWindow?
     private weak var standaloneBebopCheckbox: NSButton?
-    private weak var keyboardFlightCheckbox: NSButton?
-    private weak var controllerFlightCheckbox: NSButton?
+    private weak var vehicleInputModePopup: NSPopUpButton?
     private weak var controllerDeadzoneSlider: NSSlider?
     private weak var controllerSensitivitySlider: NSSlider?
     private weak var controllerDeadzoneValue: NSTextField?
@@ -16,6 +43,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private weak var invertGazCheckbox: NSButton?
     private var keyboardMappingPopups: [FlightControlAction: NSPopUpButton] = [:]
     private var controllerMappingPopups: [FlightControlAction: NSPopUpButton] = [:]
+    private var controllerAxisMappingPopups: [FlightControlAction: NSPopUpButton] = [:]
     private weak var developerDiagnosticsCheckbox: NSButton?
     private weak var temporalEnabledCheckbox: NSButton?
     private weak var temporalBidirectionalCheckbox: NSButton?
@@ -30,6 +58,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private weak var temporalConsistencyValue: NSTextField?
     private weak var temporalLatencyValue: NSTextField?
     private weak var temporalFlowResolutionValue: NSTextField?
+    private weak var temporalExplanationLabel: NSTextField?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if let brandIcon = LabVisualStyle.brandIcon() {
@@ -49,6 +78,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         window.makeKeyAndOrderFront(nil)
         self.controller = controller
         self.window = window
+        controller.onGroundModeChanged = { [weak self] _ in
+            self?.refreshForGroundModeChange()
+        }
         NSApp.activate(ignoringOtherApps: true)
     }
 
@@ -56,6 +88,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     @objc func installDragonLabOnBebop2(_ sender: Any?) {
         controller?.installDragonLabOnBebop2()
+    }
+
+    @objc func performBebopFlatTrim(_ sender: Any?) {
+        controller?.performBebopFlatTrim()
+    }
+
+    @objc func toggleBebopMagnetometerCalibration(_ sender: Any?) {
+        controller?.toggleBebopMagnetometerCalibration()
     }
 
     @objc func showSettings(_ sender: Any?) {
@@ -96,13 +136,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             stack.bottomAnchor.constraint(lessThanOrEqualTo: content.bottomAnchor)
         ])
 
-        let flightTitle = NSTextField(labelWithString: "Connection and flight control")
+        let flightTitle = NSTextField(labelWithString: "Connection and vehicle control")
         flightTitle.font = .systemFont(ofSize: 15, weight: .semibold)
         flightTitle.textColor = .white
         stack.addArrangedSubview(flightTitle)
 
         let standaloneCheckbox = NSButton(
-            checkboxWithTitle: "Enable standalone aircraft (Bebop Drone / Bebop 2)",
+            checkboxWithTitle: "Connect directly to product Wi-Fi (Bebop / Sumo)",
             target: self,
             action: #selector(flightControlSettingChanged(_:))
         )
@@ -110,7 +150,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         stack.addArrangedSubview(standaloneCheckbox)
 
         let standaloneExplanation = NSTextField(wrappingLabelWithString:
-            "Use while the Mac is joined directly to the aircraft Wi-Fi at 192.168.42.1. Parrot Lab automatically detects BB1 or BB2; this route is mutually exclusive with SkyController routing."
+            "Enable for a direct product connection. Disable to route the selected aircraft or Jumping Sumo through SkyController 2."
         )
         standaloneExplanation.font = .systemFont(ofSize: 11.5)
         standaloneExplanation.textColor = LabVisualStyle.mutedText
@@ -118,24 +158,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         standaloneExplanation.widthAnchor.constraint(equalToConstant: 480).isActive = true
         stack.addArrangedSubview(standaloneExplanation)
 
-        let keyboardCheckbox = NSButton(
-            checkboxWithTitle: "Enable remappable keyboard flight control",
-            target: self,
-            action: #selector(flightControlSettingChanged(_:))
-        )
-        keyboardCheckbox.font = .systemFont(ofSize: 13, weight: .medium)
-        stack.addArrangedSubview(keyboardCheckbox)
-
-        let controllerCheckbox = NSButton(
-            checkboxWithTitle: "Enable native gamepad control (Xbox / PlayStation / MFi)",
-            target: self,
-            action: #selector(flightControlSettingChanged(_:))
-        )
-        controllerCheckbox.font = .systemFont(ofSize: 13, weight: .medium)
-        stack.addArrangedSubview(controllerCheckbox)
+        let inputRow = NSStackView()
+        inputRow.orientation = .horizontal
+        inputRow.alignment = .centerY
+        inputRow.spacing = 12
+        let inputLabel = NSTextField(labelWithString: "Vehicle input")
+        inputLabel.font = .systemFont(ofSize: 13, weight: .medium)
+        inputLabel.widthAnchor.constraint(equalToConstant: 150).isActive = true
+        inputRow.addArrangedSubview(inputLabel)
+        let inputModePopup = NSPopUpButton(frame: .zero, pullsDown: false)
+        for mode in VehicleInputMode.allCases {
+            inputModePopup.addItem(withTitle: mode.title)
+            inputModePopup.lastItem?.tag = mode.rawValue
+        }
+        inputModePopup.target = self
+        inputModePopup.action = #selector(flightControlSettingChanged(_:))
+        inputModePopup.widthAnchor.constraint(equalToConstant: 250).isActive = true
+        inputRow.addArrangedSubview(inputModePopup)
+        stack.addArrangedSubview(inputRow)
 
         let controllerNote = NSTextField(wrappingLabelWithString:
-            "macOS uses Apple's GameController system rather than XInput. Stick layout matches the SC2: left yaw/gaz, right roll/pitch."
+            "Choose keyboard, gamepad, or both. When both are enabled their live axes are combined safely. macOS uses Apple's GameController system rather than XInput; all analogue movement directions can be remapped below."
         )
         controllerNote.font = .systemFont(ofSize: 11.5)
         controllerNote.textColor = LabVisualStyle.mutedText
@@ -225,6 +268,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         temporalExplanation.maximumNumberOfLines = 3
         temporalExplanation.widthAnchor.constraint(equalToConstant: 460).isActive = true
         stack.addArrangedSubview(temporalExplanation)
+        temporalExplanationLabel = temporalExplanation
 
         let temporalCheckbox = NSButton(
             checkboxWithTitle: "Enable experimental temporal reconstruction",
@@ -295,8 +339,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         panel.center()
         settingsWindow = panel
         standaloneBebopCheckbox = standaloneCheckbox
-        keyboardFlightCheckbox = keyboardCheckbox
-        controllerFlightCheckbox = controllerCheckbox
+        vehicleInputModePopup = inputModePopup
         controllerDeadzoneSlider = deadzoneRow.slider
         controllerDeadzoneValue = deadzoneRow.value
         controllerSensitivitySlider = sensitivityRow.slider
@@ -395,8 +438,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         guard let controller else { return }
         var configuration = controller.currentFlightControlConfiguration
         configuration.standaloneBebopEnabled = standaloneBebopCheckbox?.state == .on
-        configuration.keyboardEnabled = keyboardFlightCheckbox?.state == .on
-        configuration.controllerEnabled = controllerFlightCheckbox?.state == .on
+        let inputMode = VehicleInputMode(rawValue: vehicleInputModePopup?.selectedTag() ?? 0) ?? .off
+        configuration.keyboardEnabled = inputMode.enablesKeyboard
+        configuration.controllerEnabled = inputMode.enablesGamepad
         configuration.controllerDeadzone = controllerDeadzoneSlider?.doubleValue
             ?? configuration.controllerDeadzone
         configuration.controllerSensitivity = controllerSensitivitySlider?.doubleValue
@@ -413,13 +457,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             flightMappingsWindow.makeKeyAndOrderFront(nil)
             return
         }
+        guard let controller else { return }
         let panel = NSPanel(
             contentRect: NSRect(x: 0, y: 0, width: 650, height: 720),
             styleMask: [.titled, .closable, .resizable],
             backing: .buffered,
             defer: false
         )
-        panel.title = "Parrot Lab Flight Control Mappings"
+        panel.title = "Parrot Lab Vehicle Control Mappings"
         panel.isReleasedWhenClosed = false
         panel.appearance = NSAppearance(named: .darkAqua)
 
@@ -445,7 +490,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         title.font = .systemFont(ofSize: 16, weight: .semibold)
         stack.addArrangedSubview(title)
         let note = NSTextField(wrappingLabelWithString:
-            "Keyboard movement is active only while its safety-hold key is pressed. Gamepad axes use the SC2 layout. Emergency has no default binding and should remain unassigned unless deliberately configured."
+            "Keyboard movement is active only while its safety-hold key is pressed. Every gamepad movement direction can be assigned to either analogue stick direction; discrete actions use buttons. Ground Mode shows only Sumo-relevant actions."
         )
         note.textColor = LabVisualStyle.mutedText
         note.maximumNumberOfLines = 3
@@ -455,7 +500,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         let headings = NSStackView()
         headings.orientation = .horizontal
         headings.spacing = 10
-        for (text, width) in [("Action", 200.0), ("Keyboard", 175.0), ("Gamepad button", 195.0)] {
+        for (text, width) in [("Action", 200.0), ("Keyboard", 175.0), ("Gamepad", 195.0)] {
             let label = NSTextField(labelWithString: text)
             label.font = .systemFont(ofSize: 11, weight: .bold)
             label.textColor = LabVisualStyle.mutedText
@@ -466,12 +511,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
         keyboardMappingPopups.removeAll()
         controllerMappingPopups.removeAll()
-        for action in FlightControlAction.allCases {
+        controllerAxisMappingPopups.removeAll()
+        let mappingActions = controller.isGroundModeActive
+            ? FlightControlAction.allCases.filter(\.isGroundRelevant)
+            : FlightControlAction.allCases
+        for action in mappingActions {
             let row = NSStackView()
             row.orientation = .horizontal
             row.alignment = .centerY
             row.spacing = 10
-            let label = NSTextField(labelWithString: action.title)
+            let label = NSTextField(labelWithString: controller.isGroundModeActive ? action.groundTitle : action.title)
             label.widthAnchor.constraint(equalToConstant: 200).isActive = true
             label.textColor = action == .emergency ? .systemRed : .labelColor
             row.addArrangedSubview(label)
@@ -488,18 +537,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             keyboardMappingPopups[action] = keyboard
             row.addArrangedSubview(keyboard)
 
-            let gamepad = NSPopUpButton(frame: .zero, pullsDown: false)
-            for (index, button) in FlightControllerButton.allCases.enumerated() {
-                gamepad.addItem(withTitle: button.title)
-                gamepad.lastItem?.tag = index
+            if action == .movementEnable {
+                let gamepadLabel = NSTextField(labelWithString: "No safety hold required")
+                gamepadLabel.font = .systemFont(ofSize: 12, weight: .medium)
+                gamepadLabel.textColor = LabVisualStyle.mutedText
+                gamepadLabel.alignment = .center
+                gamepadLabel.widthAnchor.constraint(equalToConstant: 195).isActive = true
+                row.addArrangedSubview(gamepadLabel)
+            } else if action.isControllerDirection {
+                let gamepad = NSPopUpButton(frame: .zero, pullsDown: false)
+                for (index, direction) in FlightControllerAxisDirection.allCases.enumerated() {
+                    gamepad.addItem(withTitle: direction.title)
+                    gamepad.lastItem?.tag = index
+                }
+                gamepad.target = self
+                gamepad.action = #selector(flightMappingChanged(_:))
+                gamepad.identifier = NSUserInterfaceItemIdentifier("gamepadAxis.\(action.rawValue)")
+                gamepad.widthAnchor.constraint(equalToConstant: 195).isActive = true
+                controllerAxisMappingPopups[action] = gamepad
+                row.addArrangedSubview(gamepad)
+            } else {
+                let gamepad = NSPopUpButton(frame: .zero, pullsDown: false)
+                for (index, button) in FlightControllerButton.allCases.enumerated() {
+                    gamepad.addItem(withTitle: button.title)
+                    gamepad.lastItem?.tag = index
+                }
+                gamepad.target = self
+                gamepad.action = #selector(flightMappingChanged(_:))
+                gamepad.identifier = NSUserInterfaceItemIdentifier("gamepad.\(action.rawValue)")
+                gamepad.widthAnchor.constraint(equalToConstant: 195).isActive = true
+                controllerMappingPopups[action] = gamepad
+                row.addArrangedSubview(gamepad)
             }
-            gamepad.target = self
-            gamepad.action = #selector(flightMappingChanged(_:))
-            gamepad.identifier = NSUserInterfaceItemIdentifier("gamepad.\(action.rawValue)")
-            gamepad.widthAnchor.constraint(equalToConstant: 195).isActive = true
-            gamepad.isEnabled = !action.isContinuousAxis
-            controllerMappingPopups[action] = gamepad
-            row.addArrangedSubview(gamepad)
             stack.addArrangedSubview(row)
         }
 
@@ -524,9 +593,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         var configuration = controller.currentFlightControlConfiguration
         if identifier.hasPrefix("keyboard.") {
             configuration.keyboardKeys[action] = UInt16(clamping: popup.selectedTag())
+        } else if identifier.hasPrefix("gamepadAxis."),
+                  FlightControllerAxisDirection.allCases.indices.contains(popup.selectedTag()) {
+            configuration.bindControllerAxisDirection(
+                FlightControllerAxisDirection.allCases[popup.selectedTag()],
+                to: action
+            )
         } else if identifier.hasPrefix("gamepad."),
                   FlightControllerButton.allCases.indices.contains(popup.selectedTag()) {
-            configuration.controllerButtons[action] = FlightControllerButton.allCases[popup.selectedTag()]
+            configuration.bindControllerButton(
+                FlightControllerButton.allCases[popup.selectedTag()],
+                to: action
+            )
         }
         controller.setFlightControlConfiguration(configuration)
         refreshFlightMappingControls()
@@ -537,6 +615,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         var configuration = controller.currentFlightControlConfiguration
         configuration.keyboardKeys = FlightControlConfiguration.defaultKeyboardKeys
         configuration.controllerButtons = FlightControlConfiguration.defaultControllerButtons
+        configuration.controllerAxisDirections = FlightControlConfiguration.defaultControllerAxisDirections
         controller.setFlightControlConfiguration(configuration)
         refreshFlightMappingControls()
     }
@@ -550,6 +629,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             let selected = configuration.controllerButtons[action] ?? .unassigned
             controllerMappingPopups[action]?.selectItem(
                 withTag: FlightControllerButton.allCases.firstIndex(of: selected) ?? 0
+            )
+            let axis = configuration.controllerAxisDirections[action] ?? .unassigned
+            controllerAxisMappingPopups[action]?.selectItem(
+                withTag: FlightControllerAxisDirection.allCases.firstIndex(of: axis) ?? 0
             )
         }
     }
@@ -572,12 +655,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         refreshSettingsControls()
     }
 
+    @objc func toggleGroundTemporal720p45(_ sender: Any?) {
+        controller?.toggleGroundTemporal720p45()
+        refreshSettingsControls()
+    }
+
     private func refreshSettingsControls() {
         developerDiagnosticsCheckbox?.state = controller?.isDeveloperVideoDiagnosticsEnabled == true ? .on : .off
         if let flight = controller?.currentFlightControlConfiguration {
             standaloneBebopCheckbox?.state = flight.standaloneBebopEnabled ? .on : .off
-            keyboardFlightCheckbox?.state = flight.keyboardEnabled ? .on : .off
-            controllerFlightCheckbox?.state = flight.controllerEnabled ? .on : .off
+            standaloneBebopCheckbox?.isEnabled = controller?.isGroundModeActive != true
+            let inputMode = VehicleInputMode(
+                keyboardEnabled: flight.keyboardEnabled,
+                gamepadEnabled: flight.controllerEnabled
+            )
+            vehicleInputModePopup?.selectItem(withTag: inputMode.rawValue)
             controllerDeadzoneSlider?.doubleValue = flight.controllerDeadzone
             controllerSensitivitySlider?.doubleValue = flight.controllerSensitivity
             controllerDeadzoneValue?.stringValue = String(format: "%.0f%%", flight.controllerDeadzone * 100)
@@ -590,6 +682,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             invertGazCheckbox?.isEnabled = flight.controllerEnabled
         }
         guard let configuration = controller?.currentTemporalReconstructionConfiguration else { return }
+        temporalExplanationLabel?.stringValue = configuration.flowOnlyGround
+            ? "Sumo: image-only optical flow, lighter history and bidirectional occlusion rejection. Outputs 720p without stretching. 30 FPS input can generate up to 45 FPS. No IMU or aircraft calibration; settings are separate from Bebop."
+            : "Bebop: IMU-assisted residual optical flow and confidence/occlusion rejection before MetalFX. Requires 1600 × 900; without motion metadata it uses flow only. Settings are separate from Sumo."
+        temporalEnabledCheckbox?.title = configuration.flowOnlyGround
+            ? "Enable Sumo 720p optical-flow reconstruction"
+            : "Enable experimental temporal reconstruction"
         temporalEnabledCheckbox?.state = configuration.isEnabled ? .on : .off
         temporalBidirectionalCheckbox?.state = configuration.usesBidirectionalFlow ? .on : .off
         temporalFrameGenerationCheckbox?.state = configuration.generatesIntermediateFrames ? .on : .off
@@ -604,13 +702,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         temporalLatencyValue?.stringValue = String(format: "%.0f ms", configuration.latencyBudgetMilliseconds)
         temporalFlowResolutionValue?.stringValue = String(format: "%.0f%%", configuration.flowResolutionScale * 100)
         let controlsEnabled = configuration.isEnabled
-        temporalBidirectionalCheckbox?.isEnabled = controlsEnabled
+        temporalBidirectionalCheckbox?.isEnabled = controlsEnabled && !configuration.flowOnlyGround
         temporalFrameGenerationCheckbox?.isEnabled = controlsEnabled && configuration.usesBidirectionalFlow
         temporalFlowResolutionSlider?.isEnabled = controlsEnabled
         temporalHistorySlider?.isEnabled = controlsEnabled
         temporalGhostSlider?.isEnabled = controlsEnabled
         temporalConsistencySlider?.isEnabled = controlsEnabled && configuration.usesBidirectionalFlow
         temporalLatencySlider?.isEnabled = controlsEnabled
+    }
+
+    private func refreshForGroundModeChange() {
+        if let contentView = settingsWindow?.contentView {
+            LabVisualStyle.applyTheme(
+                controller?.isGroundModeActive == true ? .ground : .air,
+                to: contentView
+            )
+        }
+        refreshSettingsControls()
+        guard let mappings = flightMappingsWindow else { return }
+        let wasVisible = mappings.isVisible
+        mappings.close()
+        flightMappingsWindow = nil
+        keyboardMappingPopups.removeAll()
+        controllerMappingPopups.removeAll()
+        controllerAxisMappingPopups.removeAll()
+        if wasVisible { showFlightControlMappings(nil) }
     }
 
     @objc func enablePersistentTelnetOnBebop2(_ sender: Any?) {
@@ -682,6 +798,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         guard let controller else { return false }
         let action = menuItem.action
+        if action == #selector(toggleGroundTemporal720p45(_:)) {
+            menuItem.state = controller.isGroundModeActive && controller.currentTemporalReconstructionConfiguration.isEnabled ? .on : .off
+            return controller.isGroundModeActive
+        }
+        if action == #selector(performBebopFlatTrim(_:)) {
+            return controller.canUseBebopCalibrationTools
+        }
+        if action == #selector(toggleBebopMagnetometerCalibration(_:)) {
+            menuItem.title = controller.isMagnetometerCalibrationActive
+                ? "Stop Bebop Magnetometer Calibration"
+                : "Start Bebop Magnetometer Calibration"
+            return controller.canUseBebopCalibrationTools
+        }
         if action == #selector(installDragonLabOnBebop2(_:)) {
             return controller.aircraftCapabilities.supportsBB2DragonLab
         }
@@ -696,6 +825,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         if action == #selector(toggleCalibratedRollingShutter(_:)) {
             return controller.aircraftCapabilities.supportsBB2CameraCalibration ||
                 controller.isCalibratedRollingShutterEnabled
+        }
+        if controller.isGroundModeActive {
+            if action == #selector(toggleRawH264Archive(_:)) ||
+                action == #selector(installSC2DriverPatch(_:)) ||
+                action == #selector(findSC2HostThroughBebop(_:)) ||
+                action == #selector(findSC2USBHost(_:)) {
+                return false
+            }
         }
         return true
     }

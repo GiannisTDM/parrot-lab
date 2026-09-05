@@ -1,11 +1,22 @@
 # Parrot Lab for macOS
 
 Parrot Lab is a native macOS HUD and diagnostic client for the Parrot
-SkyController 2, Bebop Drone (BB1), and Bebop 2. It is intentionally built from
+SkyController 2, Bebop Drone (BB1), Bebop 2, and Jumping Sumo. It is intentionally built from
 Apple system frameworks rather than Electron or an embedded browser.
 
-See [CHANGELOG.md](CHANGELOG.md) for the V1.4 release highlights and known
+See [CHANGELOG.md](CHANGELOG.md) for the V1.5 release highlights and known
 limitations.
+
+The cockpit keeps connection controls on the first toolbar row and video/media
+controls on the second. **Focus** hides the right inspector; **Inspector** brings
+it back. Expand **Stream details** for transport statistics and the editable RTP
+port, or **Configure profile** for Dragon controls. **Activity** opens the full
+event log while its collapsed bar still shows the latest event. Air and ground
+workspaces use blue and copper accents respectively.
+
+| Air workspace | Ground workspace |
+| --- | --- |
+| ![Parrot Lab air mode](docs/images/parrot-lab-air-mode.png) | ![Parrot Lab ground mode](docs/images/parrot-lab-ground-mode.png) |
 
 > [!WARNING]
 > **Development preview — not flight-ready.** The app now receives live video
@@ -14,12 +25,29 @@ limitations.
 > used while landed with the props removed. Do not rely on this build as a
 > flight display or as a replacement for FreeFlight.
 
-The intended production transport is the SC2 mobile link used by FreeFlight: Bebop 2 video and telemetry arrive at `mppd` over Wi-Fi and are forwarded to the mobile client through Parrot's USB `libmux` channels. Version 1.4 does not yet implement that USB video path.
+> [!CAUTION]
+> **Jumping Sumo support is highly experimental.** When a Sumo is routed
+> through the SC2, use either the physical SC2 controls or Parrot Lab controls,
+> never both at once. The two independent PCMD streams will fight each other
+> and produce stop-start movement. Disable Parrot Lab keyboard/gamepad control
+> before driving with the SC2.
 
-Version 1.4 provides:
+The intended production transport is the SC2 mobile link used by FreeFlight: Bebop 2 video and telemetry arrive at `mppd` over Wi-Fi and are forwarded to the mobile client through Parrot's USB `libmux` channels. Version 1.5 does not yet implement that USB video path.
 
-- direct, read-only Telnet connection to the configured SC2 host, including
-  the normal `192.168.42.88` route and the Apple-NCM USB route;
+Version 1.5 provides:
+
+- a large **Ground Mode** switch with a brown ground-vehicle theme and a direct
+  Jumping Sumo backend (`0x0902`, `_arsdk-0902._udp`);
+- native JumpingSumo speed/turn PCMD at 20 Hz with the same bounded keyboard
+  and macOS GameController input system used by BB1/BB2;
+- codec-neutral ARStream1 fragment/ACK handling, routing BB1 to Annex-B H.264
+  and Jumping Sumo to a bounded MJPEG decoder;
+- Sumo MJPEG frames flowing through the existing enhancement, MetalFX,
+  screenshot and processed H.264 recording pipeline;
+- strict capability gating that hides flight/GPS/Dragon/RF controls and never
+  sends ARDrone3 flight commands while Ground Mode is active;
+
+- direct, read-only Telnet connection to the SC2 at `192.168.42.88`;
 - parsing of the SC2's existing `mppd`, `wifid`, and link-quality telemetry;
 - a persistent SC2-routed ARDiscovery/ARNetwork/ARCommands session for
   structured drone battery, flight state, GPS, speed, attitude, satellite and
@@ -80,9 +108,10 @@ profile is immediate and does not show an additional confirmation sheet.
 ## Requirements
 
 - macOS 13 or later on Apple silicon;
-- a Bebop Drone or Bebop 2, optionally associated with an SC2;
-- either a direct aircraft route at `192.168.42.1`, or a route to the SC2 at
-  `192.168.42.88` / its usual `192.168.53.1` Apple-NCM USB address;
+- a Bebop Drone or Bebop 2, optionally associated with an SC2, or a Jumping Sumo for direct Ground Mode;
+- either a direct product route (`192.168.42.1` for Bebop or `192.168.2.1`
+  for Sumo), or a route to the SC2 at `192.168.42.88` / its usual
+  `192.168.53.1` Apple-NCM USB address;
 - for SC2 mode and device tools, the project's explicitly enabled SC2 Telnet
   service on TCP 23;
 - Local Network access when macOS requests it.
@@ -296,6 +325,23 @@ recording remain latest-frame-only and bounded.
 
 ### Experimental temporal reconstruction
 
+For Jumping Sumo, enable **Video → Sumo · 720p + 30→45 FPS Optical Flow**.
+This works with either direct Wi-Fi or the SC2 JPEG restream. The ground preset
+uses image-only bidirectional motion estimation, a lighter history blend and
+photometric/occlusion rejection—no IMU or Bebop calibration. Settings controls
+adjust the active product's preset; ground and air preferences are separate.
+
+With the 30 FPS firmware, one midpoint is generated per two real frames, targeting
+45 FPS. Actual display FPS remains measured; low-confidence regions use the
+current image, and missing-frame gaps or non-30-FPS cadence suppress interpolation.
+Latest-frame processing and bounded display/recording queues remain in place.
+MetalFX scales processed real and generated frames to 720 pixels high, with GPU
+Lanczos fallback. Aspect ratio is preserved: 640×480 becomes **960×720**, while
+16:9 input produces **1280×720**. This is enhanced/upscaled output, not native
+720p camera detail. The processed recording and screenshots use this output too.
+Disable the ground preset to restore the ordinary scaler selection. Stop an
+active recording before changing the preset.
+
 **Parrot Lab → Settings → Experimental temporal reconstruction** enables a
 bounded causal reconstruction pass for the 1600 × 900 source. It is off by
 default. The prior source/history is first aligned with the exact
@@ -409,7 +455,7 @@ a normal termination first and uses `SIGKILL` only if Dragon does not exit.
 `/usr/bin/DragonStarter.sh`.
 
 Drone battery and navigation state now arrive as native ARCommands through the
-SC2 at controller RF range. Version 1.4 no longer opens a periodic Telnet relay
+SC2 at controller RF range. Version 1.5 no longer opens a periodic Telnet relay
 or direct-drone Telnet connection to scrape battery logs. The persistent ARSDK
 session requests all states after connecting and refreshes them periodically;
 the stock 4K fisheye capture reuses the same command connection.
@@ -444,6 +490,11 @@ route.
 
 The native macOS **Tools** menu contains deployment and discovery actions:
 
+- **Bebop Flat Trim** sends the native ARSDK flat-trim command after live
+  telemetry confirms that the Bebop is landed on a level, stationary surface;
+- **Start/Stop Bebop Magnetometer Calibration** uses the native ARSDK
+  calibration command and reports the requested X/Y/Z rotation progress from
+  the aircraft's calibration-state events;
 - **Install/Update Dragon Lab on Bebop 2** uploads and verifies the patched
   Dragon binary and helper at the fixed stock Bebop FTP address
   `192.168.42.1:21`;
@@ -531,25 +582,52 @@ It separately publishes per-chain Broadcom values, link-quality percentages, con
 
 Values of `500` used by `mppd` as unavailable altitude/position sentinels are deliberately shown as unavailable rather than as real telemetry.
 
-## Standalone BB1/BB2 and input controls
+## Standalone BB1/BB2/Sumo and input controls
 
 Open **Parrot Lab → Settings** to enable **Standalone aircraft**. Join the BB1
 or BB2 Wi-Fi first; the app then locks the target to `192.168.42.1`, identifies
 the model from its official Bonjour service, performs ARDiscovery on TCP 44444,
 and uses the command UDP port returned by the aircraft. Standalone and
-SkyController routes are mutually exclusive.
+SkyController routes are mutually exclusive. For Jumping Sumo, use the large
+**Ground Mode** switch before connecting. The app selects product `0x0902`,
+discovers `_arsdk-0902._udp`, and uses direct ARStream1 MJPEG rather than the
+Bebop H.264 path.
 
 The same Settings panel can enable keyboard and native gamepad control for
 either route. **Configure mappings…** changes every keyboard action and all
 discrete gamepad buttons. The analog gamepad layout follows the SC2: left
-stick controls yaw/gaz and right stick controls roll/pitch. Keyboard movement
+stick controls yaw/gaz and right stick controls roll/pitch. In Ground Mode,
+right-stick vertical/horizontal become Sumo speed/turn; the corresponding
+forward/back and left/right keyboard actions do the same. Keyboard movement
 only operates while the configured safety-hold key is down, and only while the
 main flight window has focus. Controller disconnect, app focus loss, route
 changes and ARSDK disconnect all force neutral PCMD.
 
-The emergency action has no default keyboard or controller binding. Direct
+Aircraft-only takeoff, landing, RTH, camera and emergency commands are ignored
+in Ground Mode; the mapped stop action neutralizes Sumo PCMD. High Jump is
+available as a separately remappable keyboard or gamepad action. The aircraft
+emergency action has no default keyboard or controller binding. Direct
 piloting and direct ARStream2 reception are new development features and must
 be validated on the ground with propellers removed before any flight use.
+
+### Experimental Sumo-through-SC2 patch
+
+Parrot Lab does not yet install or update the Jumping Sumo/SC2 compatibility
+patch automatically. The current binaries, checksums, manual replacement
+order, known-drone entry requirements and rollback cautions are documented in
+[experimental/jumping-sumo](experimental/jumping-sumo/README.md).
+
+The experimental setup requires all three matched components: the supplied
+SC2 `mppd`, the supplied SC2 `libarsdk.so`, and the Sumo B29 Dragon build for
+paced 30 FPS MJPEG. The Sumo must also be entered manually in the SC2 known-
+drone configuration as product/model 2306 (`JS`) with its exact SSID and open
+security. Until the planned installer lands, do not mix these files with an
+older experimental patch set.
+
+The same RF/MOD mechanism used by the other supported Broadcom/SKY-based
+Parrot products also works on the Sumo side. Preserve a verified stock backup
+before applying the tested profile, obey local RF limits, and keep RF changes
+separate from initial SC2/Sumo compatibility testing.
 
 ## Video transport
 

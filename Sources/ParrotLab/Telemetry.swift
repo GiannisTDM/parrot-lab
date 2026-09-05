@@ -89,6 +89,20 @@ struct ARSDKTelemetryReducer {
             guard (0...100).contains(percent) else { return false }
             snapshot.droneBatteryPercent = percent
 
+        case .wifiSignal(let rssi):
+            guard (-127...0).contains(rssi) else { return false }
+            snapshot.reportedRSSI = rssi
+            // Direct Sumo telemetry exposes one link RSSI, not two independent
+            // RF-chain values. Put it on A0 and leave A1 unknown rather than
+            // inventing a second antenna reading.
+            snapshot.chain0RSSI = rssi
+            snapshot.chain1RSSI = nil
+
+        case .jumpingSumoLinkQuality(let quality):
+            guard (0...6).contains(quality) else { return false }
+            snapshot.rxQuality = Int((Double(quality) / 6 * 100).rounded())
+            snapshot.rxUseful = snapshot.rxQuality
+
         case .controllerBattery(let percent):
             if (0...100).contains(percent) {
                 snapshot.sc2BatteryPercent = percent
@@ -159,7 +173,9 @@ struct ARSDKTelemetryReducer {
         case .satelliteCount(let count):
             snapshot.satelliteCount = count
 
-        case .aircraftConnection, .productVersion:
+        case .aircraftConnection, .productVersion, .flatTrimChanged,
+             .magnetometerCalibrationState, .magnetometerCalibrationRequired,
+             .magnetometerCalibrationAxis, .magnetometerCalibrationStarted:
             return false
         }
         snapshot.markUpdated()

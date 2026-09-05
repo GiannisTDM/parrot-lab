@@ -343,7 +343,7 @@ final class RTPH264Receiver {
     }
 }
 
-private struct RTPPacket {
+struct RTPPacket {
     let marker: Bool
     let payloadType: UInt8
     let sequence: UInt16

@@ -34,9 +34,16 @@ final class VideoHUDView: NSView {
     func update(snapshot: TelemetrySnapshot) {
         overlayView.snapshot = snapshot
     }
+
+    func setGroundMode(_ enabled: Bool) {
+        overlayView.isGroundMode = enabled
+    }
 }
 
 final class HUDOverlayView: NSView {
+    var isGroundMode = false {
+        didSet { needsDisplay = true }
+    }
     var snapshot = TelemetrySnapshot() {
         didSet { needsDisplay = true }
     }
@@ -50,15 +57,18 @@ final class HUDOverlayView: NSView {
 
         drawVignette(context)
         drawConnectionHeader()
-        drawArtificialHorizon(context)
-        drawRFPanel()
-        drawFlightPanel()
+        if snapshot.videoDecodedFPS == nil { drawWaitingState() }
+        if !isGroundMode, snapshot.videoDecodedFPS != nil { drawArtificialHorizon(context) }
+        if snapshot.connectionLabel.localizedCaseInsensitiveContains("live") || snapshot.droneBatteryPercent != nil {
+            drawRFPanel()
+            if isGroundMode { drawGroundPanel() } else { drawFlightPanel() }
+        }
         drawVideoPanel()
-        drawCenterReticle(context)
+        if snapshot.videoDecodedFPS != nil { drawCenterReticle(context) }
     }
 
     private func drawVignette(_ context: CGContext) {
-        let colors = [NSColor.clear.cgColor, NSColor.black.withAlphaComponent(0.58).cgColor] as CFArray
+        let colors = [NSColor.clear.cgColor, NSColor.black.withAlphaComponent(0.28).cgColor] as CFArray
         guard let gradient = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(), colors: colors, locations: [0.55, 1.0]) else { return }
         context.drawRadialGradient(
             gradient,
@@ -73,12 +83,52 @@ final class HUDOverlayView: NSView {
     private func drawConnectionHeader() {
         let color: NSColor = snapshot.connectionLabel.contains("Live") ? .systemGreen : .systemOrange
         drawPill(snapshot.connectionLabel.uppercased(), at: CGPoint(x: 18, y: bounds.height - 36), color: color)
+        let route = snapshot.connectionRouteLabel
+        let font = NSFont.systemFont(ofSize: 10, weight: .semibold)
+        let width = route.size(withAttributes: [.font: font]).width
         drawText(
-            "PARROT LAB  •  \(snapshot.connectionRouteLabel)",
-            at: CGPoint(x: bounds.width - 230, y: bounds.height - 31),
-            font: .monospacedSystemFont(ofSize: 11, weight: .semibold),
+            route,
+            at: CGPoint(x: bounds.width - width - 20, y: bounds.height - 31),
+            font: font,
             color: NSColor.white.withAlphaComponent(0.72)
         )
+    }
+
+    private func drawWaitingState() {
+        let center = CGPoint(x: bounds.midX, y: bounds.midY)
+        let iconCenter = NSPoint(x: center.x, y: center.y + 53)
+        for radius: CGFloat in [41, 58, 76] {
+            LabVisualStyle.accent.withAlphaComponent(radius == 41 ? 0.12 : 0.045).setStroke()
+            let ring = NSBezierPath(ovalIn: NSRect(x: iconCenter.x - radius, y: iconCenter.y - radius, width: radius * 2, height: radius * 2))
+            ring.lineWidth = 1
+            ring.stroke()
+        }
+        LabVisualStyle.accent.withAlphaComponent(0.72).setStroke()
+        let camera = NSBezierPath(roundedRect: NSRect(x: iconCenter.x - 21, y: iconCenter.y - 12, width: 31, height: 24), xRadius: 5, yRadius: 5)
+        camera.lineWidth = 1.5
+        camera.stroke()
+        let lens = NSBezierPath()
+        lens.move(to: NSPoint(x: iconCenter.x + 10, y: iconCenter.y + 5))
+        lens.line(to: NSPoint(x: iconCenter.x + 23, y: iconCenter.y + 12))
+        lens.line(to: NSPoint(x: iconCenter.x + 23, y: iconCenter.y - 12))
+        lens.line(to: NSPoint(x: iconCenter.x + 10, y: iconCenter.y - 5))
+        lens.lineWidth = 1.5
+        lens.stroke()
+        let connected = snapshot.connectionLabel.localizedCaseInsensitiveContains("live")
+        let title = connected ? "Waiting for your camera" : "Live view is ready"
+        let subtitle = connected ? "Start video, or wait for the stream to arrive." : "Connect your \(isGroundMode ? "Sumo" : "Bebop") to open live view."
+        for (text, y, font, color) in [
+            (title, center.y - 49, NSFont.systemFont(ofSize: 19, weight: .medium), NSColor.white.withAlphaComponent(0.8)),
+            (subtitle, center.y - 75, NSFont.systemFont(ofSize: 11, weight: .regular), LabVisualStyle.mutedText)
+        ] {
+            let width = text.size(withAttributes: [.font: font]).width
+            drawText(text, at: CGPoint(x: center.x - width / 2, y: y), font: font, color: color)
+        }
+    }
+
+    private func panelBackdrop(_ rect: NSRect) {
+        NSColor.black.withAlphaComponent(snapshot.videoDecodedFPS == nil ? 0.16 : 0.38).setFill()
+        NSBezierPath(roundedRect: rect, xRadius: 12, yRadius: 12).fill()
     }
 
     private func drawArtificialHorizon(_ context: CGContext) {
@@ -89,7 +139,7 @@ final class HUDOverlayView: NSView {
         context.translateBy(x: center.x, y: center.y)
         context.rotate(by: CGFloat(-roll))
         context.translateBy(x: 0, y: CGFloat(pitch * 150.0))
-        context.setStrokeColor(NSColor.systemCyan.withAlphaComponent(0.78).cgColor)
+        context.setStrokeColor(LabVisualStyle.accent.withAlphaComponent(0.78).cgColor)
         context.setLineWidth(1.4)
         context.move(to: CGPoint(x: -92, y: 0))
         context.addLine(to: CGPoint(x: -22, y: 0))
@@ -120,27 +170,25 @@ final class HUDOverlayView: NSView {
     }
 
     private func drawRFPanel() {
-        let x: CGFloat = 18
+        let x: CGFloat = 28
+        panelBackdrop(NSRect(x: 16, y: bounds.height - 206, width: 184, height: 151))
         var y = bounds.height - 78
-        drawText("RF LINK", at: CGPoint(x: x, y: y), font: .monospacedSystemFont(ofSize: 11, weight: .bold), color: .systemCyan)
+        drawText("SIGNAL", at: CGPoint(x: x, y: y), font: .systemFont(ofSize: 10, weight: .semibold), color: LabVisualStyle.accent)
         y -= 24
         drawSignalRow(label: "A0", value: snapshot.chain0RSSI, x: x, y: y)
         y -= 22
         drawSignalRow(label: "A1", value: snapshot.chain1RSSI, x: x, y: y)
         y -= 22
         drawSignalRow(label: "AVG", value: snapshot.chainAverage ?? snapshot.reportedRSSI, x: x, y: y)
-        y -= 28
-        drawText("NOISE  \(formatted(snapshot.noise, suffix: " dBm"))", at: CGPoint(x: x, y: y), font: mono(12), color: .white)
-        y -= 19
-        drawText("SNR    \(formatted(snapshot.snr, suffix: " dB"))", at: CGPoint(x: x, y: y), font: mono(12), color: .white)
-        y -= 19
-        drawText("LINK   \(formatted(snapshot.rxQuality, suffix: "%"))", at: CGPoint(x: x, y: y), font: mono(12), color: .white)
+        y -= 24
+        drawText("SNR \(formatted(snapshot.snr, suffix: " dB"))  ·  \(formatted(snapshot.rxQuality, suffix: "%")) link", at: CGPoint(x: x, y: y), font: mono(10), color: NSColor.white.withAlphaComponent(0.72))
     }
 
     private func drawFlightPanel() {
-        let x = bounds.width - 190
+        let x = bounds.width - 178
+        panelBackdrop(NSRect(x: x - 12, y: bounds.height - 263, width: 174, height: 208))
         var y = bounds.height - 78
-        drawText("FLIGHT", at: CGPoint(x: x, y: y), font: .monospacedSystemFont(ofSize: 11, weight: .bold), color: .systemCyan)
+        drawText("FLIGHT", at: CGPoint(x: x, y: y), font: .monospacedSystemFont(ofSize: 11, weight: .bold), color: LabVisualStyle.accent)
         y -= 27
         drawText(snapshot.flightState, at: CGPoint(x: x, y: y), font: .monospacedSystemFont(ofSize: 17, weight: .bold), color: flightColor)
         y -= 30
@@ -153,12 +201,6 @@ final class HUDOverlayView: NSView {
         } else {
             drawText("DRONE —", at: CGPoint(x: x, y: y), font: mono(13), color: .white)
         }
-        y -= 22
-        drawText("ROLL \(angle(snapshot.roll))", at: CGPoint(x: x, y: y), font: mono(12), color: .white)
-        y -= 20
-        drawText("PITCH\(angle(snapshot.pitch))", at: CGPoint(x: x, y: y), font: mono(12), color: .white)
-        y -= 20
-        drawText("YAW  \(angle(snapshot.yaw))", at: CGPoint(x: x, y: y), font: mono(12), color: .white)
 
         if let battery = snapshot.sc2BatteryPercent {
             y -= 31
@@ -170,12 +212,32 @@ final class HUDOverlayView: NSView {
         }
     }
 
+    private func drawGroundPanel() {
+        let x = bounds.width - 178
+        panelBackdrop(NSRect(x: x - 12, y: bounds.height - 190, width: 174, height: 135))
+        var y = bounds.height - 78
+        drawText("GROUND", at: CGPoint(x: x, y: y), font: .monospacedSystemFont(ofSize: 11, weight: .bold), color: LabVisualStyle.accent)
+        y -= 27
+        drawText("JUMPING SUMO", at: CGPoint(x: x, y: y), font: .monospacedSystemFont(ofSize: 15, weight: .bold), color: .white)
+        y -= 31
+        if let battery = snapshot.droneBatteryPercent {
+            drawText("BATTERY \(battery)%", at: CGPoint(x: x, y: y), font: mono(13), color: batteryColor(battery))
+        } else {
+            drawText("BATTERY —", at: CGPoint(x: x, y: y), font: mono(13), color: .white)
+        }
+        y -= 24
+        drawText(snapshot.connectionRouteLabel.contains("SC2") ? "VIA SKYCONTROLLER 2" : "DIRECT WI-FI", at: CGPoint(x: x, y: y), font: mono(10), color: NSColor.white.withAlphaComponent(0.64))
+    }
+
     private func drawVideoPanel() {
         let y: CGFloat = 22
-        let text = "RTP \(snapshot.videoBitrateKbps.map { "\($0) kbps" } ?? "waiting")   " +
-            "PKT \(snapshot.videoPackets)   DUP \(snapshot.videoDuplicatePackets)   LOST \(snapshot.videoPacketsLost)   " +
-            "JIT \(snapshot.videoJitterMs.map { String(format: "%.1f ms", $0) } ?? "—")"
-        drawText(text, at: CGPoint(x: 18, y: y), font: mono(11), color: NSColor.white.withAlphaComponent(0.78))
+        let output = snapshot.videoProcessedHeight.map { "\($0)p" } ?? "Output —"
+        let text = "\(isGroundMode ? "MJPEG" : "H.264")  /  \(output)  /  \(fps(snapshot.videoDisplayRefreshFPS)) fps"
+        drawText(text, at: CGPoint(x: 22, y: y), font: mono(10), color: NSColor.white.withAlphaComponent(0.68))
+    }
+
+    private func fps(_ value: Double?) -> String {
+        value.map { String(format: "%.1f", $0) } ?? "—"
     }
 
     private func drawSignalRow(label: String, value: Int?, x: CGFloat, y: CGFloat) {

@@ -1,5 +1,61 @@
 # Changelog
 
+## 1.5.0 — 2026-09-05
+
+Version 1.5 adds an experimental Jumping Sumo ground workspace, a major cockpit
+redesign and a dedicated bounded temporal path for MJPEG ground video.
+
+### Added
+
+- Added Jumping Sumo product `0x0902`, direct `_arsdk-0902._udp` discovery and
+  the product's native project-3 speed/turn PCMD and video-enable commands.
+- Added codec-neutral ARStream1 assembly: BB1 continues through Annex-B H.264,
+  while Sumo uses bounded MJPEG decoding through either direct Wi-Fi or the
+  experimental SC2 JPEG restream.
+- Added a Sumo-specific **720p + 30→45 FPS Optical Flow** preset with image-only
+  bidirectional flow, photometric/occlusion rejection and aspect-correct
+  scaling. A 640×480 source becomes 960×720 rather than being stretched.
+- Added native flat-trim and magnetometer-calibration actions for Bebop/BB2,
+  with landed-state gating and live X/Y/Z progress and error reporting.
+- Added remappable Jumping Sumo ground controls, including High Jump.
+
+### Changed
+
+- Redesigned the cockpit with distinct blue air and copper ground themes, a
+  two-row connection/media toolbar, larger key readouts and compact overlays.
+- Added Focus view, expandable stream/profile/controller/navigation panels and
+  an activity drawer that preserves the latest event while collapsed.
+- Air/ground transitions now crossfade UI chrome without fading or blocking
+  live video, and respect macOS Reduce Motion.
+- Ground mode defaults to `192.168.2.1`, remembers a valid custom host and
+  hides or gates aircraft-only flight, GPS, Dragon and RF controls.
+- Ground temporal preferences are stored independently from the Bebop temporal
+  profile. Missing frames, reconnect gaps, resolution changes and non-30-FPS
+  cadence suppress interpolation and reset history safely.
+- Forward/reverse temporal work and generated display/recording remain
+  explicitly bounded; overload drops work instead of increasing FPV latency.
+
+### Experimental Sumo/SC2 support
+
+- Added the current matched experimental artifacts for SC2 `mppd`, SC2
+  `libarsdk.so` and the Jumping Sumo B29 30 FPS Dragon patch.
+- Installation is manual in 1.5. The Sumo must also be added manually to the
+  SC2 known-drone configuration as model 2306 (`JS`) with its exact SSID and
+  open security. An integrated installer is planned.
+- The Sumo supports the same RF/MOD mechanism as the other Broadcom/SKY-based
+  Parrot products, but stock backups and local RF limits still apply.
+- Physical SC2 control and Parrot Lab keyboard/gamepad control must not be
+  enabled together: their simultaneous PCMD streams fight each other.
+
+### Known limitations
+
+- Jumping Sumo support, particularly routing through a patched SC2, remains
+  highly experimental and requires manual device modification.
+- Direct production USB/libmux transport is not implemented; SC2 video uses
+  the established restream route.
+- The public build is ad-hoc signed and not notarized. Parrot Lab remains a
+  development workbench, not a certified vehicle-control application.
+
 ## 1.4.0 — 2026-08-29
 
 Version 1.4 adds first-class Bebop Drone support, guarded standalone aircraft
