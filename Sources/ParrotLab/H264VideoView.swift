@@ -2,6 +2,7 @@ import AppKit
 import AVFoundation
 import CoreImage
 import CoreMedia
+import ImageIO
 import QuartzCore
 import VideoToolbox
 
@@ -78,6 +79,7 @@ enum VideoSpatialScalingMode: Int, CaseIterable {
     case metalFX1440p = 3
     case metalFX1800p = 4
     case metalFX2160p = 5
+    case metalFX720p = 6
 
     var menuTitle: String {
         switch self {
@@ -87,6 +89,7 @@ enum VideoSpatialScalingMode: Int, CaseIterable {
         case .metalFX1440p: return "Apple MetalFX Spatial · 2560 × 1440"
         case .metalFX1800p: return "Apple MetalFX Spatial · 3200 × 1800"
         case .metalFX2160p: return "Apple MetalFX Spatial · 3840 × 2160"
+        case .metalFX720p: return "Apple MetalFX Spatial · 720p (Preserve Aspect)"
         }
     }
 
@@ -98,6 +101,7 @@ enum VideoSpatialScalingMode: Int, CaseIterable {
         case .metalFX1440p: return "METALFX 1440P"
         case .metalFX1800p: return "METALFX 1800P"
         case .metalFX2160p: return "METALFX 4K"
+        case .metalFX720p: return "METALFX 720P"
         }
     }
 
@@ -117,6 +121,8 @@ enum VideoSpatialScalingMode: Int, CaseIterable {
             return (3_200, 1_800)
         case .metalFX2160p:
             return (3_840, 2_160)
+        case .metalFX720p:
+            return (Self.even(Int((Double(sourceWidth) * 720 / Double(max(1, sourceHeight))).rounded())), 720)
         }
     }
 
@@ -124,6 +130,13 @@ enum VideoSpatialScalingMode: Int, CaseIterable {
 }
 
 final class H264VideoView: NSView {
+    private struct MJPEGDecodeRequest {
+        let data: Data
+        let frameNumber: UInt64
+        let arrivalNanoseconds: UInt64
+        let generation: UInt64
+    }
+
     var onDebug: ((String) -> Void)?
     var onFormat: ((Int, Int) -> Void)?
     var onCodedFormat: ((Int, Int) -> Void)?
@@ -219,6 +232,16 @@ final class H264VideoView: NSView {
     private var metadataPresence = VideoMetadataPresence()
     private var extensionDumpHandle: FileHandle?
     private var dumpedExtensionAccessUnits = 0
+    private let mjpegDecodeQueue = DispatchQueue(label: "parrotlab.video.mjpeg", qos: .userInteractive)
+    private let mjpegDecodeLock = NSLock()
+    private var mjpegDecodeInFlight = false
+    private var pendingMJPEGFrame: MJPEGDecodeRequest?
+    private var mjpegDecodeGeneration: UInt64 = 0
+    private var mjpegFormat: (width: Int, height: Int)?
+    private var mjpegTimingGeneration: UInt64?
+    private var mjpegFirstArrivalNanoseconds: UInt64?
+    private var mjpegLastArrivalNanoseconds: UInt64?
+    private var mjpegNominalDurationSeconds = 1.0 / 30.0
     private var latestProcessedPixelBuffer: CVPixelBuffer?
     private var displayFormatDescription: CMVideoFormatDescription?
     private var displayFormatKey: String?
@@ -389,6 +412,125 @@ final class H264VideoView: NSView {
         }
     }
 
+    /// Decodes the Jumping Sumo's completed ARStream 1 JPEG frame. The queue
+    /// is latest-frame bounded, so a slow JPEG or enhancement pass can drop an
+    /// obsolete frame but can never build latency in the driving view.
+    func display(mjpegData: Data, frameNumber: UInt64) {
+        mjpegDecodeLock.lock()
+        let request = MJPEGDecodeRequest(
+            data: mjpegData,
+            frameNumber: frameNumber,
+            arrivalNanoseconds: DispatchTime.now().uptimeNanoseconds,
+            generation: mjpegDecodeGeneration
+        )
+        if mjpegDecodeInFlight {
+            pendingMJPEGFrame = request
+            mjpegDecodeLock.unlock()
+            return
+        }
+        mjpegDecodeInFlight = true
+        mjpegDecodeLock.unlock()
+        decodeMJPEG(request)
+    }
+
+    private func decodeMJPEG(_ request: MJPEGDecodeRequest) {
+        mjpegDecodeQueue.async { [weak self] in
+            guard let self else { return }
+            autoreleasepool {
+                guard let source = CGImageSourceCreateWithData(request.data as CFData, nil),
+                      let image = CGImageSourceCreateImageAtIndex(source, 0, [
+                        kCGImageSourceShouldCache: true,
+                        kCGImageSourceShouldAllowFloat: false
+                      ] as CFDictionary) else {
+                    self.onDebug?("Jumping Sumo MJPEG frame decode failed")
+                    self.finishMJPEGDecode(request)
+                    return
+                }
+
+                self.mjpegDecodeLock.lock()
+                let isCurrent = request.generation == self.mjpegDecodeGeneration
+                self.mjpegDecodeLock.unlock()
+                guard isCurrent else {
+                    self.finishMJPEGDecode(request)
+                    return
+                }
+
+                let timing = self.mjpegTiming(for: request)
+                let dimensions = (width: image.width, height: image.height)
+                if self.mjpegFormat?.width != dimensions.width ||
+                    self.mjpegFormat?.height != dimensions.height {
+                    self.mjpegFormat = dimensions
+                    self.visibleSourceRect = CGRect(
+                        x: 0, y: 0,
+                        width: dimensions.width, height: dimensions.height
+                    )
+                    DispatchQueue.main.async { [weak self] in
+                        self?.onFormat?(dimensions.width, dimensions.height)
+                        self?.onCodedFormat?(dimensions.width, dimensions.height)
+                        self?.onDebug?("Jumping Sumo MJPEG decoder ready: \(dimensions.width)x\(dimensions.height)")
+                    }
+                }
+                self.recordFrameRate(decoded: 1, displayed: 0)
+                self.processingPipeline.submit(DecodedVideoFrame(
+                    image: .cgImage(image),
+                    timing: timing,
+                    visibleRect: self.visibleSourceRect,
+                    verifiedMotion: nil
+                ))
+                self.finishMJPEGDecode(request)
+            }
+        }
+    }
+
+    private func finishMJPEGDecode(_ request: MJPEGDecodeRequest) {
+        mjpegDecodeLock.lock()
+        let next = pendingMJPEGFrame
+        pendingMJPEGFrame = nil
+        if next == nil { mjpegDecodeInFlight = false }
+        mjpegDecodeLock.unlock()
+        if let next { decodeMJPEG(next) }
+    }
+
+    /// ARStream 1's fragment header exposes a frame counter, not the camera's
+    /// presentation timestamp. Preserve Sumo's observed arrival cadence rather
+    /// than assuming the aircraft's 30 fps H.264 clock. This also keeps a
+    /// coalesced/dropped MJPEG frame from making the processed recording run
+    /// artificially slow or fast.
+    private func mjpegTiming(for request: MJPEGDecodeRequest) -> VideoFrameTiming {
+        if mjpegTimingGeneration != request.generation {
+            mjpegTimingGeneration = request.generation
+            mjpegFirstArrivalNanoseconds = request.arrivalNanoseconds
+            mjpegLastArrivalNanoseconds = nil
+            mjpegNominalDurationSeconds = 1.0 / 30.0
+        }
+
+        let origin = mjpegFirstArrivalNanoseconds ?? request.arrivalNanoseconds
+        let elapsedNanoseconds = request.arrivalNanoseconds >= origin
+            ? request.arrivalNanoseconds - origin
+            : 0
+        if let previous = mjpegLastArrivalNanoseconds,
+           request.arrivalNanoseconds > previous {
+            let sample = Double(request.arrivalNanoseconds - previous) / 1_000_000_000
+            let bounded = min(0.2, max(1.0 / 60.0, sample))
+            mjpegNominalDurationSeconds = (mjpegNominalDurationSeconds * 0.8) + (bounded * 0.2)
+        }
+        mjpegLastArrivalNanoseconds = request.arrivalNanoseconds
+
+        let presentationTime = CMTime(
+            value: CMTimeValue(elapsedNanoseconds / 1_000),
+            timescale: 1_000_000
+        )
+        let duration = CMTime(
+            seconds: mjpegNominalDurationSeconds,
+            preferredTimescale: 90_000
+        )
+        return VideoFrameTiming(
+            rtpTimestamp: UInt32(truncatingIfNeeded: request.frameNumber),
+            presentationTime: presentationTime,
+            nominalDuration: duration
+        )
+    }
+
     func reset() {
         hardwareFallbackWorkItem?.cancel()
         hardwareFallbackWorkItem = nil
@@ -427,6 +569,12 @@ final class H264VideoView: NSView {
         try? extensionDumpHandle?.close()
         extensionDumpHandle = nil
         dumpedExtensionAccessUnits = 0
+        mjpegDecodeLock.lock()
+        mjpegDecodeGeneration &+= 1
+        pendingMJPEGFrame = nil
+        mjpegDecodeInFlight = false
+        mjpegDecodeLock.unlock()
+        mjpegFormat = nil
         frameRateLock.lock()
         decodedFramesInWindow = 0
         displayedFramesInWindow = 0

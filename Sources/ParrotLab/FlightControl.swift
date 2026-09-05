@@ -19,6 +19,7 @@ enum FlightControlAction: String, CaseIterable, Codable {
     case cameraLeft
     case cameraRight
     case cameraCenter
+    case highJump
     case emergency
 
     var title: String {
@@ -40,7 +41,30 @@ enum FlightControlAction: String, CaseIterable, Codable {
         case .cameraLeft: return "Camera left"
         case .cameraRight: return "Camera right"
         case .cameraCenter: return "Center camera"
+        case .highJump: return "High jump"
         case .emergency: return "Emergency cut-out"
+        }
+    }
+
+    var groundTitle: String {
+        switch self {
+        case .movementEnable: return "Movement safety hold"
+        case .pitchForward: return "Drive forward"
+        case .pitchBackward: return "Drive backward"
+        case .rollLeft: return "Turn left"
+        case .rollRight: return "Turn right"
+        case .highJump: return "High jump"
+        case .emergency: return "Stop movement"
+        default: return title
+        }
+    }
+
+    var isGroundRelevant: Bool {
+        switch self {
+        case .movementEnable, .pitchForward, .pitchBackward, .rollLeft, .rollRight, .highJump, .emergency:
+            return true
+        default:
+            return false
         }
     }
 
@@ -52,6 +76,10 @@ enum FlightControlAction: String, CaseIterable, Codable {
         default:
             return false
         }
+    }
+
+    var isControllerDirection: Bool {
+        isContinuousAxis && self != .movementEnable
     }
 }
 
@@ -108,6 +136,43 @@ enum FlightControllerButton: String, CaseIterable, Codable {
     }
 }
 
+/// A positive half-axis which can be assigned to an individual movement
+/// direction. Keeping the direction in the binding makes unconventional and
+/// accessibility-oriented stick layouts possible without special cases.
+enum FlightControllerAxisDirection: String, CaseIterable, Codable {
+    case unassigned
+    case leftStickLeft, leftStickRight, leftStickUp, leftStickDown
+    case rightStickLeft, rightStickRight, rightStickUp, rightStickDown
+
+    var title: String {
+        switch self {
+        case .unassigned: return "Not assigned"
+        case .leftStickLeft: return "Left stick ←"
+        case .leftStickRight: return "Left stick →"
+        case .leftStickUp: return "Left stick ↑"
+        case .leftStickDown: return "Left stick ↓"
+        case .rightStickLeft: return "Right stick ←"
+        case .rightStickRight: return "Right stick →"
+        case .rightStickUp: return "Right stick ↑"
+        case .rightStickDown: return "Right stick ↓"
+        }
+    }
+
+    func magnitude(on gamepad: GCExtendedGamepad) -> Float {
+        switch self {
+        case .unassigned: return 0
+        case .leftStickLeft: return max(0, -gamepad.leftThumbstick.xAxis.value)
+        case .leftStickRight: return max(0, gamepad.leftThumbstick.xAxis.value)
+        case .leftStickUp: return max(0, gamepad.leftThumbstick.yAxis.value)
+        case .leftStickDown: return max(0, -gamepad.leftThumbstick.yAxis.value)
+        case .rightStickLeft: return max(0, -gamepad.rightThumbstick.xAxis.value)
+        case .rightStickRight: return max(0, gamepad.rightThumbstick.xAxis.value)
+        case .rightStickUp: return max(0, gamepad.rightThumbstick.yAxis.value)
+        case .rightStickDown: return max(0, -gamepad.rightThumbstick.yAxis.value)
+        }
+    }
+}
+
 struct FlightControlConfiguration: Equatable, Codable {
     var standaloneBebopEnabled = false
     var keyboardEnabled = false
@@ -118,6 +183,7 @@ struct FlightControlConfiguration: Equatable, Codable {
     var invertGaz = false
     var keyboardKeys: [FlightControlAction: UInt16] = Self.defaultKeyboardKeys
     var controllerButtons: [FlightControlAction: FlightControllerButton] = Self.defaultControllerButtons
+    var controllerAxisDirections: [FlightControlAction: FlightControllerAxisDirection] = Self.defaultControllerAxisDirections
 
     static let defaultKeyboardKeys: [FlightControlAction: UInt16] = [
         .movementEnable: 56,
@@ -130,6 +196,7 @@ struct FlightControlConfiguration: Equatable, Codable {
         .cameraUp: 126, .cameraDown: 125,
         .cameraLeft: 123, .cameraRight: 124,
         .cameraCenter: 8,
+        .highJump: UInt16.max,
         .emergency: UInt16.max
     ]
 
@@ -140,15 +207,28 @@ struct FlightControlConfiguration: Equatable, Codable {
         .cameraUp: .dpadUp, .cameraDown: .dpadDown,
         .cameraLeft: .dpadLeft, .cameraRight: .dpadRight,
         .cameraCenter: .rightShoulder,
+        .highJump: .unassigned,
         .emergency: .unassigned
+    ]
+
+    static let defaultControllerAxisDirections: [FlightControlAction: FlightControllerAxisDirection] = [
+        .pitchForward: .rightStickUp, .pitchBackward: .rightStickDown,
+        .rollLeft: .rightStickLeft, .rollRight: .rightStickRight,
+        .yawLeft: .leftStickLeft, .yawRight: .leftStickRight,
+        .gazUp: .leftStickUp, .gazDown: .leftStickDown
     ]
 
     static let defaultsKey = "ParrotLab.FlightControl.ConfigurationV1"
 
     static func load() -> FlightControlConfiguration {
         guard let data = UserDefaults.standard.data(forKey: defaultsKey),
-              let decoded = try? JSONDecoder().decode(FlightControlConfiguration.self, from: data) else {
+              var decoded = try? JSONDecoder().decode(FlightControlConfiguration.self, from: data) else {
             return FlightControlConfiguration()
+        }
+        // ConfigurationV1 predates remappable analogue directions. An empty
+        // decoded map is the migration signal for those existing installs.
+        if decoded.controllerAxisDirections.isEmpty {
+            decoded.controllerAxisDirections = defaultControllerAxisDirections
         }
         return decoded
     }
@@ -156,6 +236,62 @@ struct FlightControlConfiguration: Equatable, Codable {
     func save() {
         guard let data = try? JSONEncoder().encode(self) else { return }
         UserDefaults.standard.set(data, forKey: Self.defaultsKey)
+    }
+
+    /// A physical button may trigger only one discrete action. Rebinding it
+    /// moves the button instead of leaving two commands on the same press.
+    mutating func bindControllerButton(_ button: FlightControllerButton, to action: FlightControlAction) {
+        if button != .unassigned {
+            for existingAction in FlightControlAction.allCases
+                where existingAction != action && controllerButtons[existingAction] == button {
+                controllerButtons[existingAction] = .unassigned
+            }
+        }
+        controllerButtons[action] = button
+    }
+
+    /// A physical half-axis drives one movement direction. Moving an existing
+    /// direction assignment avoids two actions firing from the same gesture.
+    mutating func bindControllerAxisDirection(
+        _ direction: FlightControllerAxisDirection,
+        to action: FlightControlAction
+    ) {
+        if direction != .unassigned {
+            for existingAction in FlightControlAction.allCases
+                where existingAction != action && controllerAxisDirections[existingAction] == direction {
+                controllerAxisDirections[existingAction] = .unassigned
+            }
+        }
+        controllerAxisDirections[action] = direction
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case standaloneBebopEnabled, keyboardEnabled, controllerEnabled
+        case controllerDeadzone, controllerSensitivity, invertPitch, invertGaz
+        case keyboardKeys, controllerButtons, controllerAxisDirections
+    }
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        standaloneBebopEnabled = try values.decodeIfPresent(Bool.self, forKey: .standaloneBebopEnabled) ?? false
+        keyboardEnabled = try values.decodeIfPresent(Bool.self, forKey: .keyboardEnabled) ?? false
+        controllerEnabled = try values.decodeIfPresent(Bool.self, forKey: .controllerEnabled) ?? false
+        controllerDeadzone = try values.decodeIfPresent(Double.self, forKey: .controllerDeadzone) ?? 0.12
+        controllerSensitivity = try values.decodeIfPresent(Double.self, forKey: .controllerSensitivity) ?? 0.75
+        invertPitch = try values.decodeIfPresent(Bool.self, forKey: .invertPitch) ?? false
+        invertGaz = try values.decodeIfPresent(Bool.self, forKey: .invertGaz) ?? false
+        keyboardKeys = try values.decodeIfPresent([FlightControlAction: UInt16].self, forKey: .keyboardKeys)
+            ?? Self.defaultKeyboardKeys
+        controllerButtons = try values.decodeIfPresent(
+            [FlightControlAction: FlightControllerButton].self,
+            forKey: .controllerButtons
+        ) ?? Self.defaultControllerButtons
+        controllerAxisDirections = try values.decodeIfPresent(
+            [FlightControlAction: FlightControllerAxisDirection].self,
+            forKey: .controllerAxisDirections
+        ) ?? Self.defaultControllerAxisDirections
     }
 }
 
@@ -233,6 +369,10 @@ final class FlightInputManager {
         controlsAreAvailable = available
         if !available { neutralize() }
         reportControllerStatus()
+    }
+
+    func reemitInput() {
+        emitCombinedInput()
     }
 
     func neutralize() {
@@ -315,18 +455,30 @@ final class FlightInputManager {
         }
         let deadzone = Float(configuration.controllerDeadzone)
         let sensitivity = Float(configuration.controllerSensitivity)
-        func scaled(_ value: Float, inverted: Bool = false) -> Int8 {
-            let source = inverted ? -value : value
-            guard abs(source) > deadzone else { return 0 }
-            let normalized = (abs(source) - deadzone) / max(0.001, 1 - deadzone)
-            let signed = copysign(pow(normalized, 1.35), source)
-            return Int8(clamping: Int((signed * sensitivity * 100).rounded()))
+        func scaledMagnitude(for action: FlightControlAction) -> Float {
+            let direction = configuration.controllerAxisDirections[action] ?? .unassigned
+            let source = direction.magnitude(on: gamepad)
+            guard source > deadzone else { return 0 }
+            let normalized = (source - deadzone) / max(0.001, 1 - deadzone)
+            return pow(normalized, 1.35) * sensitivity * 100
+        }
+        func axis(
+            negative: FlightControlAction,
+            positive: FlightControlAction,
+            inverted: Bool = false
+        ) -> Int8 {
+            let raw = scaledMagnitude(for: positive) - scaledMagnitude(for: negative)
+            return Int8(clamping: Int(((inverted ? -raw : raw)).rounded()))
         }
         controllerInput = BebopPilotingInput(
-            roll: scaled(gamepad.rightThumbstick.xAxis.value),
-            pitch: scaled(gamepad.rightThumbstick.yAxis.value, inverted: configuration.invertPitch),
-            yaw: scaled(gamepad.leftThumbstick.xAxis.value),
-            gaz: scaled(gamepad.leftThumbstick.yAxis.value, inverted: configuration.invertGaz)
+            roll: axis(negative: .rollLeft, positive: .rollRight),
+            pitch: axis(
+                negative: .pitchBackward,
+                positive: .pitchForward,
+                inverted: configuration.invertPitch
+            ),
+            yaw: axis(negative: .yawLeft, positive: .yawRight),
+            gaz: axis(negative: .gazDown, positive: .gazUp, inverted: configuration.invertGaz)
         )
 
         var nowPressed = Set<FlightControlAction>()
@@ -398,11 +550,24 @@ enum FlightControlSelfTest {
         ARSDKPhotoCommand.landing == Data([1, 0, 3, 0]),
         ARSDKPhotoCommand.emergency == Data([1, 0, 4, 0]),
         ARSDKPhotoCommand.navigateHome(start: true) == Data([1, 0, 5, 0, 1]),
-        ARSDKPhotoCommand.cameraOrientation(tilt: -100, pan: 100) == Data([1, 1, 0, 0, 156, 100]) else {
+        ARSDKPhotoCommand.cameraOrientation(tilt: -100, pan: 100) == Data([1, 1, 0, 0, 156, 100]),
+        JumpingSumoPilotingInput(sharedInput: BebopPilotingInput(
+            roll: -55, pitch: 80, yaw: 100, gaz: -100
+        )) == JumpingSumoPilotingInput(speed: 80, turn: -55),
+        ARSDKPhotoCommand.jumpingSumoPCMD(flag: true, speed: 80, turn: -55) ==
+            Data([3, 0, 0, 0, 1, 80, 201]) else {
             return false
         }
         var configuration = FlightControlConfiguration()
         configuration.controllerDeadzone = 0.18
+        configuration.bindControllerButton(.a, to: .returnHome)
+        configuration.bindControllerAxisDirection(.leftStickUp, to: .pitchForward)
+        guard configuration.controllerButtons[.returnHome] == .a,
+              configuration.controllerButtons[.takeOffLand] == .unassigned,
+              configuration.controllerAxisDirections[.pitchForward] == .leftStickUp,
+              configuration.controllerAxisDirections[.gazUp] == .unassigned else {
+            return false
+        }
         return (try? JSONDecoder().decode(
             FlightControlConfiguration.self,
             from: JSONEncoder().encode(configuration)

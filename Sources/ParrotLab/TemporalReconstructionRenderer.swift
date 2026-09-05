@@ -12,7 +12,7 @@ struct TemporalReconstructionRenderResult {
     let status: String
 }
 
-/// Experimental causal temporal reconstruction for decoded 900p video.
+/// Causal temporal reconstruction for decoded Bebop 900p and Sumo video.
 ///
 /// The previous source and history are first rotated into the current camera
 /// pose with the synchronized frame quaternion. Vision then estimates the
@@ -320,13 +320,14 @@ final class TemporalReconstructionRenderer {
             return result(started, flow: 0, used: false, status: "TEMPORAL RESET · DIMENSIONS CHANGED")
         }
 
-        guard align(
+        // Ground reuses history directly: no pose prewarp, extra copies or GPU wait.
+        guard configuration.flowOnlyGround || align(
             previousSource: previousSource,
             previousHistory: previousHistory,
             alignedSource: alignedSource,
             alignedHistory: alignedHistory,
-            previousMotion: previousMotion,
-            currentMotion: currentMotion
+            previousMotion: configuration.flowOnlyGround ? nil : previousMotion,
+            currentMotion: configuration.flowOnlyGround ? nil : currentMotion
         ) else {
             return result(started, flow: 0, used: false, status: "TEMPORAL BYPASS · IMU ALIGNMENT FAILED")
         }
@@ -335,7 +336,7 @@ final class TemporalReconstructionRenderer {
         let sourceHeight = CVPixelBufferGetHeight(currentSource)
         if abs(flowScaleCeiling - configuration.flowResolutionScale) > 0.001 {
             flowScaleCeiling = configuration.flowResolutionScale
-            adaptiveFlowScale = min(flowScaleCeiling, 0.25)
+            adaptiveFlowScale = min(flowScaleCeiling, configuration.flowOnlyGround ? 0.5 : 0.25)
         }
         let effectiveFlowScale = min(configuration.flowResolutionScale, adaptiveFlowScale)
         let flowWidth = Self.flowDimension(sourceWidth, scale: effectiveFlowScale)
@@ -349,7 +350,7 @@ final class TemporalReconstructionRenderer {
         let flowStarted = CFAbsoluteTimeGetCurrent()
         let flows: (backward: CVPixelBuffer, forward: CVPixelBuffer)
         let needsForwardFlow = configuration.usesBidirectionalFlow &&
-            (!configuration.generatesIntermediateFrames || intermediateDestination != nil)
+            (configuration.flowOnlyGround || !configuration.generatesIntermediateFrames || intermediateDestination != nil)
         do {
             flows = try opticalFlowPair(
                 current: flowCurrent,
@@ -406,12 +407,12 @@ final class TemporalReconstructionRenderer {
             used: true,
             status: String(
                 format: "TEMPORAL ACTIVE · %@ · %@ %dx%d FLOW %.1f ms%@",
-                previousMotion != nil && currentMotion != nil ? "IMU ALIGNED" : "FLOW ONLY",
+                configuration.flowOnlyGround ? "GROUND FLOW ONLY" : (previousMotion != nil && currentMotion != nil ? "IMU ALIGNED" : "FLOW ONLY"),
                 needsForwardFlow ? "BIDIRECTIONAL" : "FORWARD-SPARING",
                 flowWidth,
                 flowHeight,
                 flowLatency,
-                configuration.generatesIntermediateFrames ? " · FRAME GEN 45" : ""
+                generatedIntermediate ? " · MIDPOINT GENERATED" : ""
             ),
             generated: generatedIntermediate
         )

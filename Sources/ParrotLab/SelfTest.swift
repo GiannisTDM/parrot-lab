@@ -67,14 +67,33 @@ enum ParrotLabSelfTest {
             return 1
         }
 
-        let sdp = "HTTP/1.1 200 OK\r\n\r\nc=IN IP4 192.168.42.88\nm=video 55004 RTP/AVP 96\n"
-        guard RestreamProbe.firstCapture(#"m=video\s+(\d+)"#, in: sdp) == "55004" else {
+        let jpegSDP = "HTTP/1.1 200 OK\r\n\r\nc=IN IP4 192.168.42.88\nm=video 55004 RTP/AVP 96\na=rtpmap:96 JPEG/90000\r\n"
+        let jpegDescriptor = RestreamProbe.descriptor(from: jpegSDP, requestPort: 7711)
+        let h264Descriptor = RestreamProbe.descriptor(
+            from: "m=video 55004 RTP/AVP 97\r\na=rtpmap:97 H264/90000\r\n",
+            requestPort: 7711
+        )
+        let staticJPEGDescriptor = RestreamProbe.descriptor(
+            from: "m=video 55004 RTP/AVP 26\r\n",
+            requestPort: 7711
+        )
+        guard jpegDescriptor.videoPort == 55_004,
+              jpegDescriptor.payloadType == 96,
+              jpegDescriptor.codec == .jpeg,
+              jpegDescriptor.clockRate == 90_000,
+              h264Descriptor.codec == .h264,
+              staticJPEGDescriptor.codec == .jpeg,
+              staticJPEGDescriptor.clockRate == 90_000 else {
             fputs("Self-test failed: restream SDP parser\n", stderr)
             return 1
         }
 
         guard RTPH264Receiver.assemblySelfTest() else {
             fputs("Self-test failed: RTP/H.264 assembler\n", stderr)
+            return 1
+        }
+        guard RTPJPEGReceiver.selfTest() else {
+            fputs("Self-test failed: strict RTP/JPEG receiver\n", stderr)
             return 1
         }
 
@@ -104,7 +123,8 @@ enum ParrotLabSelfTest {
             fputs("Self-test failed: calibrated 900p camera/readout mapping\n", stderr)
             return 1
         }
-        guard TemporalReconstructionRenderer.selfTest() else {
+        guard TemporalReconstructionRenderer.selfTest(),
+              LiveVideoProcessingPipeline.groundTemporalSelfTest() else {
             fputs("Self-test failed: temporal reconstruction renderer\n", stderr)
             return 1
         }
@@ -131,11 +151,15 @@ enum ParrotLabSelfTest {
             return 1
         }
 
+        guard ARSDKPhotoCaptureSelfTest.run() else {
+            fputs("Self-test failed: ARSDK compatibility protocols\n", stderr)
+            return 1
+        }
+
         guard MediaFileNamer.selfTest(), StillImageWriter.selfTest(),
               H264StreamRecorder.selfTest(), ProcessedH264Recorder.selfTest(),
               H264MP4Converter.selfTest(),
-              ARSDKPhotoCaptureSelfTest.run(),
-              AircraftSupportSelfTest.run(),
+              ProductSupportSelfTest.run(),
               FlightControlSelfTest.run(),
               ARSDKTelemetryReducer.selfTest(),
               DroneMediaFTP.selfTest() else {

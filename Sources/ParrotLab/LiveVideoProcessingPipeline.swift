@@ -120,6 +120,8 @@ struct RollingShutterProcessingConfiguration: Equatable {
 
 struct TemporalReconstructionConfiguration: Equatable {
     var isEnabled = false
+    /// Ground uses image motion only; never apply aircraft calibration or IMU data.
+    var flowOnlyGround = false
     /// Maximum contribution from reprojected history in confident regions.
     var historyWeight = 0.58
     /// 0 accepts larger residuals; 1 aggressively rejects possible ghosts.
@@ -136,6 +138,33 @@ struct TemporalReconstructionConfiguration: Equatable {
     /// Inserts one motion-compensated midpoint after every two decoded source
     /// frames: 30 real + 15 generated = a bounded 45 fps output timeline.
     var generatesIntermediateFrames = false
+
+    static var ground720p45: Self {
+        var value = Self()
+        value.flowOnlyGround = true
+        value.historyWeight = 0.38
+        value.ghostRejection = 0.8
+        value.consistencyThresholdPixels = 1.5
+        value.latencyBudgetMilliseconds = 30
+        value.flowResolutionScale = 0.5
+        value.generatesIntermediateFrames = true
+        return value
+    }
+
+    func supportsSource(width: Int, height: Int) -> Bool {
+        flowOnlyGround
+            ? (32...1920).contains(width) && (32...1080).contains(height)
+            : width == Bebop900pCameraCalibration.width && height == Bebop900pCameraCalibration.height
+    }
+
+    func permitsInterpolation(duration: CMTime, gap: Double) -> Bool {
+        guard generatesIntermediateFrames, usesBidirectionalFlow else { return false }
+        guard flowOnlyGround else { return true }
+        let cadence = CMTimeGetSeconds(duration)
+        // Do not invent a 45 FPS claim for stock 15 FPS or interpolate across loss.
+        return cadence.isFinite && (1.0 / 36...1.0 / 24).contains(cadence)
+            && gap.isFinite && gap > 0 && gap <= 1.0 / 20
+    }
 }
 
 enum DecodedVideoImage {
@@ -187,6 +216,64 @@ struct LiveVideoProcessingStats: Equatable {
 /// in the FPV path. Output buffers are IOSurface-backed and can be handed
 /// directly to VideoToolbox without a CPU pixel copy.
 final class LiveVideoProcessingPipeline {
+    /// Offline regression: ground geometry, cadence, reset and generated output.
+    static func groundTemporalSelfTest() -> Bool {
+        var config = TemporalReconstructionConfiguration.ground720p45
+        let duration = CMTime(value: 3000, timescale: 90000)
+        guard config.flowOnlyGround, !config.isEnabled,
+              config.supportsSource(width: 640, height: 480),
+              config.supportsSource(width: 1280, height: 720),
+              !config.supportsSource(width: 4096, height: 3320),
+              !TemporalReconstructionConfiguration().supportsSource(width: 640, height: 480),
+              config.permitsInterpolation(duration: duration, gap: 1.0 / 30),
+              !config.permitsInterpolation(duration: CMTime(value: 6000, timescale: 90000), gap: 1.0 / 15),
+              !config.permitsInterpolation(duration: duration, gap: 0.1) else { return false }
+        let fourThree = VideoSpatialScalingMode.metalFX720p.outputDimensions(sourceWidth: 640, sourceHeight: 480)
+        let widescreen = VideoSpatialScalingMode.metalFX720p.outputDimensions(sourceWidth: 1280, sourceHeight: 720)
+        guard fourThree.width == 960, fourThree.height == 720,
+              widescreen.width == 1280, widescreen.height == 720 else { return false }
+        let pipeline = LiveVideoProcessingPipeline()
+        config.isEnabled = true
+        config.latencyBudgetMilliseconds = 2000 // Cold Vision initialization isn't a live budget test.
+        pipeline.configuration.temporal = config
+        let image = CIImage(color: CIColor(red: 0.35, green: 0.45, blue: 0.5))
+            .cropped(to: CGRect(x: 0, y: 0, width: 96, height: 72))
+        guard let source = pipeline.makePixelBuffer(width: 96, height: 72) else { return false }
+        pipeline.ciContext.render(image, to: source)
+        var lastPTS: CMTime?
+        var synthetic = 0
+        for index in 0..<7 {
+            let output = pipeline.process(DecodedVideoFrame(
+                image: .pixelBuffer(source),
+                timing: VideoFrameTiming(rtpTimestamp: UInt32(index * 3000),
+                    presentationTime: CMTime(value: Int64(index * 3000), timescale: 90000), nominalDuration: duration),
+                visibleRect: nil, verifiedMotion: nil
+            ))
+            guard !output.isEmpty else { return false }
+            for frame in output {
+                guard frame.width == 960, frame.height == 720 else { return false }
+                if let lastPTS, CMTimeCompare(frame.timing.presentationTime, lastPTS) <= 0 { return false }
+                lastPTS = frame.timing.presentationTime
+                if frame.isSynthetic { synthetic += 1 }
+            }
+        }
+        guard synthetic == 3 else { return false }
+        // A gap and a size change must seed fresh history, never warp stale frames.
+        let gap = pipeline.applyTemporalReconstruction(to: image,
+            timing: VideoFrameTiming(rtpTimestamp: 90000, presentationTime: CMTime(value: 1, timescale: 1), nominalDuration: duration),
+            motion: nil, configuration: config)
+        guard !gap.usedHistory, gap.intermediateImage == nil else { return false }
+        let resized = pipeline.applyTemporalReconstruction(
+            to: image.cropped(to: CGRect(x: 0, y: 0, width: 64, height: 48)),
+            timing: VideoFrameTiming(rtpTimestamp: 93000, presentationTime: CMTime(value: 93000, timescale: 90000), nominalDuration: duration),
+            motion: nil, configuration: config)
+        guard !resized.usedHistory, resized.intermediateImage == nil else { return false }
+        config.isEnabled = false
+        return pipeline.applyTemporalReconstruction(to: image,
+            timing: VideoFrameTiming(rtpTimestamp: 96000, presentationTime: CMTime(value: 96000, timescale: 90000), nominalDuration: duration),
+            motion: nil, configuration: config).status == "TEMPORAL OFF"
+    }
+
     var onFrame: ((ProcessedVideoFrame) -> Void)?
     var onStats: ((LiveVideoProcessingStats) -> Void)?
     var onDebug: ((String) -> Void)?
@@ -387,9 +474,11 @@ final class LiveVideoProcessingPipeline {
         let calibratedSourceWidth = Int(sourceExtent.width.rounded())
         let calibratedSourceHeight = Int(sourceExtent.height.rounded())
 
+        var rollingShutter = configuration.rollingShutter
+        if configuration.temporal.flowOnlyGround { rollingShutter.isEnabled = false }
         let rollingShutterResult = applyRollingShutterCorrection(
             to: image,
-            configuration: configuration.rollingShutter,
+            configuration: rollingShutter,
             previousMotion: previousMotion,
             currentMotion: input.verifiedMotion,
             sourceWidth: calibratedSourceWidth,
@@ -403,7 +492,7 @@ final class LiveVideoProcessingPipeline {
         let temporalResult = applyTemporalReconstruction(
             to: image,
             timing: input.timing,
-            motion: input.verifiedMotion,
+            motion: configuration.temporal.flowOnlyGround ? nil : input.verifiedMotion,
             configuration: configuration.temporal
         )
         image = temporalResult.image
@@ -413,11 +502,13 @@ final class LiveVideoProcessingPipeline {
         let enhancedExtent = image.extent.integral
         let sourceWidth = Int(enhancedExtent.width.rounded())
         let sourceHeight = Int(enhancedExtent.height.rounded())
-        var outputDimensions = configuration.scaling.outputDimensions(
+        let outputScaling: VideoSpatialScalingMode = configuration.temporal.flowOnlyGround && configuration.temporal.isEnabled
+            ? .metalFX720p : configuration.scaling
+        var outputDimensions = outputScaling.outputDimensions(
             sourceWidth: sourceWidth,
             sourceHeight: sourceHeight
         )
-        if configuration.scaling == .off,
+        if outputScaling == .off,
            configuration.enhancement == .upscale2x || configuration.enhancement == .upscaleClarity2x {
             outputDimensions = (Self.even(sourceWidth * 2), Self.even(sourceHeight * 2))
         }
@@ -429,8 +520,9 @@ final class LiveVideoProcessingPipeline {
         let frameGenerationActive = configuration.temporal.isEnabled &&
             configuration.temporal.generatesIntermediateFrames &&
             configuration.temporal.usesBidirectionalFlow &&
-            sourceWidth == Bebop900pCameraCalibration.width &&
-            sourceHeight == Bebop900pCameraCalibration.height &&
+            configuration.temporal.supportsSource(width: sourceWidth, height: sourceHeight) &&
+            configuration.temporal.permitsInterpolation(duration: input.timing.nominalDuration,
+                                                       gap: CMTimeGetSeconds(input.timing.nominalDuration)) &&
             !temporalResult.status.contains("BYPASS")
         let targetFrameRate = frameGenerationActive ? 45 : 30
         if let intermediateImage = temporalResult.intermediateImage,
@@ -441,8 +533,8 @@ final class LiveVideoProcessingPipeline {
                sourceHeight: sourceHeight,
                outputWidth: outputWidth,
                outputHeight: outputHeight,
-               scaling: configuration.scaling,
-               prefersFastScaling: true
+               scaling: outputScaling,
+               prefersFastScaling: !configuration.temporal.flowOnlyGround
            ) {
             sequenceNumber &+= 1
             outputs.append(ProcessedVideoFrame(
@@ -461,7 +553,7 @@ final class LiveVideoProcessingPipeline {
             sourceHeight: sourceHeight,
             outputWidth: outputWidth,
             outputHeight: outputHeight,
-            scaling: configuration.scaling
+            scaling: outputScaling
         ) else {
             emitDebug("Processed-frame pool exhausted; dropping this frame without delaying live video")
             return outputs
@@ -650,11 +742,12 @@ final class LiveVideoProcessingPipeline {
         let extent = image.extent.integral
         let width = Int(extent.width.rounded())
         let height = Int(extent.height.rounded())
-        guard width == Bebop900pCameraCalibration.width,
-              height == Bebop900pCameraCalibration.height else {
+        guard configuration.supportsSource(width: width, height: height) else {
             temporalReconstructionState = nil
             temporalFrameGenerationPhase = 0
-            return (image, nil, nil, "TEMPORAL BYPASS · REQUIRES 1600x900", nil, false)
+            return (image, nil, nil, configuration.flowOnlyGround
+                ? "GROUND FLOW BYPASS · SOURCE OUTSIDE 32…1920 × 32…1080"
+                : "TEMPORAL BYPASS · REQUIRES 1600x900", nil, false)
         }
         guard let temporalRenderer,
               let currentSource = makePixelBuffer(width: width, height: height) else {
@@ -669,6 +762,11 @@ final class LiveVideoProcessingPipeline {
             colorSpace: colorSpace
         )
 
+        if let previous = temporalReconstructionState,
+           CVPixelBufferGetWidth(previous.source) != width || CVPixelBufferGetHeight(previous.source) != height {
+            temporalReconstructionState = nil
+            temporalFrameGenerationPhase = 0
+        }
         guard let previous = temporalReconstructionState else {
             temporalReconstructionState = TemporalReconstructionState(
                 timing: timing,
@@ -679,7 +777,7 @@ final class LiveVideoProcessingPipeline {
             return (CIImage(cvPixelBuffer: currentSource), nil, nil, "TEMPORAL WARMING · NEED PREVIOUS FRAME", nil, false)
         }
         let delta = CMTimeGetSeconds(CMTimeSubtract(timing.presentationTime, previous.timing.presentationTime))
-        let maximumGap = max(0.2, CMTimeGetSeconds(timing.nominalDuration) * 6)
+        let maximumGap = configuration.flowOnlyGround ? 0.12 : max(0.2, CMTimeGetSeconds(timing.nominalDuration) * 6)
         guard delta.isFinite, delta > 0, delta <= maximumGap else {
             temporalReconstructionState = TemporalReconstructionState(
                 timing: timing,
@@ -691,10 +789,11 @@ final class LiveVideoProcessingPipeline {
             return (CIImage(cvPixelBuffer: currentSource), nil, nil, "TEMPORAL RESET · TIMELINE DISCONTINUITY", nil, false)
         }
         temporalFrameGenerationPhase = (temporalFrameGenerationPhase + 1) % 2
-        let shouldGenerateIntermediate = configuration.generatesIntermediateFrames &&
-            configuration.usesBidirectionalFlow && temporalFrameGenerationPhase == 0
-        guard let alignedSource = makePixelBuffer(width: width, height: height),
-              let alignedHistory = makePixelBuffer(width: width, height: height),
+        let shouldGenerateIntermediate = configuration.permitsInterpolation(
+            duration: timing.nominalDuration, gap: delta
+        ) && temporalFrameGenerationPhase == 0
+        guard let alignedSource = configuration.flowOnlyGround ? previous.source : makePixelBuffer(width: width, height: height),
+              let alignedHistory = configuration.flowOnlyGround ? previous.history : makePixelBuffer(width: width, height: height),
               let destination = makePixelBuffer(width: width, height: height) else {
             temporalReconstructionState = TemporalReconstructionState(
                 timing: timing,

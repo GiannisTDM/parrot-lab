@@ -19,11 +19,11 @@
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.4.0</string>
+    <string>1.5.0</string>
     <key>CFBundleVersion</key>
-    <string>10</string>
+    <string>11</string>
     <key>CFBundleGetInfoString</key>
-    <string>Parrot Lab 1.4.0</string>
+    <string>Parrot Lab 1.5.0</string>
     <key>NSHumanReadableCopyright</key>
     <string>Copyright © 2026 Parrot Lab contributors.</string>
     <key>LSMinimumSystemVersion</key>
@@ -31,7 +31,7 @@
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSLocalNetworkUsageDescription</key>
-    <string>Parrot Lab connects to a Bebop Drone or Bebop 2 directly or through a SkyController 2 for piloting, telemetry, media, and video.</string>
+    <string>Parrot Lab connects to a Bebop Drone, Bebop 2, or Jumping Sumo for control, telemetry, media, and video.</string>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
 </dict>

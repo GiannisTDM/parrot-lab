@@ -43,10 +43,25 @@ enum PreviewRenderer {
         return writePNG(of: hud, to: path)
     }
 
-    static func renderApplication(to path: String) -> Bool {
+    static func renderApplication(to path: String, groundMode: Bool = false) -> Bool {
         let controller = MainViewController()
         let appView = controller.view
-        appView.frame = NSRect(x: 0, y: 0, width: 1440, height: 900)
+        controller.setGroundModeForPreview(groundMode)
+        let compact = ProcessInfo.processInfo.environment["PARROTLAB_PREVIEW_COMPACT"] == "1"
+        appView.frame = NSRect(x: 0, y: 0, width: compact ? 1180 : 1440, height: compact ? 720 : 900)
+        let expanded = ProcessInfo.processInfo.environment["PARROTLAB_PREVIEW_EXPANDED"] == "1"
+        let focus = ProcessInfo.processInfo.environment["PARROTLAB_PREVIEW_FOCUS"] == "1"
+        func exercisePresentation(_ view: NSView) {
+            if expanded, let disclosure = view as? LabDisclosureButton, !disclosure.expanded {
+                disclosure.performClick(nil)
+            }
+            if let button = view as? NSButton,
+               (expanded && button.title == "Activity") || (focus && button.title == "Focus") {
+                button.performClick(nil)
+            }
+            view.subviews.forEach(exercisePresentation)
+        }
+        exercisePresentation(appView)
         appView.layoutSubtreeIfNeeded()
         appView.displayIfNeeded()
         return writePNG(of: appView, to: path)
