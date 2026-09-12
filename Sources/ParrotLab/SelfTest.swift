@@ -105,7 +105,7 @@ enum ParrotLabSelfTest {
             fputs("Self-test failed: Dragon profile/custom launch\n", stderr)
             return 1
         }
-        guard BebopToolInstaller.selfTest() else {
+        guard BebopToolInstaller.selfTest(), SumoDeviceTools.selfTest(), SumoBridgeUploader.selfTest(), TelnetClient.bridgeSelfTest(), AppDelegate.toolsMenuSelfTest() else {
             fputs("Self-test failed: bundled device tools\n", stderr)
             return 1
         }
@@ -121,6 +121,10 @@ enum ParrotLabSelfTest {
               Bebop900pCalibrationTextureSet.selfTest(),
               RollingShutterMetalRenderer.selfTest() else {
             fputs("Self-test failed: calibrated 900p camera/readout mapping\n", stderr)
+            return 1
+        }
+        guard SC2MappingProtocol.selfTest() else {
+            fputs("Self-test failed: SC2 native mapping protocol\n", stderr)
             return 1
         }
         guard TemporalReconstructionRenderer.selfTest(),
@@ -164,6 +168,12 @@ enum ParrotLabSelfTest {
               ARSDKTelemetryReducer.selfTest(),
               DroneMediaFTP.selfTest() else {
             fputs("Self-test failed: local media capture\n", stderr)
+            return 1
+        }
+
+        guard MiniDroneSelfTest.run() else { return 1 }
+        guard AppDelegate.settingsInteractionSelfTest() else {
+            fputs("Self-test failed: settings interaction\n", stderr)
             return 1
         }
 

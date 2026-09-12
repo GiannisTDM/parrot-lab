@@ -5,6 +5,8 @@ enum BebopToolPackage: String {
     case dragonLab
     case persistentTelnet
     case rfModSuite
+    case sumoRFModSuite
+    case sumoB29Launcher
     case sc2Discovery
     case sc2DriverPatch
 
@@ -17,6 +19,8 @@ enum BebopToolPackage: String {
         case .dragonLab: return "Dragon Lab"
         case .persistentTelnet: return "Persistent Bebop Telnet"
         case .rfModSuite: return "RF/MOD Suite"
+        case .sumoRFModSuite: return "Sumo RF Lab"
+        case .sumoB29Launcher: return "Sumo B29 Launcher"
         case .sc2Discovery: return "SC2 Address Discovery"
         case .sc2DriverPatch: return "SC2 Driver Patch"
         }
@@ -53,6 +57,10 @@ enum BebopToolPackage: String {
                     remoteName: "parrot_rf_lab.sh"
                 )
             ]
+        case .sumoRFModSuite:
+            return [BebopToolAsset(sourceRelativePath: "tools/parrot_sumo_rf_lab.sh", remoteName: "parrot_sumo_rf_lab.sh")]
+        case .sumoB29Launcher:
+            return [BebopToolAsset(sourceRelativePath: "tools/start_sumo_b29.sh", remoteName: "start_sumo_b29.sh")]
         case .sc2Discovery:
             return [
                 BebopToolAsset(
@@ -134,6 +142,17 @@ enum BebopToolInstallerError: LocalizedError {
 /// It never writes outside FTP-visible `internal_000` and verifies every
 /// upload by downloading it again and comparing a SHA-256 digest.
 final class BebopToolInstaller: @unchecked Sendable {
+    /// Small Sumo scripts can travel over an SC2 Telnet tunnel when direct FTP
+    /// is not reachable. Never expose arbitrary files/binaries to this path.
+    static func sumoScript(_ package: BebopToolPackage) throws -> (Data, BebopInstalledAsset) {
+        guard package == .sumoB29Launcher || package == .sumoRFModSuite,
+              let asset = package.assets.first else { throw BebopToolInstallerError.invalidHost }
+        let data = try Data(contentsOf: resolve(asset))
+        guard data.count <= 32_768 else { throw BebopToolInstallerError.oversizedAsset(asset.remoteName) }
+        return (data, BebopInstalledAsset(assetName: asset.remoteName, remoteName: asset.remoteName,
+                byteCount: data.count, sha256: hex(SHA256.hash(data: data)), md5: hex(Insecure.MD5.hash(data: data))))
+    }
+
     static let maximumAssetBytes = 50 * 1_024 * 1_024
 
     var onProgress: ((String) -> Void)?
@@ -321,6 +340,8 @@ final class BebopToolInstaller: @unchecked Sendable {
         return BebopToolPackage.dragonLab.assets.allSatisfy { (try? resolve($0)) != nil } &&
             BebopToolPackage.persistentTelnet.assets.allSatisfy { (try? resolve($0)) != nil } &&
             BebopToolPackage.rfModSuite.assets.allSatisfy { (try? resolve($0)) != nil } &&
+            BebopToolPackage.sumoRFModSuite.assets.allSatisfy { (try? resolve($0)) != nil } &&
+            BebopToolPackage.sumoB29Launcher.assets.allSatisfy { (try? resolve($0)) != nil } &&
             BebopToolPackage.sc2Discovery.assets.allSatisfy { (try? resolve($0)) != nil } &&
             BebopToolPackage.sc2DriverPatch.assets.allSatisfy { (try? resolve($0)) != nil }
     }

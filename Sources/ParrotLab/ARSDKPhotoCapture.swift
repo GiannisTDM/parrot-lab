@@ -82,7 +82,7 @@ enum ARSDKTelemetryEvent: Equatable {
 }
 
 enum ARSDKPhotoCommand {
-    enum JumpingSumoJumpType: UInt8 {
+    enum JumpingSumoJumpType: Int32 {
         case long = 0
         case high = 1
     }
@@ -143,7 +143,10 @@ enum ARSDKPhotoCommand {
 
     /// JumpingSumo.Animations.Jump (project 3, class 2, command 3).
     static func jumpingSumoJump(_ type: JumpingSumoJumpType) -> Data {
-        Data([3, 2, 3, 0, type.rawValue])
+        // ARCommands enums occupy four little-endian bytes, even when the
+        // only values are 0 and 1. A one-byte argument is a truncated command.
+        var value = type.rawValue.littleEndian
+        return Data([3, 2, 3, 0]) + withUnsafeBytes(of: &value) { Data($0) }
     }
 
     /// Jumping Sumo project 3, MediaStreaming class 18, VideoEnable command 0.
@@ -700,6 +703,7 @@ enum ARSDKPhotoConnectionError: LocalizedError {
 final class ARSDKCommandClient {
     var onEvent: ((ARSDKPhotoEvent) -> Void)?
     var onTelemetryEvent: ((ARSDKTelemetryEvent) -> Void)?
+    var onSC2MappingEvent: ((SC2MappingEvent) -> Void)?
     var onVideoAccessUnit: ((H264AccessUnit) -> Void)?
     var onMJPEGFrame: ((Data, UInt64) -> Void)?
     var onARStream1Diagnostics: ((ARStream1VideoDiagnostics) -> Void)?
@@ -797,6 +801,20 @@ final class ARSDKCommandClient {
     func sendRequestSkyControllerAllStates() {
         sendCommand(ARSDKPhotoCommand.requestSkyControllerAllStates)
     }
+    func requestSC2Mappings() {
+        queue.async { [weak self] in
+            guard let self, self.connectionRoute == .skyController else { return }
+            self.sendAcknowledgedFrame(payload: Data([4, 4, 0, 0])) // Skyctrl.Settings.AllSettings
+            self.sendAcknowledgedFrame(payload: ARSDKPhotoCommand.requestSkyControllerAllStates)
+        }
+    }
+    func sendSC2Mapping(product: UInt16, change: SC2MappingChange) {
+        guard let payload = SC2MappingProtocol.command(product: product, change: change) else { return }
+        queue.async { [weak self] in
+            guard let self, self.connectionRoute == .skyController else { return }
+            self.sendAcknowledgedFrame(payload: payload)
+        }
+    }
     func sendRequestAllSettings() { sendCommand(ARSDKPhotoCommand.requestAllSettings) }
     func sendVideoEnable(_ enabled: Bool) {
         let payload = productModel.capabilities.supportsJumpingSumoCommands
@@ -804,9 +822,9 @@ final class ARSDKCommandClient {
             : ARSDKPhotoCommand.videoEnable(enabled)
         sendCommand(payload)
     }
-    func sendJumpingSumoHighJump() {
+    func sendJumpingSumoJump(_ type: ARSDKPhotoCommand.JumpingSumoJumpType) {
         guard productModel.capabilities.supportsJumpingSumoCommands else { return }
-        sendAcknowledgedCommand(ARSDKPhotoCommand.jumpingSumoJump(.high))
+        sendAcknowledgedCommand(ARSDKPhotoCommand.jumpingSumoJump(type))
     }
     func sendTakeOff() {
         guard productModel.capabilities.supportsSharedARDrone3Commands else { return }
@@ -1237,6 +1255,10 @@ final class ARSDKCommandClient {
                 continue
             }
 
+            if connectionRoute == .skyController, (id == 126 || id == 127),
+               let event = SC2MappingProtocol.decode(payload) {
+                DispatchQueue.main.async { [weak self] in self?.onSC2MappingEvent?(event) }
+            }
             if (id == 126 || id == 127), let event = ARSDKPhotoProtocol.decode(payload) {
                 DispatchQueue.main.async { [weak self] in self?.onEvent?(event) }
             }

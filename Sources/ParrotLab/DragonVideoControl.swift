@@ -82,7 +82,6 @@ struct DragonVideoProfile: Equatable {
     }
 
     static let restoreCommand = "sh \(helperPath) restore LANDED; exit"
-    static let statusCommand = "sh \(helperPath) status; exit"
 
     static func selfTest() -> Bool {
         guard let profile = DragonVideoProfile(

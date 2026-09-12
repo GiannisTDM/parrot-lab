@@ -110,7 +110,6 @@ final class MainViewController: NSViewController {
     private var productModel: ParrotProductModel = .unknown
     private var groundModeRequested = UserDefaults.standard.bool(forKey: "ParrotLab.GroundMode")
     private var aircraftFirmwareSoftware: String?
-    private var aircraftFirmwareHardware: String?
     private var lastARSDKTelemetryAt: Date?
     private var telemetryFreshnessTimer: Timer?
     private var lastFlightStateUpdate: Date?
@@ -198,6 +197,14 @@ final class MainViewController: NSViewController {
     private var sc2DiscoveryResult: String?
     private var sc2DiscoveryTimeoutTimer: Timer?
     private var rfPowerOperationInFlight = false
+    private var rfPowerSC2Only = false
+    private let sumoToolTelnet = TelnetClient()
+    private let sumoBridgeUploader = SumoBridgeUploader()
+    private var sumoToolBridgeHost: String?
+    private var sumoToolTimeout: Timer?
+    private var sumoToolToken: String?
+    private var sumoToolSuccessTitle = ""
+    private var sumoToolSuccessMessage = ""
     private var rfPowerMode: RFPowerMode?
     private var rfPowerPhase = RFPowerPhase.idle
     private var rfPowerSC2Host: String?
@@ -216,10 +223,14 @@ final class MainViewController: NSViewController {
     private static let jumpingSumoSpeedLimitPreferenceKey = "ParrotLab.JumpingSumoSpeedLimit"
     private static let defaultJumpingSumoHost = "192.168.2.1"
     private static let groundModePreferenceKey = "ParrotLab.GroundMode"
-    private static let airStandaloneBeforeGroundPreferenceKey = "ParrotLab.AirStandaloneBeforeGroundMode"
 
     private let hudView = VideoHUDView(frame: .zero)
     private let workbenchSubtitle = NSTextField(labelWithString: "BEBOP VIDEO & RF WORKBENCH")
+    private var miniDroneController: MiniDroneViewController?
+    private weak var standardWorkspaceView: NSView?
+    private let miniDroneModeButton = NSButton(title: "MiniDrone", target: nil, action: nil)
+    var isMiniDroneModeActive: Bool { miniDroneController != nil }
+
     private let groundModeButton = NSButton(title: "GROUND MODE", target: nil, action: nil)
     private let hostField = NSTextField(string: "192.168.42.88")
     private let hostSectionLabel = NSTextField(labelWithString: "SC2 HOST")
@@ -263,6 +274,12 @@ final class MainViewController: NSViewController {
     private var activityPanelHeight: NSLayoutConstraint?
     private var activityScroll: NSScrollView?
     private var sidebarView: NSView?
+    private var sc2MappingWindow: SC2MappingWindowController?
+    private var sc2Mappings = SC2MappingState()
+    private var sc2MappingPending: (product: UInt16, change: SC2MappingChange)?
+    private var sc2MappingTimeout: Timer?
+    private var sc2MappingMessage = "Connect through SC2, then reload its mapping."
+    private var sc2MappingReadRequired = false
     private var toolbarView: NSView?
     private var presentedGroundMode: Bool?
     private let focusButton = NSButton(title: "Focus", target: nil, action: nil)
@@ -326,6 +343,7 @@ final class MainViewController: NSViewController {
 
     private func buildInterface() {
         let root = NSStackView()
+        standardWorkspaceView = root
         root.orientation = .vertical
         root.alignment = .width
         root.spacing = 12
@@ -398,7 +416,7 @@ final class MainViewController: NSViewController {
         let title = NSTextField(labelWithString: "Parrot Lab")
         title.font = .systemFont(ofSize: 21, weight: .semibold)
         title.textColor = .white
-        let version = sectionLabel("1.5")
+        let version = sectionLabel("1.6")
         version.textColor = LabVisualStyle.accent
         titleRow.addArrangedSubview(title)
         titleRow.addArrangedSubview(version)
@@ -412,6 +430,9 @@ final class MainViewController: NSViewController {
         groundModeButton.widthAnchor.constraint(equalToConstant: 136).isActive = true
         groundModeButton.toolTip = "Switch between the air and ground workspaces"
         top.addArrangedSubview(groundModeButton)
+        styleButton(miniDroneModeButton, action: #selector(enterMiniDroneMode), symbol: "sparkles")
+        miniDroneModeButton.toolTip = "Connect a Mambo over Bluetooth"
+        top.addArrangedSubview(miniDroneModeButton)
         top.addArrangedSubview(toolbarSpacer())
         styleButton(focusButton, action: #selector(toggleFocus), symbol: "sidebar.right")
         focusButton.setButtonType(.pushOnPushOff)
@@ -945,13 +966,69 @@ final class MainViewController: NSViewController {
         activeARSDKRoute = enabled ? .directProduct : .skyController
         if enabled {
             hostField.stringValue = Self.defaultJumpingSumoHost
-            videoModePopup.selectItem(withTag: VideoReceiveMode.compatibility.rawValue)
-            hudView.videoView.receiveMode = .compatibility
+            setVideoMode(.compatibility)
         }
         setDisconnectedInterface()
         applyGroundModeAppearance()
         updateWindowIdentity()
         updateInterface()
+    }
+
+    @objc func enterMiniDroneMode() {
+        guard !isMiniDroneModeActive, !miniDroneModeBlocked else { return }
+        if videoRunning { startVideo() }
+        flightInputManager.neutralize()
+        directProductDiscovery.stop()
+        stopARSDKTelemetry()
+        telnet.stop()
+        setDisconnectedInterface()
+        let mini = MiniDroneViewController()
+        miniDroneController = mini
+        addChild(mini)
+        mini.view.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(mini.view)
+        NSLayoutConstraint.activate([
+            mini.view.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            mini.view.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            mini.view.topAnchor.constraint(equalTo: view.topAnchor),
+            mini.view.bottomAnchor.constraint(equalTo: view.bottomAnchor)
+        ])
+        standardWorkspaceView?.isHidden = true
+        flightInputManager.setGroundMode(false)
+        mini.onConnectionChanged = { [weak self] in self?.updateFlightControlAvailability() }
+        mini.onNeutralize = { [weak self] in self?.flightInputManager.neutralize() }
+        mini.onExit = { [weak self] ground in self?.leaveMiniDroneMode(ground: ground) }
+        updateFlightControlAvailability()
+        updateWindowIdentity()
+        onGroundModeChanged?(false)
+        LabMotion.reveal(mini.view)
+    }
+
+    private var miniDroneModeBlocked: Bool {
+        toolUploadInFlight || dragonCommandInFlight || dronePhotoInFlight ||
+        persistentTelnetInstallInFlight || sc2DriverInstallInFlight ||
+        rfPowerOperationInFlight || sc2DiscoveryInFlight || sumoToolToken != nil ||
+        isMagnetometerCalibrationActive || (arsdkConnected && !groundModeActive && !hasFreshLandedTelemetry)
+    }
+
+    private func leaveMiniDroneMode(ground: Bool) {
+        guard let mini = miniDroneController else { return }
+        flightInputManager.setControlsAvailable(false)
+        mini.client.onChange = nil
+        mini.client.disconnect()
+        mini.view.removeFromSuperview()
+        mini.removeFromParent()
+        miniDroneController = nil
+        standardWorkspaceView?.isHidden = false
+        if groundModeRequested != ground {
+            groundModeButton.state = ground ? .on : .off
+            toggleGroundMode()
+        } else {
+            applyGroundModeAppearance()
+            updateWindowIdentity()
+            updateInterface()
+            onGroundModeChanged?(groundModeActive)
+        }
     }
 
     @objc private func toggleGroundMode() {
@@ -978,8 +1055,7 @@ final class MainViewController: NSViewController {
                       Self.isValidIPv4Host(cached) {
                 hostField.stringValue = cached
             }
-            videoModePopup.selectItem(withTag: VideoReceiveMode.compatibility.rawValue)
-            hudView.videoView.receiveMode = .compatibility
+            setVideoMode(.compatibility)
             appendLog("Ground mode enabled · Jumping Sumo through \(activeARSDKRoute.displayName)")
         } else {
             if !flightControlConfiguration.standaloneBebopEnabled,
@@ -1000,7 +1076,9 @@ final class MainViewController: NSViewController {
     }
 
     private func applyGroundModeAppearance() {
+        guard !isMiniDroneModeActive else { return }
         let active = groundModeActive
+        flightInputManager.setGroundMode(active)
         let modeChanged = presentedGroundMode != nil && presentedGroundMode != active
         presentedGroundMode = active
         if modeChanged {
@@ -1046,6 +1124,7 @@ final class MainViewController: NSViewController {
     }
 
     private func wireDataSources() {
+        arsdkClient.onSC2MappingEvent = { [weak self] event in self?.consumeSC2Mapping(event) }
         directProductDiscovery.onDetected = { [weak self] model, serviceName in
             guard let self, self.standaloneBebopEnabled else { return }
             if self.groundModeRequested, model != .jumpingSumo { return }
@@ -1118,7 +1197,12 @@ final class MainViewController: NSViewController {
             self.hudView.videoView.display(mjpegData: jpeg, frameNumber: frameNumber)
         }
         flightInputManager.onPilotingInput = { [weak self] input in
-            guard let self, self.arsdkConnected, self.flightControlsEnabled else { return }
+            guard let self else { return }
+            if let mini = self.miniDroneController {
+                mini.client.input = self.flightControlsEnabled ? input : .neutral
+                return
+            }
+            guard self.arsdkConnected, self.flightControlsEnabled else { return }
             var routedInput = input
             if self.groundModeActive {
                 routedInput.pitch = Int8(clamping: Int((
@@ -1336,7 +1420,6 @@ final class MainViewController: NSViewController {
         arsdkTelemetryReducer.reset()
         applyDetectedProduct(groundModeRequested ? .jumpingSumo : .unknown, source: "new connection")
         aircraftFirmwareSoftware = nil
-        aircraftFirmwareHardware = nil
         snapshot = TelemetrySnapshot()
         lastFlightStateUpdate = nil
         connectButton.title = "Disconnect"
@@ -1357,7 +1440,7 @@ final class MainViewController: NSViewController {
     }
 
     private func startARSDKTelemetry(host: String, forceReconnect: Bool = false) {
-        guard !host.isEmpty, connectButton.title == "Disconnect" else { return }
+        guard !isMiniDroneModeActive, !host.isEmpty, connectButton.title == "Disconnect" else { return }
         arsdkSessionWanted = true
         if forceReconnect {
             arsdkClient.stop()
@@ -1366,6 +1449,7 @@ final class MainViewController: NSViewController {
         }
         guard !arsdkConnected, !arsdkConnectionInFlight else { return }
 
+        resetSC2MappingSession()
         arsdkConnectionInFlight = true
         let standalone = flightControlConfiguration.standaloneBebopEnabled
         let route: ARSDKConnectionRoute = standalone ? .directProduct : .skyController
@@ -1460,6 +1544,7 @@ final class MainViewController: NSViewController {
     }
 
     private func stopARSDKTelemetry() {
+        resetSC2MappingSession()
         arsdkClient.neutralizePilotingInput()
         arsdkClient.stopPiloting()
         arsdkSessionWanted = false
@@ -1477,6 +1562,122 @@ final class MainViewController: NSViewController {
         directVideoPortNegotiated = nil
         flightInputManager.setControlsAvailable(false)
         arsdkClient.stop()
+    }
+
+    func showSC2Mappings() {
+        guard !isMiniDroneModeActive else { return }
+        if sc2MappingWindow == nil {
+            let panel = SC2MappingWindowController()
+            panel.onReload = { [weak self] in self?.reloadSC2Mappings() }
+            panel.onChange = { [weak self] change in self?.changeSC2Mapping(change) }
+            sc2MappingWindow = panel
+        }
+        refreshSC2MappingWindow()
+        sc2MappingWindow?.showWindow(nil)
+        reloadSC2Mappings()
+    }
+
+    private var sc2MappingBankMatchesVehicle: Bool {
+        guard let bank = sc2Mappings.activeProduct else { return false }
+        // The documented Sumo mppd patch aliases the Bebop 1 mapper bank.
+        // Trust active_product rather than blindly sending product 0902.
+        return productModel == .jumpingSumo ? (bank == 0x0901 || bank == 0x0902) : bank == productModel.productID
+    }
+
+    private var canEditSC2Mapping: Bool {
+        let telemetryFresh = lastARSDKTelemetryAt.map { Date().timeIntervalSince($0) < 12 } ?? false
+        return arsdkConnected && activeARSDKRoute == .skyController && telemetryFresh &&
+            sc2Mappings.ready && sc2Mappings.hasActiveAssignments && sc2MappingBankMatchesVehicle && sc2MappingPending == nil && !sc2MappingReadRequired &&
+            (groundModeActive || snapshot.flightState == "LANDED") && !toolUploadInFlight && !dragonCommandInFlight
+    }
+
+    private func resetSC2MappingSession() {
+        sc2MappingTimeout?.invalidate(); sc2MappingTimeout = nil
+        sc2MappingPending = nil
+        sc2MappingReadRequired = false
+        sc2Mappings = SC2MappingState()
+        sc2MappingMessage = "Connection changed. Reload to read the current SC2 mapping."
+        refreshSC2MappingWindow()
+    }
+
+    private func reloadSC2Mappings() {
+        guard sc2MappingPending == nil else { return }
+        guard arsdkConnected, activeARSDKRoute == .skyController else {
+            sc2MappingMessage = "Connect via SkyController 2 first. Mac keyboard/gamepad mappings are separate."
+            refreshSC2MappingWindow(); return
+        }
+        sc2MappingTimeout?.invalidate()
+        sc2MappingReadRequired = false
+        sc2Mappings = SC2MappingState()
+        sc2MappingMessage = "Reading the controller's active mapping bank…"
+        arsdkClient.requestSC2Mappings()
+        sc2MappingTimeout = Timer.scheduledTimer(withTimeInterval: 8, repeats: false) { [weak self] _ in
+            guard let self else { return }
+            self.sc2MappingMessage = "SC2 did not provide a complete native mapper state. No mappings were changed. Check firmware support, then Reload."
+            self.refreshSC2MappingWindow()
+        }
+        refreshSC2MappingWindow()
+    }
+
+    private func consumeSC2Mapping(_ event: SC2MappingEvent) {
+        guard arsdkConnected, activeARSDKRoute == .skyController else { return }
+        let previousProduct = sc2Mappings.activeProduct
+        sc2Mappings.consume(event)
+        if case .activeProduct = event, previousProduct != nil, previousProduct != sc2Mappings.activeProduct {
+            sc2MappingPending = nil; sc2MappingTimeout?.invalidate()
+            sc2MappingMessage = "Controller switched mapping banks. Review the current assignments before editing."
+        }
+        if let pending = sc2MappingPending, case let .entry(entry) = event,
+           entry.product == pending.product, pending.change.matches(entry) {
+            sc2MappingPending = nil; sc2MappingTimeout?.invalidate(); sc2MappingTimeout = nil
+            sc2MappingMessage = "Mapping confirmed by SkyController 2."
+            appendLog("SC2 native mapping confirmed · bank \(String(format: "0x%04X", entry.product))")
+        } else if sc2Mappings.ready, sc2MappingPending == nil {
+            sc2MappingTimeout?.invalidate(); sc2MappingTimeout = nil
+            if sc2MappingMessage.hasPrefix("Reading") { sc2MappingMessage = "Controller mapping loaded." }
+        }
+        refreshSC2MappingWindow()
+    }
+
+    private func changeSC2Mapping(_ change: SC2MappingChange) {
+        guard canEditSC2Mapping, let product = sc2Mappings.activeProduct,
+              SC2MappingProtocol.command(product: product, change: change) != nil else {
+            sc2MappingMessage = "Mapping not sent. Connect through SC2 and park/land the vehicle before editing."
+            refreshSC2MappingWindow(); return
+        }
+        sc2MappingPending = (product, change)
+        sc2MappingMessage = "Waiting for SC2 to confirm the mapping…"
+        arsdkClient.sendSC2Mapping(product: product, change: change)
+        sc2MappingTimeout?.invalidate()
+        sc2MappingTimeout = Timer.scheduledTimer(withTimeInterval: 5, repeats: false) { [weak self] _ in
+            guard let self else { return }
+            self.sc2MappingPending = nil
+            self.sc2MappingReadRequired = true
+            self.sc2Mappings.completed.removeAll() // Require explicit readback after an uncertain write.
+            self.sc2MappingMessage = "SC2 did not confirm this change. It may have applied; Reload before editing again."
+            self.appendLog("SC2 mapping change unconfirmed; explicit reload required")
+            self.refreshSC2MappingWindow()
+        }
+        refreshSC2MappingWindow()
+    }
+
+    private func refreshSC2MappingWindow() {
+        guard let panel = sc2MappingWindow else { return }
+        var message = sc2MappingMessage
+        if let product = sc2Mappings.activeProduct {
+            message += " Bank \(String(format: "0x%04X", product))."
+            if groundModeActive && product == 0x0901 {
+                message += " Sumo shares this bank with Bebop 1; changes affect both."
+            }
+        }
+        if !groundModeActive && snapshot.flightState != "LANDED" {
+            message += " Land the aircraft to enable editing."
+        }
+        if sc2Mappings.ready && (!sc2Mappings.hasActiveAssignments || !sc2MappingBankMatchesVehicle) {
+            message += " No verified mapping bank for this vehicle. Firmware mapper support needs checking; edits are disabled."
+        }
+        message += " Center sticks and keep the vehicle stationary. Remaps run on SC2, not the Mac."
+        panel.refresh(state: sc2Mappings, ground: groundModeActive, enabled: canEditSC2Mapping, message: message)
     }
 
     private func setDisconnectedInterface() {
@@ -1498,6 +1699,13 @@ final class MainViewController: NSViewController {
     }
 
     private func updateFlightControlAvailability() {
+        if let mini = miniDroneController {
+            let available = mini.client.ready && flightControlsEnabled
+            flightInputManager.setControlsAvailable(available)
+            mini.client.controlsEnabled = available
+            mini.refreshInputs(flightControlsEnabled ? flightControlStatus : "Keyboard and gamepad are off. Enable them in Configure controls.")
+            return
+        }
         let available = arsdkConnected && flightControlsEnabled && !isMagnetometerCalibrationActive
         flightInputManager.setControlsAvailable(available)
         if available {
@@ -1508,11 +1716,15 @@ final class MainViewController: NSViewController {
     }
 
     private func performFlightControlAction(_ action: FlightControlAction) {
+        if let mini = miniDroneController {
+            if flightControlsEnabled { mini.perform(action) }
+            return
+        }
         guard arsdkConnected, flightControlsEnabled else { return }
         if groundModeActive {
-            if action == .highJump {
-                appendLog("Ground control: high jump")
-                arsdkClient.sendJumpingSumoHighJump()
+            if let jumpType = action.jumpingSumoJumpType {
+                appendLog("Ground control: \(action.groundTitle.lowercased()) requested")
+                arsdkClient.sendJumpingSumoJump(jumpType)
             } else if action == .emergency {
                 flightInputManager.neutralize()
                 arsdkClient.neutralizePilotingInput()
@@ -1563,6 +1775,7 @@ final class MainViewController: NSViewController {
     }
 
     private func consumeARSDKTelemetry(_ event: ARSDKTelemetryEvent) {
+        guard !isMiniDroneModeActive else { return }
         switch event {
         case .aircraftConnection(let status, let deviceName, let productID):
             lastARSDKTelemetryAt = Date()
@@ -1584,7 +1797,6 @@ final class MainViewController: NSViewController {
         case .productVersion(let software, let hardware):
             lastARSDKTelemetryAt = Date()
             aircraftFirmwareSoftware = software
-            aircraftFirmwareHardware = hardware
             appendLog("ARSDK product firmware \(software) · hardware \(hardware)")
             updateInterface()
             return
@@ -1685,16 +1897,13 @@ final class MainViewController: NSViewController {
     }
 
     private func applyDetectedProduct(_ model: ParrotProductModel, source: String) {
+        guard !isMiniDroneModeActive else { return }
         let wasGroundModeActive = groundModeActive
         if groundModeRequested, model != .jumpingSumo {
             appendLog("Ignored \(model.displayName) while the Jumping Sumo ground backend is selected")
             return
         }
         arsdkClient.setProductModel(model)
-        activeARSDKRoute = ParrotSessionRouting.routeAfterDetection(
-            current: activeARSDKRoute,
-            product: model
-        )
         guard productModel != model else { return }
         productModel = model
         if model == .jumpingSumo {
@@ -1708,8 +1917,7 @@ final class MainViewController: NSViewController {
         }
         if !model.capabilities.supportsBB2DragonLab && selectedVideoMode != .compatibility {
             if videoRunning { startVideo() }
-            videoModePopup.selectItem(withTag: VideoReceiveMode.compatibility.rawValue)
-            hudView.videoView.receiveMode = .compatibility
+            setVideoMode(.compatibility)
             appendLog("Switched to stock Compatibility video because \(model.displayName) has no validated BB2 Dragon profile")
         }
         if activeARSDKRoute == .directProduct,
@@ -1737,6 +1945,7 @@ final class MainViewController: NSViewController {
     }
 
     private func updateWindowIdentity() {
+        if isMiniDroneModeActive { view.window?.title = "Parrot Lab — MiniDrone / Bluetooth"; return }
         let route = activeARSDKRoute == .directProduct ? "Standalone" : "SkyController 2"
         view.window?.title = "Parrot Lab — \(productModel.displayName) / \(route)"
         workbenchSubtitle.stringValue = groundModeActive
@@ -1760,12 +1969,16 @@ final class MainViewController: NSViewController {
         VideoReceiveMode(rawValue: videoModePopup.selectedItem?.tag ?? -1) ?? .compatibility
     }
 
+    private func setVideoMode(_ mode: VideoReceiveMode) {
+        videoModePopup.selectItem(withTag: mode.rawValue)
+        hudView.videoView.receiveMode = mode
+    }
+
     @objc private func videoModeChanged() {
         guard !videoRunning else { return }
         let mode = selectedVideoMode
         guard mode == .compatibility || aircraftCapabilities.supportsBB2DragonLab else {
-            videoModePopup.selectItem(withTag: VideoReceiveMode.compatibility.rawValue)
-            hudView.videoView.receiveMode = .compatibility
+            setVideoMode(.compatibility)
             showMediaAlert("Modified 900p Dragon profiles are supported only on a detected Bebop 2. Bebop Drone uses stock Compatibility video.")
             updateInterface()
             return
@@ -1848,8 +2061,7 @@ final class MainViewController: NSViewController {
         }
 
         if videoRunning { startVideo() }
-        videoModePopup.selectItem(withTag: profile.resolution.receiverMode.rawValue)
-        hudView.videoView.receiveMode = profile.resolution.receiverMode
+        setVideoMode(profile.resolution.receiverMode)
         videoFormatStatus = "FORMAT waiting"
         videoMetadataPresence = VideoMetadataPresence()
         queuedDragonOperation = nil
@@ -2041,14 +2253,7 @@ final class MainViewController: NSViewController {
     }
 
     func uploadRFModSuiteToSkyController2() {
-        guard aircraftCapabilities.supportsValidatedRFMod else {
-            showToolAlert(
-                title: "Validated Bebop 2 required",
-                message: "The paired RF/MOD workflow is disabled for Bebop Drone and unknown aircraft."
-            )
-            return
-        }
-        let host = hostField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let host = requestToolHost(sumo: false, title: "SkyController 2 RF Lab upload") else { return }
         uploadRFModSuite(
             host: host,
             targetName: "SkyController 2",
@@ -2056,8 +2261,8 @@ final class MainViewController: NSViewController {
         )
     }
 
-    func configureRFPowerMod() {
-        guard aircraftCapabilities.supportsValidatedRFMod else {
+    func configureRFPowerMod(sc2Only: Bool = false) {
+        guard sc2Only || (!groundModeActive && aircraftCapabilities.supportsValidatedRFMod) else {
             showToolAlert(
                 title: "Validated Bebop 2 required",
                 message: "The tested RF power profile has not been validated on Bebop Drone."
@@ -2078,6 +2283,13 @@ final class MainViewController: NSViewController {
         alert.alertStyle = .critical
         alert.messageText = "Configure the RF power profile on both devices?"
         alert.informativeText = "Enable applies the tested EPA2 / PD16 / MAXP80 profile to both the SkyController 2 and Bebop 2. It was stable in field testing, but it is not laboratory-certified for EVM, unwanted emissions, or legal EIRP; use it only where permitted.\n\nRestore Stock uses each device's preserved original NVM baseline when available, otherwise its device-specific stock values. Both choices update RF Lab first, create verified backups, and write only the active NVM file.\n\nKeep the aircraft safely landed. When both writes verify, Parrot Lab will reboot the SC2 first and the Bebop 2 afterward, so all links will temporarily drop."
+        let sc2HostInput = NSTextField(string: preferredSC2ToolHost)
+        if sc2Only {
+            alert.messageText = "Configure RF power on SkyController 2 only?"
+            alert.informativeText = "SC2 address below. Enable applies its tested EPA2 / PD16 / MAXP80 profile; Restore Stock uses the preserved controller baseline. RF Lab is updated first, backs up and verifies the active NVM, then reboots only the SC2. No Sumo or Bebop file is changed. Keep the vehicle stopped; the link will drop. Use only where local RF rules permit."
+            sc2HostInput.frame = NSRect(x: 0, y: 0, width: 320, height: 26)
+            alert.accessoryView = sc2HostInput
+        }
         alert.addButton(withTitle: "Enable Tested Profile")
         alert.addButton(withTitle: "Restore Stock")
         alert.addButton(withTitle: "Cancel")
@@ -2090,12 +2302,19 @@ final class MainViewController: NSViewController {
         default: return
         }
 
+        guard !sc2Only || Self.isValidIPv4Host(sc2HostInput.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+            showToolAlert(title: "Invalid SC2 address", message: "Enter the controller's IPv4 address.")
+            return
+        }
+
         if videoRunning { startVideo() }
         let enteredHost = hostField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         let cachedHost = UserDefaults.standard.string(forKey: Self.cachedSC2HostPreferenceKey) ?? ""
         let cachedUSBHost = UserDefaults.standard.string(forKey: Self.cachedSC2USBHostPreferenceKey) ?? ""
         let candidateHost: String?
-        if connectButton.title == "Disconnect", Self.isValidIPv4Host(enteredHost) {
+        if sc2Only {
+            candidateHost = sc2HostInput.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        } else if activeARSDKRoute == .skyController, connectButton.title == "Disconnect", Self.isValidIPv4Host(enteredHost) {
             candidateHost = enteredHost
         } else if Self.isValidIPv4Host(cachedUSBHost) {
             candidateHost = cachedUSBHost
@@ -2107,6 +2326,7 @@ final class MainViewController: NSViewController {
 
         toolUploadInFlight = true
         rfPowerOperationInFlight = true
+        rfPowerSC2Only = sc2Only
         rfPowerMode = mode
         rfPowerPhase = .idle
         rfPowerSC2Host = candidateHost
@@ -2213,9 +2433,8 @@ final class MainViewController: NSViewController {
         flightControlConfiguration.standaloneBebopEnabled
     }
 
-    var isGroundModeActive: Bool { groundModeActive }
+    var isGroundModeActive: Bool { !isMiniDroneModeActive && groundModeActive }
 
-    var detectedAircraftModel: ParrotProductModel { productModel }
     var aircraftCapabilities: ParrotProductCapabilities { productModel.capabilities }
     var canUseBebopCalibrationTools: Bool {
         arsdkConnected && aircraftCapabilities.supportsBebopCalibration
@@ -2286,15 +2505,21 @@ final class MainViewController: NSViewController {
     }
 
     func setFlightControlConfiguration(_ value: FlightControlConfiguration) {
-        var sanitized = value
+        var sanitized = value.clampedControllerTuning
+        if let mini = miniDroneController {
+            sanitized.standaloneBebopEnabled = flightControlConfiguration.standaloneBebopEnabled
+            flightControlConfiguration = sanitized
+            flightInputManager.apply(sanitized)
+            mini.client.input = .neutral
+            updateFlightControlAvailability()
+            return
+        }
         let routeChanged = sanitized.standaloneBebopEnabled != flightControlConfiguration.standaloneBebopEnabled
         if routeChanged, connectButton.title == "Disconnect" {
             directProductDiscovery.stop()
             stopARSDKTelemetry()
             telnet.stop()
         }
-        sanitized.controllerDeadzone = min(0.45, max(0, value.controllerDeadzone))
-        sanitized.controllerSensitivity = min(1, max(0.25, value.controllerSensitivity))
         flightControlConfiguration = sanitized
         activeARSDKRoute = sanitized.standaloneBebopEnabled ? .directProduct : .skyController
         flightInputManager.apply(sanitized)
@@ -2401,9 +2626,10 @@ final class MainViewController: NSViewController {
                 self.cacheSC2Host(host)
                 self.appendVerifiedAssets(install)
                 self.appendLog("RF Lab updated on SkyController 2")
-                self.beginRFPowerBebopUpload()
+                if self.rfPowerSC2Only { self.beginRFPowerApplyOnSC2() }
+                else { self.beginRFPowerBebopUpload() }
             case .failure(let error):
-                if !self.rfPowerDiscoveryAttempted {
+                if !self.rfPowerSC2Only && !self.rfPowerDiscoveryAttempted {
                     self.rfPowerDiscoveryAttempted = true
                     self.rfPowerPhase = .discovering
                     self.appendLog("SC2 upload at \(host) failed; refreshing its DHCP address through the Bebop")
@@ -2448,7 +2674,7 @@ final class MainViewController: NSViewController {
         rfPowerSC2Telnet.connect(
             host: host,
             port: 23,
-            startupCommand: "NO_COLOR=1 RF_LAB_NO_CLEAR=1 sh /data/lib/ftp/internal_000/parrot_rf_lab.sh apply-profile \(mode.profileArgument); exit"
+            startupCommand: "NO_COLOR=1 RF_LAB_NO_CLEAR=1 RF_LAB_DEVICE=sc2 sh /data/lib/ftp/internal_000/parrot_rf_lab.sh apply-profile \(mode.profileArgument); exit"
         )
         armRFPowerTimeout(seconds: 25, step: "SkyController 2 profile application")
     }
@@ -2490,7 +2716,7 @@ final class MainViewController: NSViewController {
         rfPowerPhase = .queueingSC2Reboot
         rfPowerSC2Connected = false
         rfPowerStepSucceeded = false
-        appendLog("Queueing SkyController 2 reboot first; Bebop 2 follows several seconds later")
+        appendLog(rfPowerSC2Only ? "Queueing SkyController 2 reboot; no vehicle reboot" : "Queueing SkyController 2 reboot first; Bebop 2 follows several seconds later")
         rfPowerSC2Telnet.connect(
             host: host,
             port: 23,
@@ -2579,7 +2805,8 @@ final class MainViewController: NSViewController {
                 }
                 rfPowerTimeoutTimer?.invalidate()
                 rfPowerTimeoutTimer = nil
-                beginRFPowerApplyOnBebop()
+                if rfPowerSC2Only { beginRFPowerSC2Reboot() }
+                else { beginRFPowerApplyOnBebop() }
             } else if rfPowerPhase == .applyingBebop {
                 guard rfPowerStepSucceeded else {
                     finishRFPowerOperation(
@@ -2610,6 +2837,8 @@ final class MainViewController: NSViewController {
     private func finishRFPowerOperation(success: Bool, message: String?) {
         guard rfPowerOperationInFlight else { return }
         let completedMode = rfPowerMode
+        let sc2Only = rfPowerSC2Only
+        rfPowerSC2Only = false
         rfPowerTimeoutTimer?.invalidate()
         rfPowerTimeoutTimer = nil
         toolUploadInFlight = false
@@ -2632,10 +2861,10 @@ final class MainViewController: NSViewController {
                 self?.rfPowerBebopTelnet.stop()
             }
             let title = completedMode?.completionTitle ?? "RF power profile updated"
-            appendLog("RF power workflow complete; SC2 reboot is scheduled before Bebop 2")
+            appendLog(sc2Only ? "SC2 RF profile verified; controller reboot queued. Vehicle unchanged." : "RF power workflow complete; SC2 reboot is scheduled before Bebop 2")
             showToolAlert(
                 title: title,
-                message: "Both active NVM files passed identity, write, and digest verification. The SkyController 2 will reboot first; the Bebop 2 follows several seconds later. Expect USB, Wi-Fi, video, and telemetry to drop, then reconnect after both devices return.",
+                message: sc2Only ? "The SC2 active NVM passed verification and its reboot is queued. No Sumo or Bebop settings were changed. Reconnect after the controller returns." : "Both active NVM files passed identity, write, and digest verification. The SkyController 2 will reboot first; the Bebop 2 follows several seconds later. Expect USB, Wi-Fi, video, and telemetry to drop, then reconnect after both devices return.",
                 style: .informational
             )
         } else {
@@ -2693,7 +2922,7 @@ final class MainViewController: NSViewController {
                 )
                 self.showToolAlert(
                     title: "SkyController 2 USB address found",
-                    message: "Found and verified the controller at \(discovery.host) through macOS interface \(discovery.interfaceName) (local address \(discovery.localAddress)). \(discovery.serviceName) answered on port \(discovery.servicePort).\n\nThe USB address has been cached and filled into SC2 HOST.",
+                    message: "Found and verified the controller at \(discovery.host) through macOS interface \(discovery.interfaceName) (local address \(discovery.localAddress)). \(discovery.serviceName) answered on port \(discovery.servicePort).\n\nThe USB address has been cached. SC2 HOST is filled when using the SC2 route; a direct vehicle address is left unchanged.",
                     style: .informational
                 )
             case .failure(let error):
@@ -2713,11 +2942,17 @@ final class MainViewController: NSViewController {
             return
         }
 
-        let enteredHost = hostField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let enteredHost: String
+        if groundModeActive || activeARSDKRoute == .directProduct {
+            guard let selected = requestToolHost(sumo: false, title: "Install/Update SC2 Driver Patch") else { return }
+            enteredHost = selected
+        } else {
+            enteredHost = hostField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
         let cachedHost = UserDefaults.standard.string(forKey: Self.cachedSC2HostPreferenceKey) ?? ""
         let cachedUSBHost = UserDefaults.standard.string(forKey: Self.cachedSC2USBHostPreferenceKey) ?? ""
         let candidateHost: String?
-        if connectButton.title == "Disconnect", Self.isValidIPv4Host(enteredHost) {
+        if (groundModeActive || activeARSDKRoute == .directProduct || connectButton.title == "Disconnect"), Self.isValidIPv4Host(enteredHost) {
             // A live app connection is stronger evidence than a DHCP cache.
             candidateHost = enteredHost
         } else if Self.isValidIPv4Host(cachedUSBHost) {
@@ -2742,6 +2977,10 @@ final class MainViewController: NSViewController {
             alert.informativeText = "This is only for SkyController 2 firmware 1.0.9. Parrot Lab will first try the entered or cached controller address. If it cannot connect, it will ask the Bebop for the SC2's current DHCP address, cache it, install the persistent Apple-NCM driver, and reboot the controller. Disconnect any phone and expect the controller connection to drop."
             alert.addButton(withTitle: "Install and Reboot")
         }
+        if groundModeActive {
+            alert.messageText = "Install the SC2 Apple-NCM driver and reboot?"
+            alert.informativeText = "Target: \(enteredHost), SkyController 2 firmware 1.0.9 only. Keep Sumo stationary. Parrot Lab will replace and verify the controller's FTP driver files, run its installer and reboot the SC2. Sumo files are untouched. Ground mode will not attempt Bebop-side discovery if this address fails. Expect the controller link to drop."
+        }
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
 
@@ -2750,7 +2989,8 @@ final class MainViewController: NSViewController {
         sc2DriverInstallInFlight = true
         sc2DriverTelnetConnected = false
         sc2DriverInstallSucceeded = false
-        sc2DriverDiscoveryAttempted = false
+        // Ground mode has no Bebop bridge to probe after a failed SC2 install.
+        sc2DriverDiscoveryAttempted = groundModeActive
         pendingSC2DriverHost = candidateHost
         statusLabel.stringValue = "INSTALLING"
         statusLabel.textColor = .systemYellow
@@ -2951,7 +3191,7 @@ final class MainViewController: NSViewController {
 
     private func cacheSC2Host(_ host: String) {
         guard Self.isValidIPv4Host(host) else { return }
-        hostField.stringValue = host
+        if activeARSDKRoute == .skyController { hostField.stringValue = host }
         // Keep the stable USB endpoint separate from the controller's dynamic
         // DHCP address on the Bebop subnet; either can then be selected without
         // overwriting the other.
@@ -3017,7 +3257,197 @@ final class MainViewController: NSViewController {
         }
     }
 
-    private func uploadRFModSuite(host: String, targetName: String, devicePath: String) {
+    /// A direct Sumo address must never become the target of an SC2 installer.
+    private var preferredSC2ToolHost: String {
+        let entered = hostField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if activeARSDKRoute == .skyController, Self.isValidIPv4Host(entered) { return entered }
+        for key in [Self.cachedSC2USBHostPreferenceKey, Self.cachedSC2HostPreferenceKey] {
+            if let host = UserDefaults.standard.string(forKey: key), Self.isValidIPv4Host(host) { return host }
+        }
+        return "192.168.53.1"
+    }
+
+    private func requestToolHost(sumo: Bool, title: String) -> String? {
+        if sumo && toolUploadInFlight {
+            showToolAlert(title: "Tool operation already running", message: "Wait for the current device operation to finish.")
+            return nil
+        }
+        let bridgeHost = sumo && activeARSDKRoute == .skyController ? preferredSC2ToolHost : nil
+        let cachedSumo = UserDefaults.standard.string(forKey: Self.jumpingSumoHostPreferenceKey) ?? Self.defaultJumpingSumoHost
+        let initial = sumo
+            ? (activeARSDKRoute == .directProduct && groundModeActive ? hostField.stringValue : cachedSumo)
+            : preferredSC2ToolHost
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = sumo
+            ? (bridgeHost.map { "Enter Sumo's own IP on the controller's Wi-Fi network. Scripts and commands will go through SC2 \($0):23 → Sumo:23, not through direct Mac Wi-Fi. Enable Telnet on both devices. No persistent SC2 relay changes are made." } ?? "Enter the Sumo's own IP address. Direct mode uses anonymous FTP (21) for upload and Telnet (23) for commands. Enable Telnet on Sumo.")
+            : "Enter the SkyController 2 address, not the vehicle address. The Mac must reach its FTP and Telnet services."
+        let input = NSTextField(string: initial)
+        input.frame = NSRect(x: 0, y: 0, width: 320, height: 26)
+        alert.accessoryView = input
+        alert.addButton(withTitle: "Continue")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        let host = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard Self.isValidIPv4Host(host) else {
+            showToolAlert(title: "Invalid address", message: "Enter a valid IPv4 address.")
+            return nil
+        }
+        if sumo { sumoToolBridgeHost = bridgeHost }
+        return host
+    }
+
+    private func installDeviceTool(_ package: BebopToolPackage, host: String,
+                                   completion: @escaping (Result<BebopToolInstallResult, Error>) -> Void) {
+        if (package == .sumoB29Launcher || package == .sumoRFModSuite), let bridge = sumoToolBridgeHost {
+            sumoBridgeUploader.onProgress = { [weak self] message in self?.appendLog(message) }
+            sumoBridgeUploader.install(package, bridgeHost: bridge, sumoHost: host, completion: completion)
+        } else {
+            toolInstaller.install(package, host: host, completion: completion)
+        }
+    }
+
+    func uploadSumoRFModSuite() {
+        guard groundModeActive,
+              let host = requestToolHost(sumo: true, title: "Upload Sumo RF Lab") else { return }
+        uploadRFModSuite(host: host, targetName: "Jumping Sumo",
+                         devicePath: "/data/ftp/internal_000/parrot_sumo_rf_lab.sh", package: .sumoRFModSuite)
+    }
+
+    func configureSumoRFPowerMod() {
+        guard groundModeActive else { return }
+        guard !toolUploadInFlight, !dragonCommandInFlight, !rfPowerOperationInFlight,
+              !sc2DiscoveryInFlight, !sc2DriverInstallInFlight, !persistentTelnetInstallInFlight else {
+            showToolAlert(title: "Tool operation already running", message: "Wait for the current device operation to finish.")
+            return
+        }
+        guard let host = requestToolHost(sumo: true, title: "Sumo RF power profile") else { return }
+        let alert = NSAlert()
+        alert.alertStyle = .critical
+        alert.messageText = "Configure Sumo RF power at \(host)?"
+        alert.informativeText = "Enable changes only epagain2g=2 and pdgain2g=14 in /lib/firmware/brcm/bcm43526.nvm. MAXP, calibration, MAC and regulatory fields stay unchanged. Restore uses this Sumo's preserved original EPA/PD values; it never guesses stock settings.\n\nThe Sumo script is uploaded and verified first. It backs up and verifies NVM, restores the root mount state, then the app reboots only Sumo. Keep it stationary and use only where permitted. This owner-tested profile is not a regulatory certification. SC2 is unchanged."
+        alert.addButton(withTitle: "Enable EPA2 / PD14")
+        alert.addButton(withTitle: "Restore Original")
+        alert.addButton(withTitle: "Cancel")
+        let response = alert.runModal()
+        guard response == .alertFirstButtonReturn || response == .alertSecondButtonReturn else { return }
+        let enable = response == .alertFirstButtonReturn
+        let token = UUID().uuidString
+        sumoToolToken = token
+        sumoToolSuccessTitle = "Sumo RF profile verified"
+        sumoToolSuccessMessage = "Sumo RF profile verified; its reboot is queued. SC2 settings were not changed. Reconnect after Sumo returns."
+        toolUploadInFlight = true
+        updateInterface()
+        installDeviceTool(.sumoRFModSuite, host: host) { [weak self] result in
+            guard let self, self.sumoToolToken == token else { return }
+            switch result {
+            case .failure(let error): self.finishSumoTool(error: error.localizedDescription)
+            case .success(let install):
+                self.appendVerifiedAssets(install)
+                guard let asset = install.assets.first,
+                      let command = SumoDeviceTools.rfCommand(md5: asset.md5, token: token, enable: enable) else {
+                    self.finishSumoTool(error: "Invalid Sumo RF manifest.")
+                    return
+                }
+                self.sumoToolTelnet.onLine = { [weak self] line in
+                    guard let self, self.sumoToolToken == token else { return }
+                    if let profile = SC2TelemetryParser.deviceMarkerPayload("__PARROTLAB_RF_PROFILE__=", in: line) {
+                        self.appendLog("Sumo RF: \(profile)")
+                        // Keep the session alive for the script to restore the mount before exit.
+                    }
+                    guard let event = SC2TelemetryParser.deviceMarkerPayload("__PARROTLAB_SUMO_\(token)__=", in: line) else { return }
+                    if event == "RF_QUEUED" { self.finishSumoTool(error: nil) }
+                    else if event.hasPrefix("ERROR_") {
+                        self.finishSumoTool(error: "Sumo RF update failed (\(event)). No reboot was queued. See the RF error in the event log; a missing baseline requires this Sumo's original NVM, not guessed stock values.")
+                    }
+                }
+                self.sumoToolTelnet.onState = { [weak self] state in
+                    guard let self, self.sumoToolToken == token else { return }
+                    if case .failed(let message) = state { self.finishSumoTool(error: message) }
+                }
+                self.sumoToolTelnet.onDebug = { [weak self] message in self?.appendLog("Sumo RF: \(message)") }
+                self.sumoToolTimeout = Timer.scheduledTimer(withTimeInterval: 30, repeats: false) { [weak self] _ in
+                    guard self?.sumoToolToken == token else { return }
+                    self?.finishSumoTool(error: "Sumo RF did not confirm within 30 seconds. The result is uncertain; check the event log and device before retrying.")
+                }
+                self.sumoToolTelnet.connect(host: host, startupCommand: command, viaSC2: self.sumoToolBridgeHost)
+            }
+        }
+    }
+
+    func startSumoB29() {
+        guard groundModeActive else { return }
+        guard !toolUploadInFlight, !dragonCommandInFlight, !rfPowerOperationInFlight,
+              !sc2DiscoveryInFlight, !sc2DriverInstallInFlight, !persistentTelnetInstallInFlight else {
+            showToolAlert(title: "Tool operation already running", message: "Wait for the current device operation to finish.")
+            return
+        }
+        guard let host = requestToolHost(sumo: true, title: "Start Sumo 30 FPS Dragon (B29)") else { return }
+        let alert = NSAlert()
+        alert.messageText = "Upload the launcher and start B29 on \(host)?"
+        alert.informativeText = "Keep Sumo stationary. Uploads start_sumo_b29.sh beside the existing /data/ftp/internal_000/B29, verifies it, marks both executable, then runs your launcher. B29 is not overwritten. The launcher stops stock Dragon with SIGQUIT (forcing stop if necessary) and uses DragonStarter.sh. Control/video may disconnect. This is a runtime launch, not a boot installation."
+        alert.addButton(withTitle: "Upload and Start")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let token = UUID().uuidString
+        sumoToolSuccessTitle = "B29 launch queued"
+        sumoToolSuccessMessage = "B29 launch queued on Sumo. Allow the link to return, then reconnect if needed. Running state is not yet verified; device log: /tmp/parrotlab-b29-launch.log."
+        sumoToolToken = token
+        toolUploadInFlight = true
+        updateInterface()
+        appendLog("Uploading B29 launcher to Sumo \(host); leaving B29 unchanged")
+        installDeviceTool(.sumoB29Launcher, host: host) { [weak self] result in
+            guard let self, self.sumoToolToken == token else { return }
+            switch result {
+            case .failure(let error): self.finishSumoTool(error: error.localizedDescription)
+            case .success(let install):
+                self.appendVerifiedAssets(install)
+                guard let asset = install.assets.first,
+                      let command = SumoDeviceTools.launchCommand(md5: asset.md5, token: token) else {
+                    self.finishSumoTool(error: "Invalid launcher manifest.")
+                    return
+                }
+                self.sumoToolTelnet.onLine = { [weak self] line in
+                    guard let self, self.sumoToolToken == token,
+                          let event = SC2TelemetryParser.deviceMarkerPayload("__PARROTLAB_SUMO_\(token)__=", in: line) else { return }
+                    let errors = ["ERROR_B29_MISSING": "B29 is missing. Place it in /data/ftp/internal_000 first.",
+                                  "ERROR_STARTER_MISSING": "/bin/DragonStarter.sh is missing or not executable on Sumo.",
+                                  "ERROR_DIRECTORY": "Sumo internal_000 directory is unavailable.",
+                                  "ERROR_DIGEST": "The launcher checksum did not match; launch cancelled.",
+                                  "ERROR_CHMOD": "Could not make the launcher and B29 executable."]
+                    if event == "QUEUED" { self.finishSumoTool(error: nil) }
+                    else if let message = errors[event] { self.finishSumoTool(error: message) }
+                }
+                self.sumoToolTelnet.onState = { [weak self] state in
+                    guard let self, self.sumoToolToken == token else { return }
+                    if case .failed(let message) = state { self.finishSumoTool(error: message) }
+                    // A close can race queued output; the bounded timeout handles no confirmation.
+                }
+                self.sumoToolTelnet.onDebug = { [weak self] message in self?.appendLog("Sumo launcher: \(message)") }
+                self.sumoToolTimeout = Timer.scheduledTimer(withTimeInterval: 20, repeats: false) { [weak self] _ in
+                    guard self?.sumoToolToken == token else { return }
+                    self?.finishSumoTool(error: "No launch confirmation within 20 seconds. Check Sumo Telnet and /tmp/parrotlab-b29-launch.log before retrying; the launch may already have started.")
+                }
+                self.sumoToolTelnet.connect(host: host, startupCommand: command, viaSC2: self.sumoToolBridgeHost)
+            }
+        }
+    }
+
+    private func finishSumoTool(error: String?) {
+        guard sumoToolToken != nil else { return }
+        sumoToolToken = nil
+        sumoToolTimeout?.invalidate()
+        sumoToolTimeout = nil
+        sumoToolTelnet.stop()
+        toolUploadInFlight = false
+        updateInterface()
+        let message = error ?? sumoToolSuccessMessage
+        appendLog(message)
+        showToolAlert(title: error == nil ? sumoToolSuccessTitle : "Sumo tool not confirmed", message: message,
+                      style: error == nil ? .informational : .warning)
+    }
+
+    private func uploadRFModSuite(host: String, targetName: String, devicePath: String, package: BebopToolPackage = .rfModSuite) {
         guard !toolUploadInFlight, !dragonCommandInFlight,
               !persistentTelnetInstallInFlight, !sc2DriverInstallInFlight else {
             showToolAlert(title: "Tool operation already running", message: "Wait for the current transfer or Dragon operation to finish.")
@@ -3031,15 +3461,18 @@ final class MainViewController: NSViewController {
         let alert = NSAlert()
         alert.alertStyle = .informational
         alert.messageText = "Upload RF/MOD Suite to \(targetName)?"
-        alert.informativeText = "Parrot Lab will upload parrot_rf_lab.sh through anonymous FTP to \(host):/internal_000 and download it again for SHA-256 verification. It will not apply an RF profile or modify any system or factory file."
+        alert.informativeText = "Parrot Lab will upload \(package.displayName) through anonymous FTP to \(host):/internal_000 and download it again for SHA-256 verification. It will not apply an RF profile or modify any system or factory file." + (package == .sumoRFModSuite ? "\n\nThe Sumo edition includes diagnostics and the owner-tested EPA2 / PD14 profile. Use the separate Sumo RF Power Mod action to enable or restore it." : "")
+        if package == .sumoRFModSuite, let bridge = sumoToolBridgeHost {
+            alert.informativeText = "Parrot Lab will upload the Sumo RF script through SC2 \(bridge) → Sumo \(host) over Telnet and verify its MD5 before replacing the FTP-directory copy. No direct FTP access is needed. This only uploads the script; it does not apply a profile or reboot either device."
+        }
         alert.addButton(withTitle: "Upload")
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
 
         toolUploadInFlight = true
         updateInterface()
-        appendLog("Uploading RF/MOD Suite to \(targetName) FTP \(host):21/internal_000")
-        toolInstaller.install(.rfModSuite, host: host) { [weak self] result in
+        appendLog("Uploading RF/MOD Suite to \(targetName) \(host):internal_000")
+        installDeviceTool(package, host: host) { [weak self] result in
             guard let self else { return }
             self.toolUploadInFlight = false
             self.updateInterface()
@@ -3519,8 +3952,7 @@ final class MainViewController: NSViewController {
         case "RESTORED":
             dragonCommandSucceeded = true
             dragonRuntimeStatus = "STOCK RESTORED"
-            videoModePopup.selectItem(withTag: VideoReceiveMode.compatibility.rawValue)
-            hudView.videoView.receiveMode = .compatibility
+            setVideoMode(.compatibility)
             appendLog("Dragon stock startup restored")
         case "STATUS":
             dragonCommandSucceeded = true
@@ -3579,6 +4011,7 @@ final class MainViewController: NSViewController {
     }
 
     @objc private func startVideo() {
+        guard !isMiniDroneModeActive else { return }
         if videoRunning {
             if streamRecorder.isRecording { stopRecording() }
             restreamProbe.cancel()
@@ -3738,8 +4171,7 @@ final class MainViewController: NSViewController {
                 appendLog("Drone telemetry returned after the detached Dragon restart")
             case .restore:
                 dragonRuntimeStatus = "STOCK RESTORED"
-                videoModePopup.selectItem(withTag: VideoReceiveMode.compatibility.rawValue)
-                hudView.videoView.receiveMode = .compatibility
+                setVideoMode(.compatibility)
                 appendLog("Drone telemetry returned after restoring stock Dragon")
             }
             self.queuedDragonOperation = nil
@@ -3748,6 +4180,11 @@ final class MainViewController: NSViewController {
     }
 
     private func updateInterface() {
+        if let mini = miniDroneController {
+            mini.refreshInputs(flightControlsEnabled ? flightControlStatus : "Keyboard and gamepad are off. Enable them in Configure controls.")
+            return
+        }
+        refreshSC2MappingWindow()
         let battery = snapshot.droneBatteryPercent
         vehicleOverview.update(
             left: groundModeActive ? "SUMO BATTERY" : "AIRCRAFT BATTERY",
@@ -3906,6 +4343,7 @@ final class MainViewController: NSViewController {
         hostField.isEnabled = !deviceOperationActive && (!standaloneBebopEnabled || groundModeActive)
         connectButton.isEnabled = !deviceOperationActive
         groundModeButton.isEnabled = !deviceOperationActive
+        miniDroneModeButton.isEnabled = !miniDroneModeBlocked
         if connectButton.title != "Disconnect" {
             connectButton.title = groundModeActive
                 ? (activeARSDKRoute == .directProduct ? "Connect Sumo" : "Connect SC2")
@@ -4315,6 +4753,12 @@ final class MainViewController: NSViewController {
     }
 
     func prepareForTermination() {
+        miniDroneController?.client.onChange = nil
+        miniDroneController?.client.disconnect()
+        sumoToolToken = nil
+        sumoToolTimeout?.invalidate()
+        sumoToolTelnet.stop()
+        sumoBridgeUploader.cancel()
         directProductDiscovery.stop()
         mp4Converter.cancel()
         toolInstaller.cancel()

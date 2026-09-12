@@ -1,7 +1,24 @@
 import AppKit
 
+if CommandLine.arguments.contains("--self-test-settings") {
+    let passed = AppDelegate.settingsInteractionSelfTest()
+    print(passed ? "Settings interaction self-tests passed" : "Settings interaction self-tests failed")
+    exit(passed ? 0 : 1)
+}
+
+if CommandLine.arguments.contains("--self-test-minidrone") {
+    let passed = MiniDroneSelfTest.run()
+    if passed { print("MiniDrone packet and transport self-tests passed") }
+    exit(passed ? 0 : 1)
+}
+
 if CommandLine.arguments.contains("--self-test") {
     exit(ParrotLabSelfTest.run())
+}
+
+if let index = CommandLine.arguments.firstIndex(of: "--render-sc2-mapping-preview"),
+   CommandLine.arguments.indices.contains(index + 1) {
+    exit(PreviewRenderer.renderSC2Mappings(to: CommandLine.arguments[index + 1]) ? 0 : 1)
 }
 
 if let index = CommandLine.arguments.firstIndex(of: "--render-preview"),
@@ -12,6 +29,11 @@ if let index = CommandLine.arguments.firstIndex(of: "--render-preview"),
 if let index = CommandLine.arguments.firstIndex(of: "--render-app-preview"),
    CommandLine.arguments.indices.contains(index + 1) {
     exit(PreviewRenderer.renderApplication(to: CommandLine.arguments[index + 1]) ? 0 : 1)
+}
+
+if let index = CommandLine.arguments.firstIndex(of: "--render-minidrone-preview"),
+   CommandLine.arguments.indices.contains(index + 1) {
+    exit(PreviewRenderer.renderApplication(to: CommandLine.arguments[index + 1], miniDrone: true) ? 0 : 1)
 }
 
 if let index = CommandLine.arguments.firstIndex(of: "--render-ground-preview"),
@@ -73,78 +95,7 @@ menu.addItem(editItem)
 
 let toolsItem = NSMenuItem(title: "Tools", action: nil, keyEquivalent: "")
 let toolsMenu = NSMenu(title: "Tools")
-let flatTrimItem = NSMenuItem(
-    title: "Bebop Flat Trim",
-    action: #selector(AppDelegate.performBebopFlatTrim(_:)),
-    keyEquivalent: ""
-)
-flatTrimItem.target = delegate
-toolsMenu.addItem(flatTrimItem)
-let magnetometerCalibrationItem = NSMenuItem(
-    title: "Start Bebop Magnetometer Calibration",
-    action: #selector(AppDelegate.toggleBebopMagnetometerCalibration(_:)),
-    keyEquivalent: ""
-)
-magnetometerCalibrationItem.target = delegate
-toolsMenu.addItem(magnetometerCalibrationItem)
-toolsMenu.addItem(NSMenuItem.separator())
-let installDragonItem = NSMenuItem(
-    title: "Install/Update Dragon Lab on Bebop 2",
-    action: #selector(AppDelegate.installDragonLabOnBebop2(_:)),
-    keyEquivalent: ""
-)
-installDragonItem.target = delegate
-toolsMenu.addItem(installDragonItem)
-let enableBebopTelnetItem = NSMenuItem(
-    title: "Enable Persistent Telnet on Bebop 2…",
-    action: #selector(AppDelegate.enablePersistentTelnetOnBebop2(_:)),
-    keyEquivalent: ""
-)
-enableBebopTelnetItem.target = delegate
-toolsMenu.addItem(enableBebopTelnetItem)
-let uploadRFBebopItem = NSMenuItem(
-    title: "Upload RF/MOD Suite",
-    action: #selector(AppDelegate.uploadRFModSuiteToBebop2(_:)),
-    keyEquivalent: ""
-)
-uploadRFBebopItem.target = delegate
-toolsMenu.addItem(uploadRFBebopItem)
-let uploadRFSC2Item = NSMenuItem(
-    title: "Upload RF/MOD Suite to SkyController 2",
-    action: #selector(AppDelegate.uploadRFModSuiteToSkyController2(_:)),
-    keyEquivalent: ""
-)
-uploadRFSC2Item.target = delegate
-toolsMenu.addItem(uploadRFSC2Item)
-let configureRFPowerItem = NSMenuItem(
-    title: "Enable/Disable RF Power Mod…",
-    action: #selector(AppDelegate.configureRFPowerMod(_:)),
-    keyEquivalent: ""
-)
-configureRFPowerItem.target = delegate
-toolsMenu.addItem(configureRFPowerItem)
-toolsMenu.addItem(NSMenuItem.separator())
-let findSC2HostItem = NSMenuItem(
-    title: "Find SC2 IP through Bebop 2…",
-    action: #selector(AppDelegate.findSC2HostThroughBebop(_:)),
-    keyEquivalent: ""
-)
-findSC2HostItem.target = delegate
-toolsMenu.addItem(findSC2HostItem)
-let findSC2USBHostItem = NSMenuItem(
-    title: "Find SC2 USB Networking IP…",
-    action: #selector(AppDelegate.findSC2USBHost(_:)),
-    keyEquivalent: ""
-)
-findSC2USBHostItem.target = delegate
-toolsMenu.addItem(findSC2USBHostItem)
-let installSC2DriverItem = NSMenuItem(
-    title: "Install/Update SC2 Driver Patch",
-    action: #selector(AppDelegate.installSC2DriverPatch(_:)),
-    keyEquivalent: ""
-)
-installSC2DriverItem.target = delegate
-toolsMenu.addItem(installSC2DriverItem)
+delegate.populateToolsMenu(toolsMenu, ground: false)
 toolsItem.submenu = toolsMenu
 menu.addItem(toolsItem)
 

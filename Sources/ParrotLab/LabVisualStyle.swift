@@ -4,6 +4,7 @@ import QuartzCore
 enum LabThemeMode {
     case air
     case ground
+    case miniDrone
 }
 
 /// Short, user-triggered transitions only. Never animate telemetry or video frames.
@@ -104,14 +105,19 @@ enum LabVisualStyle {
     private static let groundAccent = NSColor(srgbRed: 0.94, green: 0.64, blue: 0.39, alpha: 1)
     private(set) static var themeMode = LabThemeMode.air
 
-    static var accent: NSColor { themeMode == .ground ? groundAccent : airAccent }
+    static var accent: NSColor {
+        if themeMode == .miniDrone { return NSColor(srgbRed: 0.75, green: 0.65, blue: 0.96, alpha: 1) }
+        return themeMode == .ground ? groundAccent : airAccent
+    }
     static var panel: NSColor {
-        themeMode == .ground
+        if themeMode == .miniDrone { return NSColor(srgbRed: 0.105, green: 0.088, blue: 0.14, alpha: 1) }
+        return themeMode == .ground
             ? NSColor(srgbRed: 0.108, green: 0.094, blue: 0.082, alpha: 1)
             : NSColor(srgbRed: 0.072, green: 0.087, blue: 0.108, alpha: 1)
     }
     static var raisedPanel: NSColor {
-        themeMode == .ground
+        if themeMode == .miniDrone { return NSColor(srgbRed: 0.15, green: 0.12, blue: 0.195, alpha: 1) }
+        return themeMode == .ground
             ? NSColor(srgbRed: 0.15, green: 0.124, blue: 0.103, alpha: 1)
             : NSColor(srgbRed: 0.095, green: 0.12, blue: 0.153, alpha: 1)
     }
@@ -119,6 +125,11 @@ enum LabVisualStyle {
     static let mutedText = NSColor.white.withAlphaComponent(0.59)
 
     static var backgroundColors: [CGColor] {
+        if themeMode == .miniDrone {
+            return [NSColor(srgbRed: 0.06, green: 0.04, blue: 0.095, alpha: 1).cgColor,
+                    NSColor(srgbRed: 0.095, green: 0.065, blue: 0.145, alpha: 1).cgColor,
+                    NSColor(srgbRed: 0.045, green: 0.03, blue: 0.07, alpha: 1).cgColor]
+        }
         if themeMode == .ground {
             return [
                 NSColor(srgbRed: 0.055, green: 0.037, blue: 0.025, alpha: 1).cgColor,
