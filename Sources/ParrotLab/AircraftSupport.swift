@@ -75,12 +75,10 @@ struct ParrotProductCapabilities: Equatable {
     var videoCodec: ParrotVideoCodec { model == .jumpingSumo ? .mjpeg : .h264 }
     var supportsSharedARDrone3Commands: Bool { model == .bebopDrone || model == .bebop2 }
     var supportsJumpingSumoCommands: Bool { model == .jumpingSumo }
-    var supportsStockCompatibilityVideo: Bool { model != .unknown }
     var usesARStream1Video: Bool { model == .bebopDrone || model == .jumpingSumo }
     var supportsStockFisheyePhoto: Bool { model == .bebopDrone || model == .bebop2 }
     var supportsBebopCalibration: Bool { model == .bebopDrone || model == .bebop2 }
     var supportsFlightNavigation: Bool { model == .bebopDrone || model == .bebop2 }
-    var supportsGroundDriving: Bool { model == .jumpingSumo }
     var supportsBB2DragonLab: Bool { model == .bebop2 }
     var supportsBB2CameraCalibration: Bool { model == .bebop2 }
     var supportsBB2PersistentTelnetInstall: Bool { model == .bebop2 }
@@ -94,13 +92,6 @@ enum ParrotVideoSource: Equatable {
 }
 
 enum ParrotSessionRouting {
-    static func routeAfterDetection(
-        current: ARSDKConnectionRoute,
-        product _: ParrotProductModel
-    ) -> ARSDKConnectionRoute {
-        current
-    }
-
     static func videoSource(
         route: ARSDKConnectionRoute,
         product: ParrotProductModel
@@ -113,9 +104,9 @@ enum ParrotSessionRouting {
     }
 }
 
-/// Detects direct-Wi-Fi products without guessing from an SSID. All products
-/// use the same 192.168.42.1 ARDiscovery route; the Bonjour product ID selects
-/// the command and video backend before media starts arriving.
+/// Detects direct-Wi-Fi products without guessing from an SSID. The Bonjour
+/// product ID selects the command and video backend; the session owns the
+/// target address (Bebop and Sumo have different default addresses).
 final class DirectParrotProductDiscovery: NSObject, NetServiceBrowserDelegate {
     var onDetected: ((ParrotProductModel, String) -> Void)?
     var onLog: ((String) -> Void)?
@@ -193,10 +184,6 @@ enum ProductSupportSelfTest {
         ParrotProductModel.bebop2.capabilities.supportsBebopCalibration &&
         ParrotProductModel.bebop2.capabilities.supportsBB2DragonLab &&
         !ParrotProductModel.unknown.capabilities.supportsValidatedRFMod &&
-        ParrotSessionRouting.routeAfterDetection(
-            current: .skyController,
-            product: .jumpingSumo
-        ) == .skyController &&
         ParrotSessionRouting.videoSource(
             route: .directProduct,
             product: .jumpingSumo

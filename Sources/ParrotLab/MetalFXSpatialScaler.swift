@@ -39,55 +39,6 @@ final class MetalFXSpatialScalerRenderer {
         context = CIContext(mtlDevice: device, options: [.cacheIntermediates: false])
     }
 
-    func render2x(_ source: CIImage) -> CGImage? {
-        let extent = source.extent.integral
-        let inputWidth = Int(extent.width)
-        let inputHeight = Int(extent.height)
-        guard inputWidth > 0, inputHeight > 0 else { return nil }
-        let outputWidth = inputWidth * 2
-        let outputHeight = inputHeight * 2
-
-        renderLock.lock()
-        defer { renderLock.unlock() }
-
-        guard let pipeline = pipeline(
-            inputWidth: inputWidth,
-            inputHeight: inputHeight,
-            outputWidth: outputWidth,
-            outputHeight: outputHeight
-        ), let commandBuffer = commandQueue.makeCommandBuffer() else { return nil }
-
-        // Normalize non-zero CI origins before writing into the fixed-size
-        // Metal texture used by MetalFX.
-        let normalized = source.transformed(by: CGAffineTransform(
-            translationX: -extent.origin.x,
-            y: -extent.origin.y
-        ))
-        context.render(
-            normalized,
-            to: pipeline.inputTexture,
-            commandBuffer: commandBuffer,
-            bounds: CGRect(x: 0, y: 0, width: inputWidth, height: inputHeight),
-            colorSpace: colorSpace
-        )
-        pipeline.scaler.colorTexture = pipeline.inputTexture
-        pipeline.scaler.outputTexture = pipeline.outputTexture
-        pipeline.scaler.inputContentWidth = inputWidth
-        pipeline.scaler.inputContentHeight = inputHeight
-        pipeline.scaler.encode(commandBuffer: commandBuffer)
-        commandBuffer.commit()
-        commandBuffer.waitUntilCompleted()
-        guard commandBuffer.status == .completed,
-              let output = CIImage(
-                mtlTexture: pipeline.outputTexture,
-                options: [.colorSpace: colorSpace]
-              ) else { return nil }
-        return context.createCGImage(
-            output,
-            from: CGRect(x: 0, y: 0, width: outputWidth, height: outputHeight)
-        )
-    }
-
     /// Scales directly into an IOSurface-backed destination suitable for
     /// VideoToolbox encoding. MetalFX works in private textures, then Core
     /// Image performs the final GPU copy into the shared pixel buffer; no CPU

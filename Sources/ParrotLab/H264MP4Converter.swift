@@ -8,7 +8,7 @@ enum BundledFFmpeg {
             ProcessInfo.processInfo.environment["PARROTLAB_FFMPEG"]
                 .map { URL(fileURLWithPath: $0) },
             URL(fileURLWithPath: "/opt/homebrew/bin/ffmpeg"),
-            URL(fileURLWithPath: "/usr/local/bin/ffmpeg")
+            URL(fileURLWithPath: "/usr/local/bin/ffmpeg"),
         ]
         return candidates.compactMap { $0 }.first {
             FileManager.default.isExecutableFile(atPath: $0.path)

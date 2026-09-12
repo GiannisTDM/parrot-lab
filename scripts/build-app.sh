@@ -1,6 +1,14 @@
 #!/bin/sh
 set -eu
 
+BUILD_RELEASE=0
+case "${1:---local}" in
+    --local) ;;
+    --release) BUILD_RELEASE=1 ;;
+    *) printf '%s\n' "Usage: $0 [--local|--release]" >&2; exit 2 ;;
+esac
+[ "$#" -le 1 ] || { printf '%s\n' "Usage: $0 [--local|--release]" >&2; exit 2; }
+
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 PROJECT_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 PACKAGE_SCRIPT="$SCRIPT_DIR/package-macos-release.sh"
@@ -34,7 +42,7 @@ else
 fi
 
 mkdir -p "$STAGE_APP/Contents/MacOS" "$STAGE_APP/Contents/Frameworks" \
-    "$STAGE_APP/Contents/Resources/DeviceTools" "$DIST_DIR" "$INSTALL_DIR"
+    "$STAGE_APP/Contents/Resources/DeviceTools" "$INSTALL_DIR"
 COPYFILE_DISABLE=1 cp "$SWIFT_BUILD_DIR/release/ParrotLab" "$STAGE_APP/Contents/MacOS/ParrotLab"
 COPYFILE_DISABLE=1 cp "$PROJECT_DIR/Resources/Info.plist" "$STAGE_APP/Contents/Info.plist"
 COPYFILE_DISABLE=1 cp "$PROJECT_DIR/Resources/ParrotLabIcon.png" "$STAGE_APP/Contents/Resources/ParrotLabIcon.png"
@@ -44,6 +52,8 @@ COPYFILE_DISABLE=1 cp "$PROJECT_DIR/patched/dragon-prog-900p-4.7.1" "$STAGE_APP/
 COPYFILE_DISABLE=1 cp "$PROJECT_DIR/tools/parrotlab_dragon_video.sh" "$STAGE_APP/Contents/Resources/DeviceTools/parrotlab_dragon_video.sh"
 COPYFILE_DISABLE=1 cp "$PROJECT_DIR/tools/install_bebop2_persistent_telnet.sh" "$STAGE_APP/Contents/Resources/DeviceTools/install_bebop2_persistent_telnet.sh"
 COPYFILE_DISABLE=1 cp "$PROJECT_DIR/tools/parrot_rf_lab.sh" "$STAGE_APP/Contents/Resources/DeviceTools/parrot_rf_lab.sh"
+COPYFILE_DISABLE=1 cp "$PROJECT_DIR/tools/parrot_sumo_rf_lab.sh" "$STAGE_APP/Contents/Resources/DeviceTools/parrot_sumo_rf_lab.sh"
+COPYFILE_DISABLE=1 cp "$PROJECT_DIR/tools/start_sumo_b29.sh" "$STAGE_APP/Contents/Resources/DeviceTools/start_sumo_b29.sh"
 COPYFILE_DISABLE=1 cp "$PROJECT_DIR/tools/parrotlab_find_sc2_ip.sh" "$STAGE_APP/Contents/Resources/DeviceTools/parrotlab_find_sc2_ip.sh"
 COPYFILE_DISABLE=1 cp "$PROJECT_DIR/sc2/install.sh" "$STAGE_APP/Contents/Resources/DeviceTools/install_sc2_apple_ncm.sh"
 COPYFILE_DISABLE=1 cp "$PROJECT_DIR/sc2/apple_mac_ncm.ko" "$STAGE_APP/Contents/Resources/DeviceTools/apple_mac_ncm.ko"
@@ -52,6 +62,8 @@ chmod 755 "$STAGE_APP/Contents/Resources/DeviceTools/dragon-prog-900p-4.4.2" \
     "$STAGE_APP/Contents/Resources/DeviceTools/parrotlab_dragon_video.sh" \
     "$STAGE_APP/Contents/Resources/DeviceTools/install_bebop2_persistent_telnet.sh" \
     "$STAGE_APP/Contents/Resources/DeviceTools/parrot_rf_lab.sh" \
+    "$STAGE_APP/Contents/Resources/DeviceTools/parrot_sumo_rf_lab.sh" \
+    "$STAGE_APP/Contents/Resources/DeviceTools/start_sumo_b29.sh" \
     "$STAGE_APP/Contents/Resources/DeviceTools/parrotlab_find_sc2_ip.sh" \
     "$STAGE_APP/Contents/Resources/DeviceTools/install_sc2_apple_ncm.sh"
 chmod 644 "$STAGE_APP/Contents/Resources/DeviceTools/apple_mac_ncm.ko"
@@ -90,13 +102,21 @@ case "$FFMPEG_SOURCE" in
 esac
 chmod 755 "$STAGE_APP/Contents/MacOS/ParrotLab"
 
-# Package in a clean temporary location. The helper ad-hoc signs, performs the
-# verbose strict verification, creates the ZIP, extracts it, and verifies the
-# archived app again.
-"$PACKAGE_SCRIPT" "$STAGE_APP" "$STAGE_ZIP"
-mkdir -p "$SIGNED_RELEASE_DIR"
-ditto -x -k "$STAGE_ZIP" "$SIGNED_RELEASE_DIR"
-SIGNED_APP="$SIGNED_RELEASE_DIR/Parrot Lab.app"
+# Both modes sign and verify a staged app before replacing the local install.
+# Only explicit release builds create and verify an archive.
+if [ "$BUILD_RELEASE" -eq 1 ]; then
+    "$PACKAGE_SCRIPT" "$STAGE_APP" "$STAGE_ZIP"
+    mkdir -p "$SIGNED_RELEASE_DIR" "$DIST_DIR"
+    ditto -x -k "$STAGE_ZIP" "$SIGNED_RELEASE_DIR"
+    SIGNED_APP="$SIGNED_RELEASE_DIR/Parrot Lab.app"
+else
+    "$SCRIPT_DIR/bundle-ffmpeg-dependencies.sh" "$STAGE_APP"
+    /usr/bin/xattr -cr "$STAGE_APP"
+    /usr/bin/codesign --force --deep --sign - "$STAGE_APP"
+    /usr/bin/codesign --verify --deep --strict --verbose=2 "$STAGE_APP"
+    "$STAGE_APP/Contents/MacOS/ParrotLab" --self-test
+    SIGNED_APP="$STAGE_APP"
+fi
 
 PREVIOUS_APP="$STAGE_DIR/previous-Parrot-Lab.app"
 if [ -e "$APP_DIR" ]; then
@@ -113,18 +133,21 @@ if ! ditto --noextattr --noqtn "$SIGNED_APP" "$APP_DIR" || \
     exit 1
 fi
 
-mv -f "$STAGE_ZIP" "$ZIP_PATH"
-(
-    cd "$DIST_DIR"
-    /usr/bin/shasum -a 256 "$(basename "$ZIP_PATH")" > "$(basename "$ZIP_PATH").sha256"
-)
+if [ "$BUILD_RELEASE" -eq 1 ]; then
+    mv -f "$STAGE_ZIP" "$ZIP_PATH"
+    (
+        cd "$DIST_DIR"
+        /usr/bin/shasum -a 256 "$(basename "$ZIP_PATH")" > "$(basename "$ZIP_PATH").sha256"
+    )
 
-# Older builds left a second launchable copy inside dist. The installed app is
-# now the single canonical copy; dist contains only the distributable archive.
-if [ "$LEGACY_APP_DIR" != "$APP_DIR" ] && [ -e "$LEGACY_APP_DIR" ]; then
-    mv "$LEGACY_APP_DIR" "$STAGE_DIR/legacy-dist-Parrot-Lab.app"
+    # Remove the obsolete duplicate only while explicitly updating dist.
+    if [ "$LEGACY_APP_DIR" != "$APP_DIR" ] && [ -e "$LEGACY_APP_DIR" ]; then
+        mv "$LEGACY_APP_DIR" "$STAGE_DIR/legacy-dist-Parrot-Lab.app"
+    fi
 fi
 
 printf '%s\n' "$APP_DIR"
-printf '%s\n' "$ZIP_PATH"
-printf '%s\n' "$ZIP_PATH.sha256"
+if [ "$BUILD_RELEASE" -eq 1 ]; then
+    printf '%s\n' "$ZIP_PATH"
+    printf '%s\n' "$ZIP_PATH.sha256"
+fi

@@ -13,8 +13,8 @@ Gatekeeper experience of a Developer-ID-signed and Apple-notarized release.
 On Apple Silicon macOS with Xcode command-line tools installed, run:
 
 ```sh
-cd parrot-lab
-./scripts/build-app.sh
+cd mac/ParrotLab
+./scripts/build-app.sh --release
 ```
 
 This performs the Swift Release build, assembles the normal application
@@ -23,10 +23,17 @@ locally, and produces:
 
 ```text
 ~/Applications/Parrot Lab.app
-dist/Parrot-Lab-macOS-arm64.zip
+mac/ParrotLab/dist/Parrot-Lab-macOS-arm64.zip
+mac/ParrotLab/dist/Parrot-Lab-macOS-arm64.zip.sha256
 ```
 
-Upload `Parrot-Lab-macOS-arm64.zip` as the GitHub Release asset.
+Upload `Parrot-Lab-macOS-arm64.zip` as the GitHub Release asset. The adjacent
+`.sha256` file is generated from that exact final archive and can be uploaded
+with it for testers who want to verify their download.
+
+Release compilation uses optimized per-file Swift compilation and all logical
+CPU cores by default. Set `PARROTLAB_BUILD_JOBS` to a positive integer to cap
+parallelism on another machine.
 
 ### FFmpeg input and bundling
 
@@ -47,7 +54,7 @@ Parrot Lab.app/Contents/Resources/ffmpeg-parrotlab
 For a clean release machine, set the source explicitly:
 
 ```sh
-PARROTLAB_FFMPEG=/absolute/path/to/arm64/ffmpeg ./scripts/build-app.sh
+PARROTLAB_FFMPEG=/absolute/path/to/arm64/ffmpeg ./scripts/build-app.sh --release
 ```
 
 Before signing, `bundle-ffmpeg-dependencies.sh` recursively examines FFmpeg and
@@ -99,8 +106,7 @@ input unchanged, and then:
    codesign --verify --deep --strict --verbose=2 "/path/to/Parrot Lab.app"
    ```
 
-5. confirms that `codesign` reports `Signature=adhoc` and
-   `TeamIdentifier=not set`;
+5. confirms that `codesign` reports `Signature=adhoc`;
 6. runs the offline application self-test;
 7. creates and integrity-tests the ZIP;
 8. extracts the ZIP and verifies the signature of the archived app again;

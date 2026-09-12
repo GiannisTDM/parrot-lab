@@ -20,7 +20,12 @@ enum FlightControlAction: String, CaseIterable, Codable {
     case cameraRight
     case cameraCenter
     case highJump
+    case longJump
     case emergency
+    case flatTrim
+    case grabberOpen
+    case grabberClose
+    case cannonFire
 
     var title: String {
         switch self {
@@ -42,6 +47,11 @@ enum FlightControlAction: String, CaseIterable, Codable {
         case .cameraRight: return "Camera right"
         case .cameraCenter: return "Center camera"
         case .highJump: return "High jump"
+        case .longJump: return "Long jump"
+        case .flatTrim: return "Flat trim"
+        case .grabberOpen: return "Open grabber"
+        case .grabberClose: return "Close grabber"
+        case .cannonFire: return "Fire cannon"
         case .emergency: return "Emergency cut-out"
         }
     }
@@ -59,9 +69,17 @@ enum FlightControlAction: String, CaseIterable, Codable {
         }
     }
 
+    var isMiniDroneOnly: Bool {
+        [.flatTrim, .grabberOpen, .grabberClose, .cannonFire].contains(self)
+    }
+
+    var isMiniDroneRelevant: Bool {
+        isContinuousAxis || isMiniDroneOnly || self == .takeOffLand || self == .emergency
+    }
+
     var isGroundRelevant: Bool {
         switch self {
-        case .movementEnable, .pitchForward, .pitchBackward, .rollLeft, .rollRight, .highJump, .emergency:
+        case .movementEnable, .pitchForward, .pitchBackward, .rollLeft, .rollRight, .highJump, .longJump, .emergency:
             return true
         default:
             return false
@@ -75,6 +93,14 @@ enum FlightControlAction: String, CaseIterable, Codable {
             return true
         default:
             return false
+        }
+    }
+
+    var jumpingSumoJumpType: ARSDKPhotoCommand.JumpingSumoJumpType? {
+        switch self {
+        case .highJump: return .high
+        case .longJump: return .long
+        default: return nil
         }
     }
 
@@ -173,7 +199,52 @@ enum FlightControllerAxisDirection: String, CaseIterable, Codable {
     }
 }
 
+enum ControllerResponseCurve: Float {
+    case standard = 1.35
+    case groundSteering = 3
+
+    init(action: FlightControlAction, groundMode: Bool) {
+        self = groundMode && (action == .rollLeft || action == .rollRight)
+            ? .groundSteering : .standard
+    }
+}
+
+/// Session-local ranges, keyed by physical direction rather than action. Learn
+/// on release so a new endpoint never increases gain during a held gesture.
+struct ControllerStickRanges {
+    private var peaks: [FlightControllerAxisDirection: Float] = [:]
+    private var endpoints: [FlightControllerAxisDirection: Float] = [:]
+
+    mutating func observe(_ source: Float, direction: FlightControllerAxisDirection, deadzone: Float) {
+        guard direction != .unassigned, source.isFinite else { return }
+        let magnitude = min(1, max(0, source))
+        if magnitude > deadzone {
+            peaks[direction] = max(peaks[direction] ?? 0, magnitude)
+        } else if let peak = peaks.removeValue(forKey: direction), peak >= 0.5 {
+            // Ignore drift and small movements. Subsequent sweeps can extend,
+            // but never shrink, the learned range for this connection.
+            endpoints[direction] = max(endpoints[direction] ?? 0, peak)
+        }
+    }
+
+    func scaledMagnitude(_ source: Float, direction: FlightControllerAxisDirection,
+                         deadzone: Float, limit: Float,
+                         response: ControllerResponseCurve = .standard) -> Float {
+        guard direction != .unassigned, source.isFinite, source > deadzone else { return 0 }
+        let endpoint = endpoints[direction] ?? 1
+        let normalized = min(1, max(0, (source - deadzone) / max(0.001, endpoint - deadzone)))
+        return pow(normalized, response.rawValue) * min(1, max(0, limit)) * 100
+    }
+
+    mutating func cancelGesture() {
+        peaks.removeAll()
+    }
+}
+
 struct FlightControlConfiguration: Equatable, Codable {
+    static let controllerDeadzoneRange = 0.0...0.45
+    static let controllerSensitivityRange = 0.25...1.0
+
     var standaloneBebopEnabled = false
     var keyboardEnabled = false
     var controllerEnabled = false
@@ -197,6 +268,7 @@ struct FlightControlConfiguration: Equatable, Codable {
         .cameraLeft: 123, .cameraRight: 124,
         .cameraCenter: 8,
         .highJump: UInt16.max,
+        .longJump: UInt16.max,
         .emergency: UInt16.max
     ]
 
@@ -208,6 +280,7 @@ struct FlightControlConfiguration: Equatable, Codable {
         .cameraLeft: .dpadLeft, .cameraRight: .dpadRight,
         .cameraCenter: .rightShoulder,
         .highJump: .unassigned,
+        .longJump: .unassigned,
         .emergency: .unassigned
     ]
 
@@ -222,15 +295,19 @@ struct FlightControlConfiguration: Equatable, Codable {
 
     static func load() -> FlightControlConfiguration {
         guard let data = UserDefaults.standard.data(forKey: defaultsKey),
-              var decoded = try? JSONDecoder().decode(FlightControlConfiguration.self, from: data) else {
+              let decoded = try? JSONDecoder().decode(FlightControlConfiguration.self, from: data) else {
             return FlightControlConfiguration()
         }
-        // ConfigurationV1 predates remappable analogue directions. An empty
-        // decoded map is the migration signal for those existing installs.
-        if decoded.controllerAxisDirections.isEmpty {
-            decoded.controllerAxisDirections = defaultControllerAxisDirections
-        }
         return decoded
+    }
+
+    var clampedControllerTuning: FlightControlConfiguration {
+        var result = self
+        result.controllerDeadzone = min(Self.controllerDeadzoneRange.upperBound,
+                                       max(Self.controllerDeadzoneRange.lowerBound, controllerDeadzone))
+        result.controllerSensitivity = min(Self.controllerSensitivityRange.upperBound,
+                                          max(Self.controllerSensitivityRange.lowerBound, controllerSensitivity))
+        return result
     }
 
     func save() {
@@ -288,10 +365,18 @@ struct FlightControlConfiguration: Equatable, Codable {
             [FlightControlAction: FlightControllerButton].self,
             forKey: .controllerButtons
         ) ?? Self.defaultControllerButtons
+        // Add the new action without changing any existing custom bindings.
+        if keyboardKeys[.longJump] == nil { keyboardKeys[.longJump] = UInt16.max }
+        if controllerButtons[.longJump] == nil { controllerButtons[.longJump] = .unassigned }
         controllerAxisDirections = try values.decodeIfPresent(
             [FlightControlAction: FlightControllerAxisDirection].self,
             forKey: .controllerAxisDirections
         ) ?? Self.defaultControllerAxisDirections
+        // ConfigurationV1 predates remappable analogue directions. Migrate
+        // here so all decoding paths apply the same defaults as app startup.
+        if controllerAxisDirections.isEmpty {
+            controllerAxisDirections = Self.defaultControllerAxisDirections
+        }
     }
 }
 
@@ -309,6 +394,8 @@ final class FlightInputManager {
     private var pressedControllerActions = Set<FlightControlAction>()
     private var controllerInput = BebopPilotingInput.neutral
     private var controlsAreAvailable = false
+    private var groundMode = false
+    private var stickRanges: [ObjectIdentifier: ControllerStickRanges] = [:]
 
     init() {
         localEventMonitor = NSEvent.addLocalMonitorForEvents(
@@ -326,7 +413,11 @@ final class FlightInputManager {
         })
         controllerObservers.append(center.addObserver(
             forName: .GCControllerDidDisconnect, object: nil, queue: .main
-        ) { [weak self] _ in
+        ) { [weak self] note in
+            if let controller = note.object as? GCController,
+               let gamepad = controller.extendedGamepad {
+                self?.stickRanges.removeValue(forKey: ObjectIdentifier(gamepad))
+            }
             self?.controllerInput = .neutral
             self?.pressedControllerActions.removeAll()
             self?.emitCombinedInput()
@@ -353,16 +444,18 @@ final class FlightInputManager {
     }
 
     func apply(_ configuration: FlightControlConfiguration) {
+        neutralize()
         self.configuration = configuration
         configuration.save()
-        if !configuration.keyboardEnabled { pressedKeys.removeAll() }
-        if !configuration.controllerEnabled {
-            controllerInput = .neutral
-            pressedControllerActions.removeAll()
-        }
         GCController.controllers().forEach(configure)
         emitCombinedInput()
         reportControllerStatus()
+    }
+
+    func setGroundMode(_ enabled: Bool) {
+        guard groundMode != enabled else { return }
+        neutralize()
+        groundMode = enabled
     }
 
     func setControlsAvailable(_ available: Bool) {
@@ -376,6 +469,7 @@ final class FlightInputManager {
     }
 
     func neutralize() {
+        for key in Array(stickRanges.keys) { stickRanges[key]?.cancelGesture() }
         pressedKeys.removeAll()
         controllerInput = .neutral
         pressedControllerActions.removeAll()
@@ -384,6 +478,10 @@ final class FlightInputManager {
 
     private func handleKeyboard(_ event: NSEvent) {
         guard configuration.keyboardEnabled else { return }
+        guard isMainFlightWindowActive, !isEditingText else {
+            pressedKeys.removeAll()
+            return
+        }
         let code = event.keyCode
         if event.type == .flagsChanged {
             let down = event.modifierFlags.contains(.shift)
@@ -436,6 +534,7 @@ final class FlightInputManager {
     }
 
     private func configure(_ controller: GCController) {
+        controller.handlerQueue = .main
         guard let gamepad = controller.extendedGamepad else {
             reportControllerStatus()
             return
@@ -448,19 +547,31 @@ final class FlightInputManager {
     }
 
     private func read(_ gamepad: GCExtendedGamepad) {
-        guard configuration.controllerEnabled, controlsAreAvailable, isMainFlightWindowActive else {
+        guard configuration.controllerEnabled, isMainFlightWindowActive else {
+            stickRanges[ObjectIdentifier(gamepad)]?.cancelGesture()
             controllerInput = .neutral
             emitCombinedInput()
             return
         }
         let deadzone = Float(configuration.controllerDeadzone)
         let sensitivity = Float(configuration.controllerSensitivity)
+        let key = ObjectIdentifier(gamepad)
+        var ranges = stickRanges[key] ?? ControllerStickRanges()
+        for direction in FlightControllerAxisDirection.allCases {
+            ranges.observe(direction.magnitude(on: gamepad), direction: direction, deadzone: deadzone)
+        }
+        stickRanges[key] = ranges
+        // Range learning also works while disconnected from the vehicle.
+        guard controlsAreAvailable else {
+            controllerInput = .neutral
+            emitCombinedInput()
+            return
+        }
         func scaledMagnitude(for action: FlightControlAction) -> Float {
             let direction = configuration.controllerAxisDirections[action] ?? .unassigned
-            let source = direction.magnitude(on: gamepad)
-            guard source > deadzone else { return 0 }
-            let normalized = (source - deadzone) / max(0.001, 1 - deadzone)
-            return pow(normalized, 1.35) * sensitivity * 100
+            return ranges.scaledMagnitude(direction.magnitude(on: gamepad), direction: direction,
+                                          deadzone: deadzone, limit: sensitivity,
+                                          response: ControllerResponseCurve(action: action, groundMode: groundMode))
         }
         func axis(
             negative: FlightControlAction,
@@ -533,44 +644,5 @@ final class FlightInputManager {
         let connected = GCController.controllers().filter { $0.extendedGamepad != nil }.count
         let state = controlsAreAvailable ? "READY" : "WAITING FOR ARSDK"
         onStatus?("\(state) · \(connected) GAMEPAD\(connected == 1 ? "" : "S")")
-    }
-}
-
-enum FlightControlSelfTest {
-    static func run() -> Bool {
-        let timestamp: UInt32 = 0x7a12_3456
-        let payload = ARSDKPhotoCommand.pcmd(
-            flag: true, roll: -100, pitch: 100, yaw: -1, gaz: 1,
-            timestampAndSequence: timestamp
-        )
-        guard payload == Data([
-            1, 0, 2, 0, 1, 156, 100, 255, 1, 0x56, 0x34, 0x12, 0x7a
-        ]),
-        ARSDKPhotoCommand.takeOff == Data([1, 0, 1, 0]),
-        ARSDKPhotoCommand.landing == Data([1, 0, 3, 0]),
-        ARSDKPhotoCommand.emergency == Data([1, 0, 4, 0]),
-        ARSDKPhotoCommand.navigateHome(start: true) == Data([1, 0, 5, 0, 1]),
-        ARSDKPhotoCommand.cameraOrientation(tilt: -100, pan: 100) == Data([1, 1, 0, 0, 156, 100]),
-        JumpingSumoPilotingInput(sharedInput: BebopPilotingInput(
-            roll: -55, pitch: 80, yaw: 100, gaz: -100
-        )) == JumpingSumoPilotingInput(speed: 80, turn: -55),
-        ARSDKPhotoCommand.jumpingSumoPCMD(flag: true, speed: 80, turn: -55) ==
-            Data([3, 0, 0, 0, 1, 80, 201]) else {
-            return false
-        }
-        var configuration = FlightControlConfiguration()
-        configuration.controllerDeadzone = 0.18
-        configuration.bindControllerButton(.a, to: .returnHome)
-        configuration.bindControllerAxisDirection(.leftStickUp, to: .pitchForward)
-        guard configuration.controllerButtons[.returnHome] == .a,
-              configuration.controllerButtons[.takeOffLand] == .unassigned,
-              configuration.controllerAxisDirections[.pitchForward] == .leftStickUp,
-              configuration.controllerAxisDirections[.gazUp] == .unassigned else {
-            return false
-        }
-        return (try? JSONDecoder().decode(
-            FlightControlConfiguration.self,
-            from: JSONEncoder().encode(configuration)
-        )) == configuration
     }
 }

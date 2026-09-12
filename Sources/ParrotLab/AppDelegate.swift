@@ -31,6 +31,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     private var window: NSWindow?
     private var controller: MainViewController?
+    private weak var sc2MappingsButton: NSButton?
+    private var settingsAirOnlyViews: [NSView] = []
+    private weak var miniDroneSettingsNote: NSTextField?
+    private weak var flightSettingsTitle: NSTextField?
     private var settingsWindow: NSWindow?
     private var flightMappingsWindow: NSWindow?
     private weak var standaloneBebopCheckbox: NSButton?
@@ -81,6 +85,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         controller.onGroundModeChanged = { [weak self] _ in
             self?.refreshForGroundModeChange()
         }
+        rebuildToolsMenu()
         NSApp.activate(ignoringOtherApps: true)
     }
 
@@ -99,13 +104,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     }
 
     @objc func showSettings(_ sender: Any?) {
-        if let settingsWindow {
-            refreshSettingsControls()
-            settingsWindow.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
-            return
-        }
+        let panel = settingsWindow ?? makeSettingsWindow()
+        refreshSettingsControls()
+        panel.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
 
+    private func makeSettingsWindow() -> NSPanel {
         let panel = NSPanel(
             contentRect: NSRect(x: 0, y: 0, width: 540, height: 820),
             styleMask: [.titled, .closable],
@@ -115,6 +120,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         panel.title = "Parrot Lab Settings"
         panel.isReleasedWhenClosed = false
         panel.appearance = NSAppearance(named: .darkAqua)
+        panel.backgroundColor = LabVisualStyle.panel
 
         let scroll = NSScrollView(frame: panel.contentView?.bounds ?? .zero)
         scroll.drawsBackground = false
@@ -122,6 +128,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         scroll.autohidesScrollers = true
         scroll.borderType = .noBorder
         let content = LabFlippedBackgroundView(frame: NSRect(x: 0, y: 0, width: 540, height: 1_100))
+        content.translatesAutoresizingMaskIntoConstraints = false
+        scroll.documentView = content
         let stack = NSStackView()
         stack.orientation = .vertical
         stack.alignment = .leading
@@ -133,13 +141,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             stack.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             stack.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             stack.topAnchor.constraint(equalTo: content.topAnchor),
-            stack.bottomAnchor.constraint(lessThanOrEqualTo: content.bottomAnchor)
+            stack.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            content.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor)
         ])
 
         let flightTitle = NSTextField(labelWithString: "Connection and vehicle control")
         flightTitle.font = .systemFont(ofSize: 15, weight: .semibold)
         flightTitle.textColor = .white
         stack.addArrangedSubview(flightTitle)
+        flightSettingsTitle = flightTitle
+        let bluetoothNote = NSTextField(wrappingLabelWithString:
+            "MiniDrone connects over Bluetooth. Choose your inputs and adjust how the sticks respond. Piloting pauses while you edit controls."
+        )
+        bluetoothNote.font = .systemFont(ofSize: 12)
+        bluetoothNote.textColor = LabVisualStyle.mutedText
+        bluetoothNote.widthAnchor.constraint(equalToConstant: 480).isActive = true
+        stack.addArrangedSubview(bluetoothNote)
+        miniDroneSettingsNote = bluetoothNote
 
         let standaloneCheckbox = NSButton(
             checkboxWithTitle: "Connect directly to product Wi-Fi (Bebop / Sumo)",
@@ -171,6 +189,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             inputModePopup.addItem(withTitle: mode.title)
             inputModePopup.lastItem?.tag = mode.rawValue
         }
+        inputModePopup.menu?.autoenablesItems = false
         inputModePopup.target = self
         inputModePopup.action = #selector(flightControlSettingChanged(_:))
         inputModePopup.widthAnchor.constraint(equalToConstant: 250).isActive = true
@@ -178,11 +197,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         stack.addArrangedSubview(inputRow)
 
         let controllerNote = NSTextField(wrappingLabelWithString:
-            "Choose keyboard, gamepad, or both. When both are enabled their live axes are combined safely. macOS uses Apple's GameController system rather than XInput; all analogue movement directions can be remapped below."
+            "Choose keyboard, gamepad, or both. After connecting a gamepad, sweep both sticks fully in every direction and release to center. Each direction learns its range automatically, including while disconnected from the vehicle. Stick limit still caps output."
         )
         controllerNote.font = .systemFont(ofSize: 11.5)
         controllerNote.textColor = LabVisualStyle.mutedText
-        controllerNote.maximumNumberOfLines = 2
+        controllerNote.maximumNumberOfLines = 5
         controllerNote.widthAnchor.constraint(equalToConstant: 480).isActive = true
         stack.addArrangedSubview(controllerNote)
 
@@ -190,11 +209,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         controllerTuning.orientation = .horizontal
         controllerTuning.spacing = 14
         let deadzoneRow = makeCompactFlightSlider(
-            title: "Deadzone", minimum: 0, maximum: 0.45,
+            title: "Deadzone",
+            minimum: FlightControlConfiguration.controllerDeadzoneRange.lowerBound,
+            maximum: FlightControlConfiguration.controllerDeadzoneRange.upperBound,
             action: #selector(flightControlSettingChanged(_:))
         )
         let sensitivityRow = makeCompactFlightSlider(
-            title: "Stick limit", minimum: 0.25, maximum: 1,
+            title: "Stick limit",
+            minimum: FlightControlConfiguration.controllerSensitivityRange.lowerBound,
+            maximum: FlightControlConfiguration.controllerSensitivityRange.upperBound,
             action: #selector(flightControlSettingChanged(_:))
         )
         controllerTuning.addArrangedSubview(deadzoneRow.container)
@@ -221,6 +244,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         mappingsButton.bezelStyle = .rounded
         invertRow.addArrangedSubview(mappingsButton)
         stack.addArrangedSubview(invertRow)
+        let sc2Mappings = NSButton(title: "Configure SkyController 2 sticks & buttons…", target: self,
+                                  action: #selector(showSC2Mappings(_:)))
+        stack.addArrangedSubview(sc2Mappings)
+        sc2MappingsButton = sc2Mappings
 
         let flightSeparator = NSBox()
         flightSeparator.boxType = .separator
@@ -360,10 +387,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         temporalConsistencyValue = consistencyRow.value
         temporalLatencySlider = latencyRow.slider
         temporalLatencyValue = latencyRow.value
+        let videoStart = stack.arrangedSubviews.firstIndex(of: flightSeparator)!
+        settingsAirOnlyViews = [standaloneCheckbox, standaloneExplanation, sc2Mappings] +
+            Array(stack.arrangedSubviews[videoStart...])
         refreshSettingsControls()
-        panel.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        return panel
     }
+
+    @objc func showSC2Mappings(_ sender: Any?) { controller?.showSC2Mappings() }
 
     @objc private func toggleDeveloperVideoDiagnosticsSetting(_ sender: Any?) {
         guard let checkbox = sender as? NSButton else { return }
@@ -451,27 +482,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         refreshSettingsControls()
     }
 
-    @objc private func showFlightControlMappings(_ sender: Any?) {
-        if let flightMappingsWindow {
-            refreshFlightMappingControls()
-            flightMappingsWindow.makeKeyAndOrderFront(nil)
-            return
-        }
-        guard let controller else { return }
+    @objc func showFlightControlMappings(_ sender: Any?) {
+        guard let panel = flightMappingsWindow ?? makeFlightControlMappingsWindow() else { return }
+        refreshFlightMappingControls()
+        panel.makeKeyAndOrderFront(nil)
+    }
+
+    private func makeFlightControlMappingsWindow() -> NSPanel? {
+        guard let controller else { return nil }
         let panel = NSPanel(
             contentRect: NSRect(x: 0, y: 0, width: 650, height: 720),
             styleMask: [.titled, .closable, .resizable],
             backing: .buffered,
             defer: false
         )
-        panel.title = "Parrot Lab Vehicle Control Mappings"
+        panel.title = controller.isMiniDroneModeActive ? "MiniDrone mappings" : "Parrot Lab Vehicle Control Mappings"
         panel.isReleasedWhenClosed = false
         panel.appearance = NSAppearance(named: .darkAqua)
+        panel.backgroundColor = LabVisualStyle.panel
 
         let scroll = NSScrollView()
         scroll.drawsBackground = false
         scroll.hasVerticalScroller = true
-        let document = LabFlippedView(frame: NSRect(x: 0, y: 0, width: 630, height: 920))
+        let document = LabFlippedBackgroundView(frame: NSRect(x: 0, y: 0, width: 630, height: 920))
+        document.translatesAutoresizingMaskIntoConstraints = false
+        scroll.documentView = document
+        document.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor).isActive = true
         let stack = NSStackView()
         stack.orientation = .vertical
         stack.alignment = .leading
@@ -490,7 +526,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         title.font = .systemFont(ofSize: 16, weight: .semibold)
         stack.addArrangedSubview(title)
         let note = NSTextField(wrappingLabelWithString:
-            "Keyboard movement is active only while its safety-hold key is pressed. Every gamepad movement direction can be assigned to either analogue stick direction; discrete actions use buttons. Ground Mode shows only Sumo-relevant actions."
+            "Choose a key, stick direction or button for each action. Keyboard movement requires the safety-hold key. Piloting pauses while this window is active."
         )
         note.textColor = LabVisualStyle.mutedText
         note.maximumNumberOfLines = 3
@@ -512,9 +548,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         keyboardMappingPopups.removeAll()
         controllerMappingPopups.removeAll()
         controllerAxisMappingPopups.removeAll()
-        let mappingActions = controller.isGroundModeActive
+        let mappingActions = controller.isMiniDroneModeActive
+            ? FlightControlAction.allCases.filter(\.isMiniDroneRelevant)
+            : controller.isGroundModeActive
             ? FlightControlAction.allCases.filter(\.isGroundRelevant)
-            : FlightControlAction.allCases
+            : FlightControlAction.allCases.filter { $0.jumpingSumoJumpType == nil && !$0.isMiniDroneOnly }
         for action in mappingActions {
             let row = NSStackView()
             row.orientation = .horizontal
@@ -530,6 +568,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
                 keyboard.addItem(withTitle: key.title)
                 keyboard.lastItem?.tag = Int(key.keyCode)
             }
+            keyboard.menu?.autoenablesItems = false
             keyboard.target = self
             keyboard.action = #selector(flightMappingChanged(_:))
             keyboard.identifier = NSUserInterfaceItemIdentifier("keyboard.\(action.rawValue)")
@@ -550,6 +589,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
                     gamepad.addItem(withTitle: direction.title)
                     gamepad.lastItem?.tag = index
                 }
+                gamepad.menu?.autoenablesItems = false
                 gamepad.target = self
                 gamepad.action = #selector(flightMappingChanged(_:))
                 gamepad.identifier = NSUserInterfaceItemIdentifier("gamepadAxis.\(action.rawValue)")
@@ -562,6 +602,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
                     gamepad.addItem(withTitle: button.title)
                     gamepad.lastItem?.tag = index
                 }
+                gamepad.menu?.autoenablesItems = false
                 gamepad.target = self
                 gamepad.action = #selector(flightMappingChanged(_:))
                 gamepad.identifier = NSUserInterfaceItemIdentifier("gamepad.\(action.rawValue)")
@@ -581,7 +622,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         panel.center()
         flightMappingsWindow = panel
         refreshFlightMappingControls()
-        panel.makeKeyAndOrderFront(nil)
+        return panel
     }
 
     @objc private func flightMappingChanged(_ sender: Any?) {
@@ -661,10 +702,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     }
 
     private func refreshSettingsControls() {
+        let miniDrone = controller?.isMiniDroneModeActive == true
+        settingsAirOnlyViews.forEach { $0.isHidden = miniDrone }
+        miniDroneSettingsNote?.isHidden = !miniDrone
+        flightSettingsTitle?.stringValue = miniDrone ? "MiniDrone controls" : "Connection and vehicle control"
+        settingsWindow?.title = miniDrone ? "MiniDrone controls" : "Parrot Lab Settings"
+        let desiredHeight: CGFloat = miniDrone ? 440 : 820
+        if settingsWindow?.contentView?.bounds.height != desiredHeight {
+            settingsWindow?.setContentSize(NSSize(width: 540, height: desiredHeight))
+        }
+        sc2MappingsButton?.isHidden = miniDrone
         developerDiagnosticsCheckbox?.state = controller?.isDeveloperVideoDiagnosticsEnabled == true ? .on : .off
         if let flight = controller?.currentFlightControlConfiguration {
             standaloneBebopCheckbox?.state = flight.standaloneBebopEnabled ? .on : .off
-            standaloneBebopCheckbox?.isEnabled = controller?.isGroundModeActive != true
+            standaloneBebopCheckbox?.isEnabled = controller?.isGroundModeActive != true && controller?.isMiniDroneModeActive != true
             let inputMode = VehicleInputMode(
                 keyboardEnabled: flight.keyboardEnabled,
                 gamepadEnabled: flight.controllerEnabled
@@ -712,11 +763,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     }
 
     private func refreshForGroundModeChange() {
+        rebuildToolsMenu()
         if let contentView = settingsWindow?.contentView {
             LabVisualStyle.applyTheme(
-                controller?.isGroundModeActive == true ? .ground : .air,
+                controller?.isMiniDroneModeActive == true ? .miniDrone : (controller?.isGroundModeActive == true ? .ground : .air),
                 to: contentView
             )
+            settingsWindow?.backgroundColor = LabVisualStyle.panel
         }
         refreshSettingsControls()
         guard let mappings = flightMappingsWindow else { return }
@@ -743,6 +796,73 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     @objc func configureRFPowerMod(_ sender: Any?) {
         controller?.configureRFPowerMod()
+    }
+
+    @objc func configureSC2RFPowerMod(_ sender: Any?) {
+        controller?.configureRFPowerMod(sc2Only: true)
+    }
+
+    @objc func uploadSumoRFModSuite(_ sender: Any?) { controller?.uploadSumoRFModSuite() }
+    @objc func configureSumoRFPowerMod(_ sender: Any?) { controller?.configureSumoRFPowerMod() }
+    @objc func startSumoB29(_ sender: Any?) { controller?.startSumoB29() }
+
+    private func rebuildToolsMenu() {
+        guard let menu = NSApp.mainMenu?.item(withTitle: "Tools")?.submenu else { return }
+        populateToolsMenu(menu, ground: controller?.isGroundModeActive == true)
+    }
+
+    func populateToolsMenu(_ menu: NSMenu, ground: Bool) {
+        menu.removeAllItems()
+        func add(_ title: String, _ action: Selector) {
+            let item = menu.addItem(withTitle: title, action: action, keyEquivalent: "")
+            item.target = self
+        }
+        if controller?.isMiniDroneModeActive == true {
+            add("Configure MiniDrone Controls…", #selector(showFlightControlMappings(_:)))
+            return
+        }
+        if ground {
+            add("Start Sumo 30 FPS Dragon (B29)…", #selector(startSumoB29(_:)))
+            add("Upload Sumo RF Lab…", #selector(uploadSumoRFModSuite(_:)))
+            add("Enable/Disable Sumo RF Power Mod…", #selector(configureSumoRFPowerMod(_:)))
+        } else {
+            add("Bebop Flat Trim", #selector(performBebopFlatTrim(_:)))
+            add("Start Bebop Magnetometer Calibration", #selector(toggleBebopMagnetometerCalibration(_:)))
+            menu.addItem(.separator())
+            add("Install/Update Dragon Lab on Bebop 2", #selector(installDragonLabOnBebop2(_:)))
+            add("Enable Persistent Telnet on Bebop 2…", #selector(enablePersistentTelnetOnBebop2(_:)))
+            add("Upload RF/MOD Suite to Bebop 2", #selector(uploadRFModSuiteToBebop2(_:)))
+            add("Enable/Disable Paired Bebop 2 + SC2 RF Power Mod…", #selector(configureRFPowerMod(_:)))
+        }
+        menu.addItem(.separator())
+        add("Upload RF/MOD Suite to SkyController 2", #selector(uploadRFModSuiteToSkyController2(_:)))
+        add("Enable/Disable SC2 RF Power Mod…", #selector(configureSC2RFPowerMod(_:)))
+        add("Configure SC2 Sticks & Buttons…", #selector(showSC2Mappings(_:)))
+        menu.addItem(.separator())
+        add("Find SC2 IP through Bebop 2…", #selector(findSC2HostThroughBebop(_:)))
+        add("Find SC2 USB Networking IP…", #selector(findSC2USBHost(_:)))
+        add("Install/Update SC2 Driver Patch", #selector(installSC2DriverPatch(_:)))
+    }
+
+    static func toolsMenuSelfTest() -> Bool {
+        let delegate = AppDelegate()
+        let menu = NSMenu(title: "Tools")
+        for ground in [false, true, false, true] {
+            delegate.populateToolsMenu(menu, ground: ground)
+            let actions = menu.items.compactMap(\.action)
+            guard actions.contains(#selector(startSumoB29(_:))) == ground,
+                  actions.contains(#selector(uploadSumoRFModSuite(_:))) == ground,
+                  actions.contains(#selector(configureSumoRFPowerMod(_:))) == ground,
+                  actions.contains(#selector(performBebopFlatTrim(_:))) == !ground,
+                  actions.contains(#selector(installDragonLabOnBebop2(_:))) == !ground,
+                  actions.contains(#selector(configureRFPowerMod(_:))) == !ground,
+                  actions.contains(#selector(configureSC2RFPowerMod(_:))),
+                  actions.contains(#selector(uploadRFModSuiteToSkyController2(_:))),
+                  actions.contains(#selector(installSC2DriverPatch(_:))),
+                  actions.contains(#selector(findSC2USBHost(_:))),
+                  Set(actions.map(NSStringFromSelector)).count == actions.count else { return false }
+        }
+        return true
     }
 
     @objc func selectVideoEnhancement(_ sender: Any?) {
@@ -795,9 +915,80 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         controller?.findSC2USBHost()
     }
 
+    /// Builds real settings/mapping controls without showing windows or opening Bluetooth.
+    static func settingsInteractionSelfTest() -> Bool {
+        _ = NSApplication.shared
+        let saved = UserDefaults.standard.object(forKey: FlightControlConfiguration.defaultsKey)
+        let previousTheme = LabVisualStyle.themeMode
+        let delegate = AppDelegate()
+        let controller = MainViewController()
+        delegate.controller = controller
+        _ = controller.view
+        controller.enterMiniDroneMode()
+        defer {
+            controller.prepareForTermination()
+            if let saved { UserDefaults.standard.set(saved, forKey: FlightControlConfiguration.defaultsKey) }
+            else { UserDefaults.standard.removeObject(forKey: FlightControlConfiguration.defaultsKey) }
+            LabVisualStyle.applyTheme(previousTheme, to: NSView())
+        }
+        var config = controller.currentFlightControlConfiguration
+        config.controllerEnabled = true
+        controller.setFlightControlConfiguration(config)
+        _ = delegate.makeSettingsWindow()
+        guard delegate.makeFlightControlMappingsWindow() != nil,
+              let input = delegate.vehicleInputModePopup else { return false }
+        for action in [#selector(flightControlSettingChanged(_:)), #selector(flightMappingChanged(_:)),
+                       #selector(resetFlightMappings(_:))] {
+            guard delegate.validateMenuItem(NSMenuItem(title: "Choice", action: action, keyEquivalent: "")) else { return false }
+        }
+        guard !delegate.validateMenuItem(NSMenuItem(title: "Device tool", action: #selector(installSC2DriverPatch(_:)), keyEquivalent: "")),
+              delegate.settingsAirOnlyViews.allSatisfy(\.isHidden),
+              delegate.miniDroneSettingsNote?.isHidden == false else { return false }
+        let choices = [input] + Array(delegate.keyboardMappingPopups.values) +
+            Array(delegate.controllerMappingPopups.values) + Array(delegate.controllerAxisMappingPopups.values)
+        for popup in choices {
+            popup.menu?.update()
+            guard popup.isEnabled, popup.numberOfItems > 1,
+                  popup.itemArray.allSatisfy(\.isEnabled) else { return false }
+        }
+        for mode in [VehicleInputMode.off, .keyboard, .gamepad, .keyboardAndGamepad] {
+            input.selectItem(withTag: mode.rawValue)
+            delegate.flightControlSettingChanged(input)
+            let changed = controller.currentFlightControlConfiguration
+            guard changed.keyboardEnabled == mode.enablesKeyboard,
+                  changed.controllerEnabled == mode.enablesGamepad else { return false }
+        }
+        guard let gamepad = delegate.controllerMappingPopups[.cannonFire],
+              let axis = delegate.controllerAxisMappingPopups[.pitchForward],
+              let keyboard = delegate.keyboardMappingPopups[.grabberOpen],
+              let buttonIndex = FlightControllerButton.allCases.firstIndex(of: .x),
+              let axisIndex = FlightControllerAxisDirection.allCases.firstIndex(of: .leftStickUp) else { return false }
+        gamepad.selectItem(withTag: buttonIndex)
+        delegate.flightMappingChanged(gamepad)
+        axis.selectItem(withTag: axisIndex)
+        delegate.flightMappingChanged(axis)
+        keyboard.selectItem(withTag: 18)
+        delegate.flightMappingChanged(keyboard)
+        let updated = controller.currentFlightControlConfiguration
+        guard updated.controllerButtons[.cannonFire] == .x,
+              updated.controllerAxisDirections[.pitchForward] == .leftStickUp,
+              updated.keyboardKeys[.grabberOpen] == 18,
+              FlightControlConfiguration.load() == updated else { return false }
+        delegate.resetFlightMappings(nil)
+        return controller.currentFlightControlConfiguration.controllerButtons == FlightControlConfiguration.defaultControllerButtons &&
+            MiniDroneViewController.pickerSelfTest()
+    }
+
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         guard let controller else { return false }
         let action = menuItem.action
+        if controller.isMiniDroneModeActive {
+            // AppKit validates popup choices through the control's action too.
+            // Configuration actions must remain usable while device tools are hidden.
+            return [#selector(showSettings(_:)), #selector(showFlightControlMappings(_:)),
+                    #selector(flightControlSettingChanged(_:)), #selector(flightMappingChanged(_:)),
+                    #selector(resetFlightMappings(_:))].contains { $0 == action }
+        }
         if action == #selector(toggleGroundTemporal720p45(_:)) {
             menuItem.state = controller.isGroundModeActive && controller.currentTemporalReconstructionConfiguration.isEnabled ? .on : .off
             return controller.isGroundModeActive
@@ -818,7 +1009,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             return controller.aircraftCapabilities.supportsBB2PersistentTelnetInstall
         }
         if action == #selector(uploadRFModSuiteToBebop2(_:)) ||
-            action == #selector(uploadRFModSuiteToSkyController2(_:)) ||
             action == #selector(configureRFPowerMod(_:)) {
             return controller.aircraftCapabilities.supportsValidatedRFMod
         }
@@ -827,10 +1017,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
                 controller.isCalibratedRollingShutterEnabled
         }
         if controller.isGroundModeActive {
-            if action == #selector(toggleRawH264Archive(_:)) ||
-                action == #selector(installSC2DriverPatch(_:)) ||
-                action == #selector(findSC2HostThroughBebop(_:)) ||
-                action == #selector(findSC2USBHost(_:)) {
+            if action == #selector(toggleRawH264Archive(_:)) {
                 return false
             }
         }
