@@ -41,15 +41,108 @@ final class VideoHUDView: NSView {
 }
 
 final class HUDOverlayView: NSView {
+    var subjectObservation: SumoSubjectObservation? { didSet { needsDisplay = true } }
+    var subjectLabel = "Person" { didSet { needsDisplay = true } }
+    var trackingPresentationState: SumoTrackingPresentationState = .idle { didSet { needsDisplay = true } }
+    var clickSelectionEnabled = false {
+        didSet { if clickSelectionEnabled != oldValue, !clickSelectionEnabled { cancelSubjectGesture() } }
+    }
+    var selectingSubject = false {
+        didSet {
+            if selectingSubject != oldValue { cancelSubjectGesture() }
+        }
+    }
+    var selectionFrameSize = CGSize.zero {
+        didSet {
+            if selectionFrameSize != oldValue {
+                cancelSubjectGesture()
+            }
+            needsDisplay = true
+        }
+    }
+    var onBeginSubjectInteraction: (() -> Void)?
+    var onSelectSubject: ((CGRect) -> Void)?
+    var onClickSubject: ((CGPoint) -> Void)?
+    private var selectionStart: CGPoint?
+    private var selectionEnd: CGPoint?
+    private var selectionMoved = false
     var isGroundMode = false {
-        didSet { needsDisplay = true }
+        didSet {
+            if !isGroundMode { cancelSubjectGesture() }
+            needsDisplay = true
+        }
     }
     var snapshot = TelemetrySnapshot() {
         didSet { needsDisplay = true }
     }
 
     override var isOpaque: Bool { false }
-    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    private var acceptsSubjectGesture: Bool { selectingSubject || (clickSelectionEnabled && isGroundMode) }
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard acceptsSubjectGesture, !isHidden, alphaValue > 0,
+              let imageRect = Self.imageRect(in: bounds, frameSize: selectionFrameSize),
+              imageRect.contains(convert(point, from: superview)) else { return nil }
+        return self
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        if newSize != frame.size { cancelSubjectGesture() }
+        super.setFrameSize(newSize)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        beginSubjectGesture(at: convert(event.locationInWindow, from: nil))
+    }
+
+    private func beginSubjectGesture(at point: CGPoint) {
+        cancelSubjectGesture()
+        guard acceptsSubjectGesture,
+              let imageRect = Self.imageRect(in: bounds, frameSize: selectionFrameSize) else { return }
+        guard imageRect.contains(point) else { return }
+        selectionStart = point
+        selectionEnd = point
+        needsDisplay = true
+        // Stop any active following before a drag can hold the old target's
+        // motion command. A callback may disable selection, so do not restore
+        // gesture state after calling it.
+        onBeginSubjectInteraction?()
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        updateSubjectGesture(at: convert(event.locationInWindow, from: nil))
+    }
+
+    private func updateSubjectGesture(at point: CGPoint) {
+        guard acceptsSubjectGesture, let start = selectionStart else { return }
+        selectionEnd = point
+        if hypot(point.x - start.x, point.y - start.y) > 6 { selectionMoved = true }
+        needsDisplay = true
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        finishSubjectGesture(at: convert(event.locationInWindow, from: nil))
+    }
+
+    private func cancelSubjectGesture() {
+        selectionStart = nil
+        selectionEnd = nil
+        selectionMoved = false
+        needsDisplay = true
+    }
+
+    private func finishSubjectGesture(at end: CGPoint) {
+        guard acceptsSubjectGesture, let start = selectionStart else { cancelSubjectGesture(); return }
+        let moved = selectionMoved || hypot(end.x - start.x, end.y - start.y) > 6
+        let wasSelecting = selectingSubject
+        cancelSubjectGesture()
+        if let box = Self.normalizedSelection(from: start, to: end, in: bounds, frameSize: selectionFrameSize) {
+            if wasSelecting { selectingSubject = false }
+            onSelectSubject?(box)
+        } else if !wasSelecting, !moved, clickSelectionEnabled, isGroundMode,
+                  let point = Self.normalizedPoint(end, in: bounds, frameSize: selectionFrameSize) {
+            onClickSubject?(point)
+        }
+    }
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
@@ -65,6 +158,176 @@ final class HUDOverlayView: NSView {
         }
         drawVideoPanel()
         if snapshot.videoDecodedFPS != nil { drawCenterReticle(context) }
+        if let observation = subjectObservation, let box = observation.box,
+           let imageRect = Self.imageRect(in: bounds, frameSize: observation.frameSize) {
+            let rect = NSRect(x: imageRect.minX + box.minX * imageRect.width,
+                              y: imageRect.minY + box.minY * imageRect.height,
+                              width: box.width * imageRect.width, height: box.height * imageRect.height)
+            let color = trackingPresentationState.color
+            color.setStroke()
+            let outline = NSBezierPath(rect: rect); outline.lineWidth = 2; outline.stroke()
+            drawText("\(subjectLabel) \(String(format: "%.0f%%", Double(observation.confidence) * 100))",
+                     at: CGPoint(x: rect.minX + 4, y: rect.maxY + 3), font: .systemFont(ofSize: 11, weight: .semibold), color: color)
+        }
+        if isGroundMode, trackingPresentationState != .idle {
+            drawPill(trackingPresentationState.title.uppercased(),
+                     at: CGPoint(x: bounds.minX + 18, y: bounds.minY + 47),
+                     color: trackingPresentationState.color)
+        }
+        if selectingSubject || selectionStart != nil { drawSubjectSelection() }
+    }
+
+    private func drawSubjectSelection() {
+        if let imageRect = Self.imageRect(in: bounds, frameSize: selectionFrameSize),
+           let start = selectionStart, let end = selectionEnd {
+            let rect = Self.dragRect(from: start, to: end, constrainedTo: imageRect)
+            LabVisualStyle.accent.withAlphaComponent(0.12).setFill()
+            NSBezierPath(rect: rect).fill()
+            LabVisualStyle.accent.setStroke()
+            let outline = NSBezierPath(rect: rect)
+            outline.lineWidth = 2
+            outline.setLineDash([5, 3], count: 2, phase: 0)
+            outline.stroke()
+        }
+        guard selectingSubject else { return }
+        let prompt = "Drag around your target · Escape cancels"
+        let font = NSFont.monospacedSystemFont(ofSize: 10, weight: .bold)
+        let width = prompt.size(withAttributes: [.font: font]).width + 18
+        drawPill(prompt, at: CGPoint(x: bounds.midX - width / 2, y: bounds.minY + 48),
+                 color: LabVisualStyle.accent)
+    }
+
+    private static func imageRect(in bounds: CGRect, frameSize: CGSize) -> CGRect? {
+        guard [bounds.minX, bounds.minY, bounds.width, bounds.height,
+               frameSize.width, frameSize.height].allSatisfy(\.isFinite),
+              bounds.width > 0, bounds.height > 0,
+              frameSize.width > 0, frameSize.height > 0 else { return nil }
+        let scale = min(bounds.width / frameSize.width, bounds.height / frameSize.height)
+        let width = frameSize.width * scale
+        let height = frameSize.height * scale
+        guard width.isFinite, height.isFinite, width > 0, height > 0 else { return nil }
+        return CGRect(x: bounds.midX - width / 2, y: bounds.midY - height / 2,
+                      width: width, height: height)
+    }
+
+    private static func dragRect(from start: CGPoint, to end: CGPoint,
+                                 constrainedTo imageRect: CGRect) -> CGRect {
+        let clipped = CGPoint(x: min(imageRect.maxX, max(imageRect.minX, end.x)),
+                              y: min(imageRect.maxY, max(imageRect.minY, end.y)))
+        return CGRect(x: min(start.x, clipped.x), y: min(start.y, clipped.y),
+                      width: abs(clipped.x - start.x), height: abs(clipped.y - start.y))
+    }
+
+    private static func normalizedPoint(_ point: CGPoint, in bounds: CGRect, frameSize: CGSize) -> CGPoint? {
+        guard point.x.isFinite, point.y.isFinite,
+              let imageRect = imageRect(in: bounds, frameSize: frameSize), imageRect.contains(point) else { return nil }
+        return CGPoint(x: (point.x - imageRect.minX) / imageRect.width,
+                       y: (point.y - imageRect.minY) / imageRect.height)
+    }
+
+    private static func normalizedSelection(from start: CGPoint, to end: CGPoint,
+                                             in bounds: CGRect, frameSize: CGSize) -> CGRect? {
+        guard [start.x, start.y, end.x, end.y].allSatisfy(\.isFinite),
+              let imageRect = imageRect(in: bounds, frameSize: frameSize),
+              imageRect.contains(start) else { return nil }
+        let selection = dragRect(from: start, to: end, constrainedTo: imageRect)
+        guard selection.width >= 12, selection.height >= 12 else { return nil }
+        let box = CGRect(x: (selection.minX - imageRect.minX) / imageRect.width,
+                         y: (selection.minY - imageRect.minY) / imageRect.height,
+                         width: selection.width / imageRect.width,
+                         height: selection.height / imageRect.height)
+        guard SumoSubjectTracker.isValidSelection(box) else { return nil }
+        return box
+    }
+
+    static func subjectSelectionSelfTest() -> Bool {
+        let square = CGRect(x: 0, y: 0, width: 800, height: 800)
+        let wide = CGSize(width: 1600, height: 800)
+        let tall = CGSize(width: 800, height: 1600)
+        // Wide image has top/bottom letterboxes; tall image has side margins.
+        guard imageRect(in: square, frameSize: wide) == CGRect(x: 0, y: 200, width: 800, height: 400),
+              imageRect(in: square, frameSize: tall) == CGRect(x: 200, y: 0, width: 400, height: 800),
+              normalizedSelection(from: CGPoint(x: 200, y: 300), to: CGPoint(x: 600, y: 500),
+                                  in: square, frameSize: wide) == CGRect(x: 0.25, y: 0.25, width: 0.5, height: 0.5),
+              normalizedSelection(from: CGPoint(x: 500, y: 600), to: CGPoint(x: 300, y: 200),
+                                  in: square, frameSize: tall) == CGRect(x: 0.25, y: 0.25, width: 0.5, height: 0.5),
+              normalizedSelection(from: CGPoint(x: 400, y: 400), to: CGPoint(x: 900, y: 900),
+                                  in: square, frameSize: wide) == CGRect(x: 0.5, y: 0.5, width: 0.5, height: 0.5),
+              normalizedSelection(from: CGPoint(x: 300, y: 400), to: CGPoint(x: 700, y: 600),
+                                  in: square.offsetBy(dx: 100, dy: 100), frameSize: wide) ==
+                CGRect(x: 0.25, y: 0.25, width: 0.5, height: 0.5) else { return false }
+        let invalid = [
+            (CGPoint(x: 50, y: 50), CGPoint(x: 300, y: 400), square, wide),
+            (CGPoint(x: 50, y: 50), CGPoint(x: 300, y: 100), square, wide),
+            (CGPoint(x: 400, y: 400), CGPoint(x: 405, y: 410), square, wide),
+            (CGPoint(x: 400, y: 400), CGPoint(x: 420, y: 420), square, CGSize(width: 800, height: 800)),
+            (CGPoint(x: 400, y: 400), CGPoint(x: 450, y: 400), square, wide),
+            (CGPoint(x: CGFloat.nan, y: 400), CGPoint(x: 450, y: 450), square, wide),
+            (CGPoint(x: 400, y: 400), CGPoint(x: CGFloat.infinity, y: 450), square, wide),
+            (CGPoint(x: 400, y: 400), CGPoint(x: 450, y: 450), square, CGSize.zero),
+            (CGPoint(x: 400, y: 400), CGPoint(x: 450, y: 450), square, CGSize(width: -1, height: 800)),
+            (CGPoint(x: 400, y: 400), CGPoint(x: 450, y: 450), CGRect.zero, wide)
+        ]
+        guard invalid.allSatisfy({ normalizedSelection(from: $0.0, to: $0.1, in: $0.2, frameSize: $0.3) == nil }),
+              normalizedPoint(CGPoint(x: 200, y: 300), in: square, frameSize: wide) == CGPoint(x: 0.25, y: 0.25),
+              normalizedPoint(CGPoint(x: 300, y: 200), in: square, frameSize: tall) == CGPoint(x: 0.25, y: 0.25),
+              normalizedPoint(CGPoint(x: 300, y: 400), in: square.offsetBy(dx: 100, dy: 100), frameSize: wide) == CGPoint(x: 0.25, y: 0.25),
+              normalizedPoint(CGPoint(x: 100, y: 100), in: square, frameSize: wide) == nil,
+              normalizedPoint(CGPoint(x: CGFloat.nan, y: 400), in: square, frameSize: wide) == nil else { return false }
+        _ = NSApplication.shared
+        let view = Self(frame: square)
+        view.selectionFrameSize = wide
+        var clicks: [CGPoint] = []
+        var boxes: [CGRect] = []
+        var begins = 0
+        var callbackWasModal = true
+        view.onBeginSubjectInteraction = { begins += 1 }
+        view.onClickSubject = { clicks.append($0) }
+        view.onSelectSubject = { [weak view] in boxes.append($0); callbackWasModal = view?.selectingSubject ?? true }
+        let start = CGPoint(x: 200, y: 300)
+        let end = CGPoint(x: 600, y: 500)
+        // All unrelated video modes retain click-through behavior by default.
+        view.beginSubjectGesture(at: start); view.finishSubjectGesture(at: start)
+        guard clicks.isEmpty, begins == 0, view.hitTest(start) == nil else { return false }
+        view.clickSelectionEnabled = true
+        view.beginSubjectGesture(at: start); view.finishSubjectGesture(at: start)
+        guard clicks.isEmpty, begins == 0 else { return false }
+        view.isGroundMode = true
+        view.beginSubjectGesture(at: start); view.finishSubjectGesture(at: start)
+        guard clicks == [CGPoint(x: 0.25, y: 0.25)], begins == 1 else { return false }
+        view.beginSubjectGesture(at: CGPoint(x: 100, y: 100)); view.finishSubjectGesture(at: start)
+        guard clicks.count == 1, begins == 1 else { return false }
+        view.beginSubjectGesture(at: start); view.updateSubjectGesture(at: end); view.finishSubjectGesture(at: end)
+        guard boxes == [CGRect(x: 0.25, y: 0.25, width: 0.5, height: 0.5)], begins == 2, !callbackWasModal else { return false }
+        // A failed drag must not become a subject click, even when the pointer returns.
+        view.beginSubjectGesture(at: start)
+        view.updateSubjectGesture(at: CGPoint(x: 205, y: 310))
+        view.finishSubjectGesture(at: start)
+        guard clicks.count == 1, boxes.count == 1 else { return false }
+        view.beginSubjectGesture(at: start); view.clickSelectionEnabled = false; view.finishSubjectGesture(at: end)
+        guard boxes.count == 1, begins == 4 else { return false }
+        // Modal rectangle selection remains available independently of default clicks.
+        view.selectingSubject = true
+        view.beginSubjectGesture(at: start); view.finishSubjectGesture(at: start)
+        guard clicks.count == 1, view.selectingSubject else { return false }
+        view.beginSubjectGesture(at: start)
+        view.selectionFrameSize = CGSize(width: 1600, height: 800) // Equal metadata must not cancel.
+        view.finishSubjectGesture(at: end)
+        guard boxes.count == 2, !callbackWasModal, !view.selectingSubject else { return false }
+        view.clickSelectionEnabled = true
+        view.beginSubjectGesture(at: start); view.selectionFrameSize = tall; view.finishSubjectGesture(at: end)
+        guard boxes.count == 2 else { return false }
+        view.beginSubjectGesture(at: CGPoint(x: 300, y: 300)); view.isGroundMode = false; view.finishSubjectGesture(at: end)
+        guard boxes.count == 2, clicks.count == 1 else { return false }
+        view.isGroundMode = true
+        view.beginSubjectGesture(at: CGPoint(x: 300, y: 300)); view.setFrameSize(NSSize(width: 700, height: 800))
+        view.finishSubjectGesture(at: end)
+        guard boxes.count == 2, clicks.count == 1, begins == 9 else { return false }
+        // Disabling selection inside the begin callback must also cancel the
+        // already-started gesture rather than restoring it afterwards.
+        view.onBeginSubjectInteraction = { [weak view] in view?.clickSelectionEnabled = false }
+        view.beginSubjectGesture(at: CGPoint(x: 300, y: 300)); view.finishSubjectGesture(at: end)
+        return boxes.count == 2 && clicks.count == 1
     }
 
     private func drawVignette(_ context: CGContext) {

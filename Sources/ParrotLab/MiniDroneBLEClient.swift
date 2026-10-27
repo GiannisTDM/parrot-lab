@@ -26,6 +26,7 @@ final class MiniDroneBLEClient: NSObject, CBCentralManagerDelegate, CBPeripheral
 
     var onChange: (() -> Void)?
     var onLog: ((String) -> Void)?
+    var detailedDiagnosticsEnabled = false
     private(set) var connection = Connection.idle
     private(set) var devices: [Device] = []
     private(set) var telemetry = MiniDroneTelemetry()
@@ -41,9 +42,11 @@ final class MiniDroneBLEClient: NSObject, CBCentralManagerDelegate, CBPeripheral
     private var peripherals: [UUID: CBPeripheral] = [:]
     private var active: CBPeripheral?
     private var characteristics: [MiniDroneChannel: CBCharacteristic] = [:]
+    private var characteristicGeneration: [ObjectIdentifier: UInt64] = [:]
     private var handshakeCharacteristics: [CBUUID: CBCharacteristic] = [:]
     private var pendingNotifications: Set<CBUUID> = []
     private var pendingServices: Set<CBUUID> = []
+    private var preReadyNotifications: [(MiniDroneChannel, Data, UInt64)] = []
     private var subscriptions = MiniDroneSubscriptions()
     private var link = MiniDroneLink()
     private var timer: Timer?
@@ -51,6 +54,8 @@ final class MiniDroneBLEClient: NSObject, CBCentralManagerDelegate, CBPeripheral
     private var connectedAt: TimeInterval = 0
     private var wantsScan = false
     private var writeInFlight = false
+    private var writeInFlightCharacteristic: CBCharacteristic?
+    private var sessionGeneration: UInt64 = 0
     private var lastAcceptedWrite: TimeInterval = 0
     private var emergencyLatched = false
     private var accessoryBusyUntil: TimeInterval = 0
@@ -62,6 +67,16 @@ final class MiniDroneBLEClient: NSObject, CBCentralManagerDelegate, CBPeripheral
     private var now: TimeInterval { ProcessInfo.processInfo.systemUptime }
     private var elapsedMilliseconds: UInt32 {
         UInt32(truncatingIfNeeded: UInt64(max(0, now - connectedAt) * 1_000))
+    }
+
+    var diagnosticSummary: String {
+        let axes = activePilotingInput
+        return "MiniDrone gen=\(sessionGeneration) state=\(connection.title) peripheral=\(active?.identifier.uuidString ?? "none") " +
+        "subscriptions=\(subscriptions.enabled.count)/4 flight=\(telemetry.flightState?.title ?? "unknown") " +
+        "battery=\(telemetry.battery.map(String.init) ?? "-") requests=\(stateRequestAttempts) " +
+        "rx=\(receivedDataPackets) axes=\(axes.roll),\(axes.pitch),\(axes.yaw),\(axes.gaz) " +
+        "pre-ready=\(preReadyNotifications.count) " +
+        "write-pending=\(writeInFlight) \(link.diagnosticSummary)"
     }
 
     func scan() {
@@ -95,11 +110,17 @@ final class MiniDroneBLEClient: NSObject, CBCentralManagerDelegate, CBPeripheral
         peripheral.delegate = self
         deadline = now + 15
         setConnection(.connecting)
+        if detailedDiagnosticsEnabled { onLog?("Bluetooth session \(sessionGeneration) connecting") }
         central?.connect(peripheral, options: nil)
         startTimer()
     }
 
     func disconnect() {
+        if detailedDiagnosticsEnabled, active != nil {
+            onLog?("Bluetooth session \(sessionGeneration) disconnecting")
+        }
+        input = .neutral
+        controlsEnabled = false
         if ready {
             let neutral = MiniDroneCommand.pcmd(roll: 0, pitch: 0, yaw: 0, gaz: 0, milliseconds: elapsedMilliseconds)
             _ = write(link.pilotingPacket(neutral))
@@ -117,16 +138,20 @@ final class MiniDroneBLEClient: NSObject, CBCentralManagerDelegate, CBPeripheral
     }
 
     private func resetSession() {
+        sessionGeneration &+= 1
         controlsEnabled = false
         input = .neutral
         telemetry = MiniDroneTelemetry()
         link = MiniDroneLink()
         subscriptions = MiniDroneSubscriptions()
         characteristics.removeAll()
+        characteristicGeneration.removeAll()
         handshakeCharacteristics.removeAll()
         pendingNotifications.removeAll()
         pendingServices.removeAll()
+        preReadyNotifications.removeAll()
         writeInFlight = false
+        writeInFlightCharacteristic = nil
         accessoryBusyUntil = 0
         nextStateRequestAt = nil
         stateRequestAttempts = 0
@@ -169,7 +194,7 @@ final class MiniDroneBLEClient: NSObject, CBCentralManagerDelegate, CBPeripheral
             fail("Bluetooth stopped accepting commands. Reconnect to resume.")
             return
         }
-        let axes = controlsEnabled && !emergencyLatched ? input : .neutral
+        let axes = activePilotingInput
         if telemetry.flightState == nil, let requestAt = nextStateRequestAt,
            now >= requestAt, link.pendingCount == 0 {
             if stateRequestAttempts >= 4 {
@@ -190,13 +215,22 @@ final class MiniDroneBLEClient: NSObject, CBCentralManagerDelegate, CBPeripheral
         if let failure = link.failure { fail(failure) }
     }
 
+    private var activePilotingInput: BebopPilotingInput {
+        guard controlsEnabled, !emergencyLatched,
+              let state = telemetry.flightState,
+              state == .takingOff || state == .hovering || state == .flying else { return .neutral }
+        return input
+    }
+
     private func write(_ packet: MiniDroneLink.Write) -> Bool {
-        guard let active, let characteristic = characteristics[packet.channel], !writeInFlight else { return false }
+        guard let active, let characteristic = characteristics[packet.channel] else { return false }
         if characteristic.properties.contains(.writeWithoutResponse) {
             guard active.canSendWriteWithoutResponse else { return false }
             active.writeValue(packet.data, for: characteristic, type: .withoutResponse)
         } else if characteristic.properties.contains(.write) {
+            guard !writeInFlight else { return false }
             writeInFlight = true
+            writeInFlightCharacteristic = characteristic
             active.writeValue(packet.data, for: characteristic, type: .withResponse)
         } else { return false }
         lastAcceptedWrite = now
@@ -326,10 +360,12 @@ final class MiniDroneBLEClient: NSObject, CBCentralManagerDelegate, CBPeripheral
         for characteristic in service.characteristics ?? [] {
             if let channel = MiniDroneChannel.allCases.first(where: { CBUUID(string: $0.uuid) == characteristic.uuid }) {
                 characteristics[channel] = characteristic
+                characteristicGeneration[ObjectIdentifier(characteristic)] = sessionGeneration
             }
             if MiniDroneBLEClient.handshakeUUIDs.contains(characteristic.uuid),
                characteristic.properties.contains(.notify) || characteristic.properties.contains(.indicate) {
                 handshakeCharacteristics[characteristic.uuid] = characteristic
+                characteristicGeneration[ObjectIdentifier(characteristic)] = sessionGeneration
             }
         }
         pendingServices.remove(service.uuid)
@@ -353,7 +389,8 @@ final class MiniDroneBLEClient: NSObject, CBCentralManagerDelegate, CBPeripheral
         }
     }
     func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
-        guard peripheral === active, connection == .subscribing || ready else { return }
+        guard peripheral === active, connection == .subscribing || ready,
+              characteristicGeneration[ObjectIdentifier(characteristic)] == sessionGeneration else { return }
         guard error == nil, characteristic.isNotifying else {
             fail(error?.localizedDescription ?? "The drone stopped sending Bluetooth notifications.")
             return
@@ -368,32 +405,61 @@ final class MiniDroneBLEClient: NSObject, CBCentralManagerDelegate, CBPeripheral
             // Let the drone finish its GATT setup before asking for the state dump.
             nextStateRequestAt = now + 0.35
             setConnection(.ready)
+            flushPreReadyNotifications()
             onLog?("MiniDrone Bluetooth handshake complete")
         }
     }
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
         guard peripheral === active, connection == .subscribing || ready,
+              characteristicGeneration[ObjectIdentifier(characteristic)] == sessionGeneration,
               let channel = channel(for: characteristic) else { return }
         guard error == nil else { fail(error!.localizedDescription); return }
         if let value = characteristic.value, MiniDroneChannel.notifications.contains(channel) {
-            if channel == .state || channel == .telemetry {
-                receivedDataPackets += 1
-                let bytes = [UInt8](value)
-                if bytes.count >= 6, receivedHeaderSamples.count < 6 {
-                    let header = bytes.prefix(6).map { String(format: "%02X", $0) }.joined()
-                    let sample = "\(channel.rawValue.uppercased()):\(header)/\(bytes.count)"
-                    if !receivedHeaderSamples.contains(sample) { receivedHeaderSamples.append(sample) }
-                }
+            if ready {
+                consumeNotification(value, on: channel, generation: sessionGeneration)
+            } else if channel == .state || channel == .telemetry {
+                bufferPreReadyNotification(value, on: channel, generation: sessionGeneration)
             }
-            guard let payload = link.receive(value, on: channel) else { return }
-            let previousState = telemetry.flightState
-            telemetry.consume(payload)
-            if previousState == nil, let state = telemetry.flightState {
-                nextStateRequestAt = nil
-                onLog?("Flight state ready: \(state.title)")
-            }
-            onChange?()
         }
+    }
+    private func bufferPreReadyNotification(_ value: Data, on channel: MiniDroneChannel, generation: UInt64) {
+        guard connection == .subscribing, generation == sessionGeneration else { return }
+        if preReadyNotifications.count >= 64 { preReadyNotifications.removeFirst() }
+        preReadyNotifications.append((channel, value, generation))
+    }
+    private func flushPreReadyNotifications() {
+        let buffered = preReadyNotifications
+        preReadyNotifications.removeAll()
+        for (channel, value, generation) in buffered {
+            consumeNotification(value, on: channel, generation: generation)
+        }
+    }
+    private func consumeNotification(_ value: Data, on channel: MiniDroneChannel, generation: UInt64) {
+        guard ready, generation == sessionGeneration else { return }
+        if channel == .state || channel == .telemetry {
+            receivedDataPackets += 1
+            let bytes = [UInt8](value)
+            if bytes.count >= 6, receivedHeaderSamples.count < 6 {
+                let header = bytes.prefix(6).map { String(format: "%02X", $0) }.joined()
+                let sample = "\(channel.rawValue.uppercased()):\(header)/\(bytes.count)"
+                if !receivedHeaderSamples.contains(sample) { receivedHeaderSamples.append(sample) }
+            }
+        }
+        guard let payload = link.receive(value, on: channel) else { return }
+        let previousState = telemetry.flightState
+        telemetry.consume(payload)
+        if previousState != telemetry.flightState,
+           activePilotingInput == .neutral {
+            input = .neutral
+        }
+        if previousState == nil, let state = telemetry.flightState {
+            nextStateRequestAt = nil
+            onLog?("Flight state ready: \(state.title)")
+        } else if detailedDiagnosticsEnabled, let state = telemetry.flightState,
+                  previousState != state {
+            onLog?("Flight state: \(state.title) · gen \(sessionGeneration)")
+        }
+        onChange?()
     }
     private func channel(for characteristic: CBCharacteristic) -> MiniDroneChannel? {
         characteristics.first { $0.value === characteristic }?.key
@@ -404,8 +470,11 @@ final class MiniDroneBLEClient: NSObject, CBCentralManagerDelegate, CBPeripheral
             .map { CBUUID(string: "9a66\($0)-0800-9191-11e4-012d1540cb8e") }
     )
     func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
-        guard peripheral === active, ready else { return }
+        guard peripheral === active, ready,
+              characteristicGeneration[ObjectIdentifier(characteristic)] == sessionGeneration,
+              characteristic === writeInFlightCharacteristic else { return }
         writeInFlight = false
+        writeInFlightCharacteristic = nil
         if let error { fail(error.localizedDescription) }
     }
 
@@ -417,7 +486,16 @@ final class MiniDroneBLEClient: NSObject, CBCentralManagerDelegate, CBPeripheral
         guard client.link.pendingCount == 0, client.central == nil else { return false }
         client.connection = .ready
         client.telemetry.consume(Data([2, 3, 1, 0, 0, 0, 0, 0]))
-        client.telemetry.consume(Data([2, 15, 2, 0, 93, 0, 0, 0, 0, 3]))
+        client.controlsEnabled = true
+        client.input = BebopPilotingInput(roll: 20, pitch: 0, yaw: 0, gaz: 0)
+        guard client.activePilotingInput == .neutral else { return false }
+        client.telemetry.consume(Data([2, 3, 1, 0, 3, 0, 0, 0]))
+        guard client.activePilotingInput.roll == 20 else { return false }
+        client.telemetry.consume(Data([2, 3, 1, 0, 4, 0, 0, 0]))
+        guard client.activePilotingInput == .neutral else { return false }
+        client.telemetry.consume(Data([2, 3, 1, 0, 0, 0, 0, 0]))
+        client.input = .neutral
+        client.telemetry.consume(Data([2, 16, 2, 0, 93, 0, 0, 0, 0, 3]))
         client.cannon(id: nil)
         client.cannon(id: 0)
         guard client.link.pendingCount == 0, client.canTakeOff else { return false }
@@ -434,10 +512,30 @@ final class MiniDroneBLEClient: NSObject, CBCentralManagerDelegate, CBPeripheral
         client.takeOff()
         guard client.link.pendingCount == 1 else { return false }
         client.disconnect()
-        return client.connection == .idle && client.link.pendingCount == 0 &&
+        guard client.connection == .idle && client.link.pendingCount == 0 &&
             client.input == .neutral && !client.controlsEnabled && !client.emergencyLatched &&
             client.telemetry.cannons.isEmpty && client.telemetry.flightState == nil &&
-            !client.subscriptions.ready && client.central == nil
+            !client.subscriptions.ready && client.central == nil else { return false }
+
+        client.connection = .ready
+        let previousGeneration = client.sessionGeneration
+        let landed = Data([4, 1, 2, 3, 1, 0, 0, 0, 0, 0])
+        client.consumeNotification(landed, on: .state, generation: previousGeneration)
+        guard client.telemetry.flightState == .landed else { return false }
+        client.resetSession()
+        client.connection = .ready
+        client.consumeNotification(Data([4, 2, 2, 3, 1, 0, 3, 0, 0, 0]),
+                                   on: .state, generation: previousGeneration)
+        guard client.telemetry.flightState == nil, client.receivedDataPackets == 0 else { return false }
+        client.consumeNotification(landed, on: .state, generation: client.sessionGeneration)
+        guard client.telemetry.flightState == .landed && client.receivedDataPackets == 1 else { return false }
+        client.resetSession()
+        client.connection = .subscribing
+        client.bufferPreReadyNotification(landed, on: .state, generation: client.sessionGeneration)
+        guard client.telemetry.flightState == nil, client.preReadyNotifications.count == 1 else { return false }
+        client.connection = .ready
+        client.flushPreReadyNotifications()
+        return client.telemetry.flightState == .landed && client.preReadyNotifications.isEmpty
     }
 
 }

@@ -34,8 +34,8 @@ final class MiniDroneViewController: NSViewController {
         let root = NSStackView()
         root.orientation = .vertical
         root.alignment = .leading
-        root.spacing = 14
-        root.edgeInsets = NSEdgeInsets(top: 24, left: 24, bottom: 24, right: 24)
+        root.spacing = 12
+        root.edgeInsets = NSEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
         root.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(root)
         NSLayoutConstraint.activate([
@@ -57,6 +57,8 @@ final class MiniDroneViewController: NSViewController {
         identity.addArrangedSubview(label("MINIDRONE / MAMBO", size: 11, weight: .semibold, muted: true))
         heading.addArrangedSubview(identity)
         heading.addArrangedSubview(spacer())
+        let settings = NSButton(title: "Settings", target: nil, action: #selector(AppDelegate.showSettings(_:)))
+        settings.bezelStyle = .rounded; heading.addArrangedSubview(settings)
         airButton = button("Air mode", #selector(exitAir), symbol: "paperplane")
         groundButton = button("Ground mode", #selector(exitGround), symbol: "car")
         heading.addArrangedSubview(airButton)
@@ -96,7 +98,7 @@ final class MiniDroneViewController: NSViewController {
         metrics.addArrangedSubview(flightIcon)
         let stateColumn = column()
         stateColumn.addArrangedSubview(label("FLIGHT", size: 11, weight: .bold, muted: true))
-        flight.font = .systemFont(ofSize: 30, weight: .medium)
+        flight.font = .systemFont(ofSize: 26, weight: .medium)
         flight.textColor = LabVisualStyle.accent
         stateColumn.addArrangedSubview(flight)
         metrics.addArrangedSubview(stateColumn)
@@ -166,7 +168,9 @@ final class MiniDroneViewController: NSViewController {
         accessories.addArrangedSubview(accessoryRow)
         accessories.addArrangedSubview(label("Accessories appear automatically when attached. Assign their buttons in Edit mappings.",
                                              size: 12, muted: true))
-        root.addArrangedSubview(card(accessories))
+        let accessoryPanel = card(accessories)
+        root.addArrangedSubview(LabDisclosureButton(title: "Grabber & cannon", views: [accessoryPanel], expanded: true))
+        root.addArrangedSubview(accessoryPanel)
 
         let log = column()
         log.addArrangedSubview(label("ACTIVITY", size: 11, weight: .bold, muted: true))
@@ -177,7 +181,7 @@ final class MiniDroneViewController: NSViewController {
         root.addArrangedSubview(card(log))
         root.addArrangedSubview(spacer())
         for child in root.arrangedSubviews {
-            child.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -48).isActive = true
+            child.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -32).isActive = true
         }
         client.onChange = { [weak self] in
             self?.refresh()

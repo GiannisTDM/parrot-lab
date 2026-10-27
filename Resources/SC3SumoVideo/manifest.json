@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "files": {
+    "libsc3-sumo-native-v2f.so": {
+      "size": 16912,
+      "sha256": "6cfb13f79cd20f555a584dc415b54c5163e37ba8b0593c6f6d03f75185dea6aa",
+      "sha1": "e18ff6ef07d172e53886e02a4f23118da7e0a1a5"
+    },
+    "startup-v1c.sh": {
+      "size": 2671,
+      "sha256": "47b9bdb3122267bec7e4855d38ebb68c23e7f94994d7af44ff2a3ce596e2ae8a",
+      "sha1": "0be1f74b8829fb66d07a8401fd7330b4a5016d87"
+    },
+    "startup-video.sh": {
+      "size": 2702,
+      "sha256": "fa2a554a7488926a867dac2fde3dc98062e7030ec460ecb5d4b208ccd29aafa0",
+      "sha1": "f376614daf2d5719f9181203d966571ca95d7b00"
+    },
+    "persist-video.sh": {
+      "size": 7256,
+      "sha256": "2b00aaa43d5df3993176d34b08f1a5353c9c5b82507557e8ce4943251c0b0bdc",
+      "sha1": "922019113bde2397e5cd556e6ee8c3e12c16aea3"
+    }
+  }
+}

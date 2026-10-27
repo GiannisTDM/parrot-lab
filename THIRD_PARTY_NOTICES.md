@@ -11,14 +11,16 @@ The repository's MIT license does not replace that notice.
 
 ## Patched Dragon research binary
 
-`patched/dragon-prog-1080p-mode1-30fps` is a modified firmware component for
-interoperability research on the Bebop 2. It is not covered by this
-repository's MIT license. Parrot and Dragon-related copyrights and trademarks
-remain with their respective owners.
+The patched Dragon binaries under `patched/` and
+`experimental/jumping-sumo/`, and firmware-derived components in the bundled
+SC3 resource packages, are supplied for interoperability research. They are
+not covered by this repository's MIT license. Original copyrights and
+trademarks remain with their respective owners. Their inclusion does not
+establish a blanket redistribution license for third-party firmware.
 
 ## FFmpeg
 
-FFmpeg is not included in this repository. Parrot Lab can invoke an FFmpeg
-executable installed separately by the user. FFmpeg builds may be licensed
+FFmpeg is not stored in the source repository. The macOS release ZIP includes
+an FFmpeg recovery decoder so users do not need Homebrew. FFmpeg builds may be licensed
 under LGPL or GPL terms depending on how they were configured. Consult the
 license information distributed with the FFmpeg build you use.

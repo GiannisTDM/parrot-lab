@@ -1,11 +1,18 @@
 import Foundation
+import GameController
 
 enum FlightControlSelfTest {
     static func run() -> Bool {
+        // Raw key snapshots cover keys ignored while a field editor had focus,
+        // independently of the event cache and without requiring live hardware.
+        guard !FlightInputManager.boundKeysReleasedForArming([13, 56], isDown: { $0 == 13 }),
+              !FlightInputManager.boundKeysReleasedForArming([13, 56], isDown: { $0 == 60 }),
+              FlightInputManager.boundKeysReleasedForArming([13, UInt16.max], isDown: { $0 == UInt16.max }) else { return false }
         guard stickRangeTest() else { return false }
         guard steeringResponseTest() else { return false }
         guard jumpCommandTest() else { return false }
         guard configurationTest() else { return false }
+        guard relayControllerAdmissionTest(), relayArmingInputTest(), FlightInputManager.relayInputSafetySelfTest() else { return false }
         let timestamp: UInt32 = 0x7a12_3456
         let payload = ARSDKPhotoCommand.pcmd(
             flag: true, roll: -100, pitch: 100, yaw: -1, gaz: 1,
@@ -28,10 +35,13 @@ enum FlightControlSelfTest {
         }
         var configuration = FlightControlConfiguration()
         configuration.controllerDeadzone = 0.18
+        configuration.bindKeyboardKey(49, to: .emergency)
         configuration.bindControllerButton(.a, to: .returnHome)
         configuration.bindControllerAxisDirection(.leftStickUp, to: .pitchForward)
         guard configuration.controllerButtons[.returnHome] == .a,
               configuration.controllerButtons[.takeOffLand] == .unassigned,
+              configuration.keyboardKeys[.emergency] == 49,
+              configuration.keyboardKeys[.takeOffLand] == UInt16.max,
               configuration.controllerAxisDirections[.pitchForward] == .leftStickUp,
               configuration.controllerAxisDirections[.gazUp] == .unassigned else {
             return false
@@ -40,6 +50,55 @@ enum FlightControlSelfTest {
             FlightControlConfiguration.self,
             from: JSONEncoder().encode(configuration)
         )) == configuration
+    }
+
+    private static func relayControllerAdmissionTest() -> Bool {
+        let samples: [(String?, String, Bool)] = [
+            ("Parrot SkyController 3", GCProductCategoryHID, false),
+            ("PARROT", GCProductCategoryXboxOne, false),
+            ("Sky Controller", GCProductCategoryMFi, false),
+            ("SC3", GCProductCategoryDualSense, false),
+            (nil, GCProductCategoryHID, false),
+            ("", GCProductCategoryMFi, false),
+            ("Unknown Wireless Controller", GCProductCategoryHID, false),
+            ("Generic Gamepad", GCProductCategoryMFi, false),
+            ("Microsoft Xbox Wireless Controller", GCProductCategoryXboxOne, true),
+            (nil, GCProductCategoryDualShock4, true),
+            (nil, GCProductCategoryDualSense, true),
+            ("GULIKIT KingKong", GCProductCategoryHID, true),
+            ("8BitDo Pro 2", GCProductCategoryHID, true),
+            ("Nintendo Switch Pro Controller", GCProductCategoryHID, true),
+            ("SteelSeries Nimbus", GCProductCategoryMFi, true),
+            ("Sony DualSense / Parrot SC3", GCProductCategoryDualSense, false),
+            ("GuliKit", "Sky-Controller 3", false)
+        ]
+        return samples.allSatisfy { vendor, category, allowed in
+            FlightGameControllerAdmission.allows(vendorName: vendor, productCategory: category, restricted: true) == allowed &&
+                FlightGameControllerAdmission.allows(vendorName: vendor, productCategory: category, restricted: false)
+        }
+    }
+
+    private static func relayArmingInputTest() -> Bool {
+        let fixtures: [(Bool, [Float], Bool, Float, Bool)] = [
+            (false, [], false, 0.15, true),
+            (false, [0, 0.1, 0.15], false, 0.15, true),
+            (true, [0], false, 0.15, false),
+            (false, [0], true, 0.15, false),
+            (false, [0.151], false, 0.15, false),
+            (false, [1], false, 0.15, false),
+            (false, [.nan], false, 0.15, false),
+            (false, [.infinity], false, 0.15, false),
+            (false, [-0.1], false, 0.15, false),
+            (false, [0], false, .nan, false),
+            (false, [0], false, 1, false),
+            (false, [0], false, -0.1, false),
+            (false, [0], false, 0, true),
+            (false, [0.001], false, 0, false)
+        ]
+        return fixtures.allSatisfy { keys, axes, buttons, deadzone, neutral in
+            FlightInputManager.inputsAreNeutralForArming(keysHeld: keys, axisMagnitudes: axes,
+                buttonsHeld: buttons, deadzone: deadzone) == neutral
+        }
     }
 
     private static func configurationTest() -> Bool {

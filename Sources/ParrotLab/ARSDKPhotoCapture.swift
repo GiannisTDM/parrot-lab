@@ -62,6 +62,8 @@ enum ARSDKTelemetryEvent: Equatable {
     case droneBattery(Int)
     case wifiSignal(Int)
     case jumpingSumoLinkQuality(Int)
+    case sumoAudioVolume(UInt8)
+    case sumoAudioTheme(SumoAudioTheme)
     case controllerBattery(Int)
     case controllerBatteryState(UInt32)
     case flyingState(UInt32)
@@ -158,11 +160,25 @@ enum ARSDKPhotoCommand {
 enum ARSDKConnectionRoute: Equatable {
     case skyController
     case directProduct
+    case sumoSC3Relay
+    case sumoSC3Native
+
+    var isSC3Sumo: Bool { self == .sumoSC3Relay || self == .sumoSC3Native }
+
+    var discoveryPort: UInt16 {
+        self == .sumoSC3Relay ? SC3SumoRelay.discoveryPort : 44_444
+    }
+
+    var usesDirectARNetworkVideo: Bool {
+        self == .directProduct || self == .sumoSC3Relay
+    }
 
     var displayName: String {
         switch self {
         case .skyController: return "SkyController 2"
         case .directProduct: return "Parrot product direct"
+        case .sumoSC3Relay: return "Sumo through SC3 relay (experimental)"
+        case .sumoSC3Native: return "Sumo through native SC3 (experimental)"
         }
     }
 }
@@ -546,6 +562,7 @@ struct ARStream1VideoAssembler {
 
 enum ARSDKTelemetryProtocol {
     static func decode(_ data: Data) -> ARSDKTelemetryEvent? {
+        if let audio = SumoAudioProtocol.decode(data) { return audio }
         guard data.count >= 4 else { return nil }
         let project = data[0]
         let commandClass = data[1]
@@ -707,6 +724,10 @@ final class ARSDKCommandClient {
     var onVideoAccessUnit: ((H264AccessUnit) -> Void)?
     var onMJPEGFrame: ((Data, UInt64) -> Void)?
     var onARStream1Diagnostics: ((ARStream1VideoDiagnostics) -> Void)?
+    /// A drone ping received from the negotiated relay peer, never a video
+    /// packet. UI callers must still require actual Sumo state before arming.
+    var onRelayHeartbeat: ((TimeInterval) -> Void)?
+    var onRelayState: ((TimeInterval) -> Void)?
     var onLog: ((String) -> Void)?
 
     private let queue = DispatchQueue(label: "parrotlab.arsdk.command", qos: .userInitiated)
@@ -729,12 +750,25 @@ final class ARSDKCommandClient {
     }
     private var pendingAcknowledgements: [UInt16: PendingAcknowledgement] = [:]
     private var connectionCompletions: [(Result<Void, Error>) -> Void] = []
-    private var connectingHost: String?
-    private var connectedHost: String?
+    private struct UDPConnectionRequest: Equatable {
+        let host: String
+        let route: ARSDKConnectionRoute
+        let videoStreamPort: UInt16?
+    }
+    private var connectingRequest: UDPConnectionRequest?
+    private var connectedRequest: UDPConnectionRequest?
+    private var muxTransportSend: ((Data) -> Void)?
     private var connectionRoute = ARSDKConnectionRoute.skyController
     private var requestedVideoStreamPort: UInt16?
+    private var sessionGeneration: UInt64 = 0
+    private let callbackGenerationLock = NSLock()
+    private var callbackGeneration: UInt64 = 0
     private var pcmdTimer: DispatchSourceTimer?
+    private var relayKeepaliveTimer: DispatchSourceTimer?
+    private var relayDriveGate = SumoRelayDriveGate()
+    private let loopbackDiscoveryPort: UInt16?
     private var pilotingInput = BebopPilotingInput.neutral
+    private var sumoFollowLease: SumoFollowLease?
     private var pcmdSequence: UInt8 = 0
     private var productModel = ParrotProductModel.unknown
     private var arstream1VideoAssembler = ARStream1VideoAssembler()
@@ -751,9 +785,28 @@ final class ARSDKCommandClient {
     private var lastVideoDiagnosticLogNanoseconds: UInt64 = 0
     private var lastInvalidJPEGLog: UInt64 = 0
 
+    init() { loopbackDiscoveryPort = nil }
+
+    /// Exercises the actual sockets on ephemeral loopback ports. This override
+    /// is ignored for every non-loopback host and cannot redirect production.
+    init(loopbackDiscoveryPort: UInt16) { self.loopbackDiscoveryPort = loopbackDiscoveryPort }
+
+    var diagnosticSummary: String {
+        queue.sync {
+            let input = pilotingInput
+            return "ARSDK gen=\(sessionGeneration) route=\(connectionRoute.displayName) " +
+                "udp=\(socketFD >= 0) mux=\(muxTransportSend != nil) pcmd=\(pcmdTimer != nil) relayKeepalive=\(relayKeepaliveTimer != nil) " +
+                "relayArmed=\(relayDriveGate.armed) acks=\(pendingAcknowledgements.count) connecting=\(connectionCompletions.count) " +
+                "axes=\(input.roll),\(input.pitch),\(input.yaw),\(input.gaz)"
+        }
+    }
+
     func setProductModel(_ model: ParrotProductModel) {
         queue.async { [weak self] in
             guard let self else { return }
+            if self.connectionRoute == .sumoSC3Relay, model != .jumpingSumo {
+                self.stopLocked()
+            }
             if self.productModel != model { self.resetVideoAssemblyLocked() }
             self.productModel = model
         }
@@ -767,35 +820,88 @@ final class ARSDKCommandClient {
     ) {
         queue.async { [weak self] in
             guard let self else { return }
-            if self.remoteAddress != nil, self.connectedHost == host {
-                DispatchQueue.main.async { completion(.success(())) }
+            let request = UDPConnectionRequest(
+                host: host,
+                route: route,
+                videoStreamPort: videoStreamPort
+            )
+            if self.remoteAddress != nil, self.connectedRequest == request {
+                self.dispatchMain(generation: self.sessionGeneration) { _ in
+                    completion(.success(()))
+                }
                 return
             }
-            if self.connectingHost == host, self.discoveryConnection != nil {
+            if self.connectingRequest == request, self.discoveryConnection != nil {
                 self.connectionCompletions.append(completion)
                 return
             }
             self.stopLocked()
+            let generation = self.sessionGeneration
             self.connectionCompletions = [completion]
-            self.connectingHost = host
+            self.connectingRequest = request
             self.connectionRoute = route
             self.requestedVideoStreamPort = videoStreamPort
             do {
+                guard route != .sumoSC3Native else {
+                    throw NSError(domain: "SC3SumoNative", code: 1, userInfo: [NSLocalizedDescriptionKey:
+                        "Native SC3 uses its video-only mobile proxy session, not the direct/relay command client."])
+                }
+                guard route != .sumoSC3Relay || self.productModel == .jumpingSumo else {
+                    throw SC3SumoRelay.discoveryFailure("this route requires Jumping Sumo mode")
+                }
+                guard route != .sumoSC3Relay || SC3SumoRelay.isValidHost(host) else {
+                    throw SC3SumoRelay.discoveryFailure("enter the SC3's numeric unicast USB IPv4 address")
+                }
                 let localPort = try self.openUDPSocket()
-                try self.startDiscovery(host: host, localPort: localPort)
+                try self.startDiscovery(
+                    request: request,
+                    localPort: localPort,
+                    generation: generation
+                )
             } catch {
-                self.finishConnection(.failure(error))
+                self.finishConnection(.failure(error), generation: generation)
             }
         }
     }
 
+    /// Attaches the ARNetwork layer to SC2's libmux transport channel. Direct
+    /// Wi-Fi continues to use the UDP/ARDiscovery path above.
+    func connectMux(
+        product: ParrotProductModel,
+        send: @escaping (Data) -> Void,
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.stopLocked()
+            self.connectionRoute = .skyController
+            self.productModel = product
+            self.muxTransportSend = send
+            self.log("ARSDK attached to SC2 libmux transport channel 1")
+            self.dispatchMain(generation: self.sessionGeneration) { _ in
+                completion(.success(()))
+            }
+        }
+    }
+
+    func receiveMuxTransport(_ packet: Data) {
+        queue.async { [weak self] in
+            guard let self, self.muxTransportSend != nil else { return }
+            self.parseFrames(packet)
+        }
+    }
+
     func sendSetFisheye() {
-        guard productModel.capabilities.supportsSharedARDrone3Commands else { return }
-        sendCommand(ARSDKPhotoCommand.setFisheye)
+        sendAcknowledgedCommand(
+            ARSDKPhotoCommand.setFisheye,
+            requiring: \.supportsSharedARDrone3Commands
+        )
     }
     func sendTakePictureV2() {
-        guard productModel.capabilities.supportsSharedARDrone3Commands else { return }
-        sendCommand(ARSDKPhotoCommand.takePictureV2)
+        sendAcknowledgedCommand(
+            ARSDKPhotoCommand.takePictureV2,
+            requiring: \.supportsSharedARDrone3Commands
+        )
     }
     func sendRequestAllStates() { sendCommand(ARSDKPhotoCommand.requestAllStates) }
     func sendRequestSkyControllerAllStates() {
@@ -817,38 +923,76 @@ final class ARSDKCommandClient {
     }
     func sendRequestAllSettings() { sendCommand(ARSDKPhotoCommand.requestAllSettings) }
     func sendVideoEnable(_ enabled: Bool) {
-        let payload = productModel.capabilities.supportsJumpingSumoCommands
-            ? ARSDKPhotoCommand.jumpingSumoVideoEnable(enabled)
-            : ARSDKPhotoCommand.videoEnable(enabled)
-        sendCommand(payload)
+        let generation = currentCallbackGeneration()
+        queue.async { [weak self] in
+            guard let self else { return }
+            guard self.connectionRoute != .sumoSC3Relay || self.sessionGeneration == generation else { return }
+            let payload = self.productModel.capabilities.supportsJumpingSumoCommands
+                ? ARSDKPhotoCommand.jumpingSumoVideoEnable(enabled)
+                : ARSDKPhotoCommand.videoEnable(enabled)
+            self.sendAcknowledgedFrame(payload: payload)
+        }
     }
     func sendJumpingSumoJump(_ type: ARSDKPhotoCommand.JumpingSumoJumpType) {
-        guard productModel.capabilities.supportsJumpingSumoCommands else { return }
-        sendAcknowledgedCommand(ARSDKPhotoCommand.jumpingSumoJump(type))
+        sendAcknowledgedCommand(
+            ARSDKPhotoCommand.jumpingSumoJump(type),
+            requiring: \.supportsJumpingSumoCommands
+        )
+    }
+    func setSumoVolume(_ volume: UInt8) {
+        sendAcknowledgedCommand(
+            SumoAudioProtocol.volumeCommand(volume),
+            requiring: \.supportsJumpingSumoCommands
+        )
+    }
+    func setSumoAudioTheme(_ theme: SumoAudioTheme) {
+        sendAcknowledgedCommand(
+            SumoAudioProtocol.themeCommand(theme),
+            requiring: \.supportsJumpingSumoCommands
+        )
     }
     func sendTakeOff() {
-        guard productModel.capabilities.supportsSharedARDrone3Commands else { return }
-        sendAcknowledgedCommand(ARSDKPhotoCommand.takeOff)
+        sendAcknowledgedCommand(
+            ARSDKPhotoCommand.takeOff,
+            requiring: \.supportsSharedARDrone3Commands
+        )
     }
     func sendFlatTrim() {
-        guard productModel.capabilities.supportsBebopCalibration else { return }
-        sendAcknowledgedCommand(ARSDKPhotoCommand.flatTrim)
+        sendAcknowledgedCommand(
+            ARSDKPhotoCommand.flatTrim,
+            requiring: \.supportsBebopCalibration
+        )
     }
     func sendMagnetometerCalibration(start: Bool) {
-        guard productModel.capabilities.supportsBebopCalibration else { return }
-        sendAcknowledgedCommand(ARSDKPhotoCommand.magnetometerCalibration(start: start))
+        sendAcknowledgedCommand(
+            ARSDKPhotoCommand.magnetometerCalibration(start: start),
+            requiring: \.supportsBebopCalibration
+        )
     }
     func sendLanding() {
-        guard productModel.capabilities.supportsSharedARDrone3Commands else { return }
-        sendAcknowledgedCommand(ARSDKPhotoCommand.landing)
+        sendAcknowledgedCommand(
+            ARSDKPhotoCommand.landing,
+            requiring: \.supportsSharedARDrone3Commands
+        )
     }
     func sendEmergency() {
-        guard productModel.capabilities.supportsSharedARDrone3Commands else { return }
-        sendAcknowledgedCommand(ARSDKPhotoCommand.emergency, buffer: 12, maximumRetries: nil)
+        sendAcknowledgedCommand(
+            ARSDKPhotoCommand.emergency,
+            buffer: 12,
+            maximumRetries: nil,
+            requiring: \.supportsSharedARDrone3Commands
+        )
     }
     func sendCameraOrientation(tilt: Int8, pan: Int8) {
-        guard productModel.capabilities.supportsSharedARDrone3Commands else { return }
-        sendUnacknowledgedCommand(ARSDKPhotoCommand.cameraOrientation(tilt: tilt, pan: pan))
+        queue.async { [weak self] in
+            guard let self,
+                  self.productModel.capabilities.supportsSharedARDrone3Commands else { return }
+            self.sendFrame(
+                type: 2,
+                id: 10,
+                payload: ARSDKPhotoCommand.cameraOrientation(tilt: tilt, pan: pan)
+            )
+        }
     }
 
     func sendNavigateHome(start: Bool) {
@@ -856,15 +1000,20 @@ final class ARSDKCommandClient {
             guard let self, self.productModel.capabilities.supportsSharedARDrone3Commands else { return }
             self.pilotingInput = .neutral
             self.sendPCMDLocked()
+            let generation = self.sessionGeneration
             self.queue.asyncAfter(deadline: .now() + .milliseconds(55)) { [weak self] in
-                self?.sendAcknowledgedFrame(payload: ARSDKPhotoCommand.navigateHome(start: start))
+                guard let self, self.sessionGeneration == generation else { return }
+                self.sendAcknowledgedFrame(payload: ARSDKPhotoCommand.navigateHome(start: start))
             }
         }
     }
 
     func startPiloting() {
+        let generation = currentCallbackGeneration()
         queue.async { [weak self] in
             guard let self, self.pcmdTimer == nil else { return }
+            guard self.connectionRoute != .sumoSC3Relay || self.sessionGeneration == generation else { return }
+            guard self.relayMovementAllowedLocked() else { return }
             self.pilotingInput = .neutral
             let timer = DispatchSource.makeTimerSource(queue: self.queue)
             timer.schedule(deadline: .now(), repeating: .milliseconds(50), leeway: .milliseconds(4))
@@ -875,18 +1024,67 @@ final class ARSDKCommandClient {
     }
 
     func updatePilotingInput(_ input: BebopPilotingInput) {
-        queue.async { [weak self] in self?.pilotingInput = input }
+        let generation = currentCallbackGeneration()
+        queue.async { [weak self] in
+            guard let self else { return }
+            guard self.connectionRoute != .sumoSC3Relay ||
+                    (self.sessionGeneration == generation && self.pcmdTimer != nil) else { return }
+            guard self.relayMovementAllowedLocked() else { return }
+            self.sumoFollowLease = nil
+            self.pilotingInput = input
+        }
+    }
+
+    func updateSumoFollowInput(_ lease: SumoFollowLease) {
+        let generation = currentCallbackGeneration()
+        queue.async { [weak self] in
+            guard let self, self.productModel == .jumpingSumo, self.pcmdTimer != nil else { return }
+            guard self.connectionRoute != .sumoSC3Relay || self.sessionGeneration == generation else { return }
+            guard self.relayMovementAllowedLocked() else { return }
+            let now = ProcessInfo.processInfo.systemUptime
+            guard lease.expiresAt.isFinite, lease.expiresAt <= now + 0.5 else {
+                self.sumoFollowLease = nil; self.pilotingInput = .neutral; return
+            }
+            self.sumoFollowLease = lease
+            self.pilotingInput = lease.value(at: now)
+        }
     }
 
     func neutralizePilotingInput() {
         queue.async { [weak self] in
+            if let self, self.connectionRoute == .sumoSC3Relay {
+                self.stopPilotingLocked()
+                return
+            }
+            self?.sumoFollowLease = nil
             self?.pilotingInput = .neutral
+            self?.relayDriveGate.disarm()
+            self?.cancelRelayJumpRetriesLocked()
             self?.sendPCMDLocked()
         }
     }
 
     func stopPiloting() {
         queue.async { [weak self] in self?.stopPilotingLocked() }
+    }
+
+    /// Additional session-scoped authorization for the unvalidated relay. UI
+    /// focus/neutral checks remain the caller's responsibility; actual drone
+    /// state and subsequent freshness are enforced on the network queue too.
+    func setRelayMovementEnabled(_ enabled: Bool) {
+        let generation = currentCallbackGeneration()
+        queue.async { [weak self] in
+            guard let self, self.connectionRoute == .sumoSC3Relay,
+                  self.sessionGeneration == generation else { return }
+            if enabled, self.canSendLocked, self.productModel == .jumpingSumo {
+                if !self.relayDriveGate.arm(at: ProcessInfo.processInfo.systemUptime,
+                    neutral: self.pilotingInput == .neutral, focused: true) {
+                    self.stopPilotingLocked()
+                }
+            } else {
+                self.stopPilotingLocked()
+            }
+        }
     }
 
     func stop() {
@@ -896,7 +1094,6 @@ final class ARSDKCommandClient {
     private func openUDPSocket() throws -> UInt16 {
         let fd = Darwin.socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
         guard fd >= 0 else { throw ARSDKPhotoConnectionError.socket(String(cString: strerror(errno))) }
-        socketFD = fd
 
         // ARStream1 can burst up to 128 fragments for one MJPEG image. Give
         // the kernel enough room to absorb that burst while the command queue
@@ -932,7 +1129,9 @@ final class ARSDKCommandClient {
             }
         }
         guard bindResult == 0 else {
-            throw ARSDKPhotoConnectionError.socket(String(cString: strerror(errno)))
+            let detail = String(cString: strerror(errno))
+            Darwin.close(fd)
+            throw ARSDKPhotoConnectionError.socket(detail)
         }
         _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK)
 
@@ -944,18 +1143,29 @@ final class ARSDKCommandClient {
             }
         }
         guard nameResult == 0 else {
-            throw ARSDKPhotoConnectionError.socket(String(cString: strerror(errno)))
+            let detail = String(cString: strerror(errno))
+            Darwin.close(fd)
+            throw ARSDKPhotoConnectionError.socket(detail)
         }
 
+        socketFD = fd
         let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
-        source.setEventHandler { [weak self] in self?.receiveDatagrams() }
-        source.setCancelHandler { Darwin.close(fd) }
+        let generation = sessionGeneration
+        source.setEventHandler { [weak self] in
+            guard let self, self.sessionGeneration == generation, self.socketFD == fd else { return }
+            self.receiveDatagrams()
+        }
         readSource = source
         source.resume()
         return UInt16(bigEndian: bound.sin_port)
     }
 
-    private func startDiscovery(host: String, localPort: UInt16) throws {
+    private func startDiscovery(
+        request: UDPConnectionRequest,
+        localPort: UInt16,
+        generation: UInt64
+    ) throws {
+        let host = request.host
         var ipv4 = in_addr()
         guard inet_pton(AF_INET, host, &ipv4) == 1 else {
             throw ARSDKPhotoConnectionError.invalidHost
@@ -963,12 +1173,15 @@ final class ARSDKCommandClient {
 
         let connection = NWConnection(
             host: NWEndpoint.Host(host),
-            port: NWEndpoint.Port(rawValue: 44_444)!,
+            port: NWEndpoint.Port(rawValue: host == "127.0.0.1"
+                ? (loopbackDiscoveryPort ?? request.route.discoveryPort) : request.route.discoveryPort)!,
             using: .tcp
         )
         discoveryConnection = connection
         connection.stateUpdateHandler = { [weak self] state in
-            guard let self else { return }
+            guard let self,
+                  self.sessionGeneration == generation,
+                  self.discoveryConnection === connection else { return }
             switch state {
             case .ready:
                 var body: [String: Any] = [
@@ -977,27 +1190,49 @@ final class ARSDKCommandClient {
                     "d2c_port": Int(localPort),
                     "qos_mode": 0
                 ]
-                if self.connectionRoute == .directProduct,
-                   let videoPort = self.requestedVideoStreamPort {
+                if request.route == .directProduct,
+                   let videoPort = request.videoStreamPort {
                     body["arstream2_client_stream_port"] = Int(videoPort)
                     body["arstream2_client_control_port"] = Int(videoPort &+ 1)
                 }
                 do {
                     let data = try JSONSerialization.data(withJSONObject: body)
                     connection.send(content: data, completion: .contentProcessed { [weak self] error in
-                        if let error { self?.failDiscovery(error.localizedDescription) }
+                        guard let self, let error,
+                              self.sessionGeneration == generation,
+                              self.discoveryConnection === connection else { return }
+                        self.failDiscovery(error.localizedDescription, generation: generation)
                     })
-                    self.receiveDiscoveryResponse(connection, accumulated: Data(), host: host, ipv4: ipv4)
+                    self.receiveDiscoveryResponse(
+                        connection,
+                        accumulated: Data(),
+                        request: request,
+                        ipv4: ipv4,
+                        generation: generation
+                    )
                 } catch {
-                    self.failDiscovery(error.localizedDescription)
+                    self.failDiscovery(error.localizedDescription, generation: generation)
                 }
-            case .failed(let error): self.failDiscovery(error.localizedDescription)
+            case .failed(let error):
+                self.failDiscovery(error.localizedDescription, generation: generation)
+            case .waiting(let error) where request.route == .sumoSC3Relay:
+                // An explicitly selected experimental relay must report a
+                // missing listener/link now, rather than silently waiting on
+                // stock ANAFI discovery or trying another transport.
+                self.failDiscovery(error.localizedDescription, generation: generation)
             case .cancelled: break
             default: break
             }
         }
         let timeout = DispatchWorkItem { [weak self] in
-            self?.finishConnection(.failure(ARSDKPhotoConnectionError.discoveryTimeout))
+            guard let self,
+                  self.sessionGeneration == generation,
+                  self.discoveryConnection === connection else { return }
+            if request.route == .sumoSC3Relay {
+                self.failDiscovery("timed out (relay missing, USB link unavailable, or upstream Sumo association unavailable)", generation: generation)
+            } else {
+                self.finishConnection(.failure(ARSDKPhotoConnectionError.discoveryTimeout), generation: generation)
+            }
         }
         discoveryTimeout = timeout
         queue.asyncAfter(deadline: .now() + 8, execute: timeout)
@@ -1007,22 +1242,48 @@ final class ARSDKCommandClient {
     private func receiveDiscoveryResponse(
         _ connection: NWConnection,
         accumulated: Data,
-        host: String,
-        ipv4: in_addr
+        request: UDPConnectionRequest,
+        ipv4: in_addr,
+        generation: UInt64
     ) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 65_535) { [weak self] data, _, complete, error in
-            guard let self else { return }
+            guard let self,
+                  self.sessionGeneration == generation,
+                  self.discoveryConnection === connection else { return }
             var combined = accumulated
             if let data { combined.append(data) }
+            let maximumBytes = request.route == .sumoSC3Relay ? SC3SumoRelay.maximumDiscoveryBytes + 1 : 1_048_576
+            guard combined.count <= maximumBytes else {
+                self.failDiscovery("oversized JSON reply", generation: generation)
+                return
+            }
             if let object = ARSDKDiscoveryProtocol.responseObject(from: combined) {
+                if request.route == .sumoSC3Relay, object["status"] as? Int == nil {
+                    self.failDiscovery("missing discovery status", generation: generation)
+                    return
+                }
                 let status = object["status"] as? Int ?? 0
                 guard status == 0 else {
-                    self.finishConnection(.failure(ARSDKPhotoConnectionError.connectionRejected(status)))
+                    if request.route == .sumoSC3Relay {
+                        self.failDiscovery("relay/upstream discovery rejected status \(status); check Sumo association", generation: generation)
+                        return
+                    }
+                    self.finishConnection(
+                        .failure(ARSDKPhotoConnectionError.connectionRejected(status)),
+                        generation: generation
+                    )
                     return
                 }
                 guard let portValue = object["c2d_port"] as? Int,
-                      let port = UInt16(exactly: portValue) else {
-                    self.finishConnection(.failure(ARSDKPhotoConnectionError.missingCommandPort))
+                      let port = UInt16(exactly: portValue), port > 0 else {
+                    if request.route == .sumoSC3Relay {
+                        self.failDiscovery("invalid or missing negotiated c2d_port", generation: generation)
+                        return
+                    }
+                    self.finishConnection(
+                        .failure(ARSDKPhotoConnectionError.missingCommandPort),
+                        generation: generation
+                    )
                     return
                 }
                 var remote = sockaddr_in()
@@ -1031,13 +1292,13 @@ final class ARSDKCommandClient {
                 remote.sin_port = port.bigEndian
                 remote.sin_addr = ipv4
                 self.remoteAddress = remote
-                self.connectedHost = host
-                self.log("ARSDK connected to \(self.connectionRoute.displayName) \(host) · command UDP \(port)")
+                self.connectedRequest = request
+                self.log("ARSDK connected to \(self.connectionRoute.displayName) \(request.host) · command UDP \(port)")
                 // Buffer 125 belongs to a directly connected legacy product.
                 // An SC2 session may report that its downstream product is a
                 // Sumo, but its video still arrives through the SC2 /video
                 // restream and must never alter this transport route.
-                if self.connectionRoute == .directProduct,
+                if self.connectionRoute.usesDirectARNetworkVideo,
                    self.productModel.capabilities.usesARStream1Video {
                     let negotiation = ARSDKDiscoveryProtocol.arstream1Negotiation(from: object)
                     self.arstream1Negotiation = negotiation
@@ -1061,32 +1322,51 @@ final class ARSDKCommandClient {
                         "\(serverControl.map(String.init) ?? "not announced")"
                     )
                 }
-                self.finishConnection(.success(()))
+                if request.route == .sumoSC3Relay { self.startRelayKeepaliveLocked() }
+                self.finishConnection(.success(()), generation: generation)
                 return
             }
             if let error {
-                self.failDiscovery(error.localizedDescription)
+                self.failDiscovery(error.localizedDescription, generation: generation)
             } else if complete {
-                self.failDiscovery("invalid JSON reply")
+                self.failDiscovery("invalid JSON reply", generation: generation)
             } else {
-                self.receiveDiscoveryResponse(connection, accumulated: combined, host: host, ipv4: ipv4)
+                self.receiveDiscoveryResponse(
+                    connection,
+                    accumulated: combined,
+                    request: request,
+                    ipv4: ipv4,
+                    generation: generation
+                )
             }
         }
     }
 
-    private func failDiscovery(_ detail: String) {
-        finishConnection(.failure(ARSDKPhotoConnectionError.discovery(detail)))
+    private func failDiscovery(_ detail: String, generation: UInt64) {
+        finishConnection(
+            .failure(connectionRoute == .sumoSC3Relay
+                ? SC3SumoRelay.discoveryFailure(detail) : ARSDKPhotoConnectionError.discovery(detail)),
+            generation: generation
+        )
     }
 
-    private func finishConnection(_ result: Result<Void, Error>) {
+    private func finishConnection(_ result: Result<Void, Error>, generation: UInt64) {
+        guard sessionGeneration == generation, !connectionCompletions.isEmpty else { return }
         discoveryTimeout?.cancel()
         discoveryTimeout = nil
         discoveryConnection?.cancel()
         discoveryConnection = nil
         let callbacks = connectionCompletions
         connectionCompletions.removeAll()
-        connectingHost = nil
-        DispatchQueue.main.async { callbacks.forEach { $0(result) } }
+        connectingRequest = nil
+        if case .failure = result {
+            connectedRequest = nil
+            remoteAddress = nil
+            closeSocketLocked()
+        }
+        dispatchMain(generation: generation) { _ in
+            callbacks.forEach { $0(result) }
+        }
     }
 
     private func sendCommand(_ payload: Data) {
@@ -1096,10 +1376,20 @@ final class ARSDKCommandClient {
     private func sendAcknowledgedCommand(
         _ payload: Data,
         buffer: UInt8 = 11,
-        maximumRetries: Int? = 5
+        maximumRetries: Int? = 5,
+        requiring capability: KeyPath<ParrotProductCapabilities, Bool>? = nil
     ) {
+        let generation = currentCallbackGeneration()
         queue.async { [weak self] in
-            self?.sendAcknowledgedFrame(payload: payload, buffer: buffer, maximumRetries: maximumRetries)
+            guard let self else { return }
+            guard self.connectionRoute != .sumoSC3Relay || self.sessionGeneration == generation else { return }
+            if let capability,
+               !self.productModel.capabilities[keyPath: capability] { return }
+            self.sendAcknowledgedFrame(
+                payload: payload,
+                buffer: buffer,
+                maximumRetries: maximumRetries
+            )
         }
     }
 
@@ -1108,10 +1398,16 @@ final class ARSDKCommandClient {
         buffer: UInt8 = 11,
         maximumRetries: Int? = 5
     ) {
-        guard socketFD >= 0, var remoteAddress else { return }
+        guard canSendLocked else { return }
+        // No Bebop/ANAFI/controller command may cross the explicitly selected
+        // Sumo relay, including a late callback during a mode change.
+        if connectionRoute == .sumoSC3Relay,
+           payload.first != 0, payload.first != 3 { return }
+        if connectionRoute == .sumoSC3Relay,
+           payload.starts(with: Data([3, 2, 3, 0])), !relayMovementAllowedLocked() { return }
         let sequence = nextSequence(for: buffer)
         let packet = ARSDKPhotoProtocol.frame(type: 4, id: buffer, sequence: sequence, payload: payload)
-        sendPacket(packet, to: &remoteAddress)
+        sendPacketLocked(packet)
         let key = acknowledgementKey(buffer: buffer, sequence: sequence)
         pendingAcknowledgements[key] = PendingAcknowledgement(
             buffer: buffer,
@@ -1120,17 +1416,26 @@ final class ARSDKCommandClient {
             retries: 0,
             maximumRetries: maximumRetries
         )
-        scheduleRetry(key: key)
-    }
-
-    private func sendUnacknowledgedCommand(_ payload: Data) {
-        queue.async { [weak self] in self?.sendFrame(type: 2, id: 10, payload: payload) }
+        scheduleRetry(key: key, generation: sessionGeneration)
     }
 
     private func sendFrame(type: UInt8, id: UInt8, payload: Data) {
-        guard socketFD >= 0, var remoteAddress else { return }
+        guard canSendLocked else { return }
         let sequence = nextSequence(for: id)
         let packet = ARSDKPhotoProtocol.frame(type: type, id: id, sequence: sequence, payload: payload)
+        sendPacketLocked(packet)
+    }
+
+    private var canSendLocked: Bool {
+        muxTransportSend != nil || (socketFD >= 0 && remoteAddress != nil)
+    }
+
+    private func sendPacketLocked(_ packet: Data) {
+        if let muxTransportSend {
+            muxTransportSend(packet)
+            return
+        }
+        guard var remoteAddress else { return }
         sendPacket(packet, to: &remoteAddress)
     }
 
@@ -1144,10 +1449,17 @@ final class ARSDKCommandClient {
         }
     }
 
-    private func scheduleRetry(key: UInt16) {
+    private func scheduleRetry(key: UInt16, generation: UInt64) {
         queue.asyncAfter(deadline: .now() + .milliseconds(150)) { [weak self] in
-            guard let self, var pending = self.pendingAcknowledgements[key],
-                  var remote = self.remoteAddress else { return }
+            guard let self, self.sessionGeneration == generation,
+                  var pending = self.pendingAcknowledgements[key],
+                  self.canSendLocked else { return }
+            if self.connectionRoute == .sumoSC3Relay,
+               pending.packet.dropFirst(7).starts(with: Data([3, 2, 3, 0])),
+               !self.relayMovementAllowedLocked() {
+                self.pendingAcknowledgements.removeValue(forKey: key)
+                return
+            }
             if let maximumRetries = pending.maximumRetries, pending.retries >= maximumRetries {
                 self.pendingAcknowledgements.removeValue(forKey: key)
                 self.log("ARSDK buffer \(pending.buffer) command acknowledgement timed out")
@@ -1155,8 +1467,8 @@ final class ARSDKCommandClient {
             }
             pending.retries += 1
             self.pendingAcknowledgements[key] = pending
-            self.sendPacket(pending.packet, to: &remote)
-            self.scheduleRetry(key: key)
+            self.sendPacketLocked(pending.packet)
+            self.scheduleRetry(key: key, generation: generation)
         }
     }
 
@@ -1165,7 +1477,15 @@ final class ARSDKCommandClient {
     }
 
     private func sendPCMDLocked() {
-        guard remoteAddress != nil else { return }
+        guard canSendLocked else { return }
+        if !relayMovementAllowedLocked() {
+            pilotingInput = .neutral
+            sumoFollowLease = nil
+        }
+        if let lease = sumoFollowLease {
+            pilotingInput = lease.value(at: ProcessInfo.processInfo.systemUptime)
+            if pilotingInput == .neutral { sumoFollowLease = nil }
+        }
         if productModel.capabilities.supportsJumpingSumoCommands {
             let drive = JumpingSumoPilotingInput(sharedInput: pilotingInput)
             sendFrame(
@@ -1195,10 +1515,59 @@ final class ARSDKCommandClient {
     }
 
     private func stopPilotingLocked() {
+        sumoFollowLease = nil
         pilotingInput = .neutral
+        relayDriveGate.disarm()
+        cancelRelayJumpRetriesLocked()
         sendPCMDLocked()
         pcmdTimer?.cancel()
         pcmdTimer = nil
+    }
+
+    private func cancelRelayJumpRetriesLocked() {
+        guard connectionRoute == .sumoSC3Relay else { return }
+        pendingAcknowledgements = pendingAcknowledgements.filter {
+            // Seven-byte ARNetwork header followed by Sumo.Animations.Jump.
+            !$0.value.packet.dropFirst(7).starts(with: Data([3, 2, 3, 0]))
+        }
+    }
+
+    private func relayMovementAllowedLocked() -> Bool {
+        guard connectionRoute == .sumoSC3Relay else { return true }
+        expireRelayMovementLocked(at: ProcessInfo.processInfo.systemUptime)
+        return relayDriveGate.armed
+    }
+
+    private func expireRelayMovementLocked(at now: TimeInterval) {
+        guard connectionRoute == .sumoSC3Relay, relayDriveGate.armed,
+              !relayDriveGate.isFresh(at: now) else { return }
+        relayDriveGate.disarm()
+        pilotingInput = .neutral
+        sumoFollowLease = nil
+        cancelRelayJumpRetriesLocked()
+        pcmdTimer?.cancel()
+        pcmdTimer = nil
+        // Send directly to avoid recursively checking freshness through PCMD.
+        sendFrame(type: 2, id: 10, payload: ARSDKPhotoCommand.jumpingSumoPCMD(flag: false, speed: 0, turn: 0))
+        log("SC3 Sumo relay controls disabled: drone state/heartbeat is stale; enable movement again after recovery")
+    }
+
+    private func startRelayKeepaliveLocked() {
+        relayKeepaliveTimer?.cancel()
+        let generation = sessionGeneration
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now(), repeating: .milliseconds(SC3SumoRelay.keepaliveIntervalMilliseconds), leeway: .milliseconds(20))
+        timer.setEventHandler { [weak self] in
+            guard let self, self.sessionGeneration == generation,
+                  self.connectionRoute == .sumoSC3Relay, self.productModel == .jumpingSumo else { return }
+            self.expireRelayMovementLocked(at: ProcessInfo.processInfo.systemUptime)
+            guard self.pcmdTimer == nil else { return }
+            // The relay expires after 1500ms without app datagrams. Keep it
+            // alive at 2Hz with the existing Sumo command, never stale input.
+            self.sendFrame(type: 2, id: 10, payload: ARSDKPhotoCommand.jumpingSumoPCMD(flag: false, speed: 0, turn: 0))
+        }
+        relayKeepaliveTimer = timer
+        timer.resume()
     }
 
     private func nextSequence(for id: UInt8) -> UInt8 {
@@ -1210,10 +1579,22 @@ final class ARSDKCommandClient {
     private func receiveDatagrams() {
         var storage = [UInt8](repeating: 0, count: 65_535)
         while true {
+            var sender = sockaddr_in()
+            var senderLength = socklen_t(MemoryLayout<sockaddr_in>.size)
             let count = storage.withUnsafeMutableBytes { bytes in
-                recv(socketFD, bytes.baseAddress, bytes.count, 0)
+                withUnsafeMutablePointer(to: &sender) {
+                    $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                        recvfrom(socketFD, bytes.baseAddress, bytes.count, 0, $0, &senderLength)
+                    }
+                }
             }
             if count <= 0 { break }
+            if connectionRoute == .sumoSC3Relay {
+                guard let remoteAddress,
+                      sender.sin_family == sa_family_t(AF_INET),
+                      sender.sin_addr.s_addr == remoteAddress.sin_addr.s_addr,
+                      sender.sin_port == remoteAddress.sin_port else { continue }
+            }
             parseFrames(Data(storage.prefix(count)))
         }
     }
@@ -1246,29 +1627,60 @@ final class ARSDKCommandClient {
             }
             if type == 2, id == 0 {
                 sendFrame(type: 2, id: 1, payload: payload)
+                if connectionRoute == .sumoSC3Relay, payload.count == 8 {
+                    let sampledAt = ProcessInfo.processInfo.systemUptime
+                    expireRelayMovementLocked(at: sampledAt)
+                    relayDriveGate.receivedHeartbeat(at: sampledAt)
+                    dispatchMain(generation: sessionGeneration) { client in
+                        client.onRelayHeartbeat?(sampledAt)
+                    }
+                }
             }
 
-            if connectionRoute == .directProduct,
+            if connectionRoute.usesDirectARNetworkVideo,
                productModel.capabilities.usesARStream1Video, id == 125 {
                 enqueueARStream1PayloadLocked(payload)
                 offset += size
                 continue
             }
 
+            if connectionRoute == .sumoSC3Relay, (id == 126 || id == 127),
+               payload.first != 0, payload.first != 3 {
+                // A Sumo relay never acquires an SC2/Bebop/ANAFI identity or
+                // camera state from an unrelated feature notification.
+                offset += size
+                continue
+            }
+
             if connectionRoute == .skyController, (id == 126 || id == 127),
                let event = SC2MappingProtocol.decode(payload) {
-                DispatchQueue.main.async { [weak self] in self?.onSC2MappingEvent?(event) }
+                dispatchMain(generation: sessionGeneration) { client in
+                    client.onSC2MappingEvent?(event)
+                }
             }
             if (id == 126 || id == 127), let event = ARSDKPhotoProtocol.decode(payload) {
-                DispatchQueue.main.async { [weak self] in self?.onEvent?(event) }
+                dispatchMain(generation: sessionGeneration) { client in
+                    client.onEvent?(event)
+                }
             }
             if id == 126 || id == 127, let telemetry = ARSDKTelemetryProtocol.decode(payload) {
-                if case .aircraftConnection(let status, _, let productID) = telemetry, status == 2 {
+                if connectionRoute == .sumoSC3Relay, payload.first == 0 || payload.first == 3 {
+                    let sampledAt = ProcessInfo.processInfo.systemUptime
+                    expireRelayMovementLocked(at: sampledAt)
+                    relayDriveGate.receivedState(at: sampledAt)
+                    dispatchMain(generation: sessionGeneration) { client in
+                        client.onRelayState?(sampledAt)
+                    }
+                }
+                if case .aircraftConnection(let status, _, let productID) = telemetry, status == 2,
+                   connectionRoute != .sumoSC3Relay {
                     let detectedModel = ParrotProductModel(productID: productID)
                     if productModel != detectedModel { resetVideoAssemblyLocked() }
                     productModel = detectedModel
                 }
-                DispatchQueue.main.async { [weak self] in self?.onTelemetryEvent?(telemetry) }
+                dispatchMain(generation: sessionGeneration) { client in
+                    client.onTelemetryEvent?(telemetry)
+                }
             }
             offset += size
         }
@@ -1276,6 +1688,7 @@ final class ARSDKCommandClient {
 
     private func enqueueARStream1PayloadLocked(_ payload: Data) {
         let generation = videoAssemblyGeneration
+        let callbackGeneration = sessionGeneration
         let codec = productModel.capabilities.videoCodec
         let negotiation = arstream1Negotiation
         videoAssemblyQueue.async { [weak self] in
@@ -1290,10 +1703,17 @@ final class ARSDKCommandClient {
                 }
                 if let frame = result.frame {
                     self.diagnosticWindowCompletedFrames &+= 1
-                    self.deliverARStream1Frame(frame, codec: codec)
+                    self.deliverARStream1Frame(
+                        frame,
+                        codec: codec,
+                        callbackGeneration: callbackGeneration
+                    )
                 }
             }
-            self.publishARStream1DiagnosticsIfNeeded(negotiation: negotiation)
+            self.publishARStream1DiagnosticsIfNeeded(
+                negotiation: negotiation,
+                callbackGeneration: callbackGeneration
+            )
         }
     }
 
@@ -1316,7 +1736,10 @@ final class ARSDKCommandClient {
         }
     }
 
-    private func publishARStream1DiagnosticsIfNeeded(negotiation: ARStream1Negotiation) {
+    private func publishARStream1DiagnosticsIfNeeded(
+        negotiation: ARStream1Negotiation,
+        callbackGeneration: UInt64
+    ) {
         let now = DispatchTime.now().uptimeNanoseconds
         if diagnosticWindowStartedNanoseconds == 0 {
             diagnosticWindowStartedNanoseconds = now
@@ -1334,7 +1757,9 @@ final class ARSDKCommandClient {
         diagnosticWindowStartedNanoseconds = now
         diagnosticWindowReceivedFragments = 0
         diagnosticWindowCompletedFrames = 0
-        DispatchQueue.main.async { [weak self] in self?.onARStream1Diagnostics?(diagnostics) }
+        dispatchMain(generation: callbackGeneration) { client in
+            client.onARStream1Diagnostics?(diagnostics)
+        }
 
         if now &- lastVideoDiagnosticLogNanoseconds >= 5_000_000_000 {
             lastVideoDiagnosticLogNanoseconds = now
@@ -1348,12 +1773,17 @@ final class ARSDKCommandClient {
                     stats.lastAssembledBytes.map(String.init) ?? "—",
                     stats.incompleteFrames,
                     stats.missingFragments
-                )
+                ),
+                generation: callbackGeneration
             )
         }
     }
 
-    private func deliverARStream1Frame(_ frame: ARStream1CompletedFrame, codec: ParrotVideoCodec) {
+    private func deliverARStream1Frame(
+        _ frame: ARStream1CompletedFrame,
+        codec: ParrotVideoCodec,
+        callbackGeneration: UInt64
+    ) {
         switch codec {
         case .h264:
             let nalUnits = ARStream1VideoAssembler.splitAnnexB(frame.payload)
@@ -1363,30 +1793,45 @@ final class ARSDKCommandClient {
                 rtpTimestamp: UInt32(truncatingIfNeeded: frame.frameNumber &* 3_000),
                 rtpHeaderExtensions: []
             )
-            DispatchQueue.main.async { [weak self] in self?.onVideoAccessUnit?(accessUnit) }
+            dispatchMain(generation: callbackGeneration) { client in
+                client.onVideoAccessUnit?(accessUnit)
+            }
         case .mjpeg:
             guard let jpeg = ARStream1VideoAssembler.jpegPayload(in: frame.payload) else {
                 let now = DispatchTime.now().uptimeNanoseconds
                 if now &- lastInvalidJPEGLog >= 2_000_000_000 {
                     lastInvalidJPEGLog = now
-                    log("Jumping Sumo ARStream 1 dropped an invalid JPEG (missing SOI/EOI boundary)")
+                    log(
+                        "Jumping Sumo ARStream 1 dropped an invalid JPEG (missing SOI/EOI boundary)",
+                        generation: callbackGeneration
+                    )
                 }
                 return
             }
-            DispatchQueue.main.async { [weak self] in self?.onMJPEGFrame?(jpeg, frame.frameNumber) }
+            dispatchMain(generation: callbackGeneration) { client in
+                client.onMJPEGFrame?(jpeg, frame.frameNumber)
+            }
         }
     }
 
     private func stopLocked() {
+        sessionGeneration &+= 1
+        callbackGenerationLock.lock()
+        callbackGeneration = sessionGeneration
+        callbackGenerationLock.unlock()
         stopPilotingLocked()
+        relayKeepaliveTimer?.cancel()
+        relayKeepaliveTimer = nil
+        relayDriveGate.reset()
         discoveryTimeout?.cancel()
         discoveryTimeout = nil
         discoveryConnection?.cancel()
         discoveryConnection = nil
         connectionCompletions.removeAll()
-        connectingHost = nil
+        connectingRequest = nil
         remoteAddress = nil
-        connectedHost = nil
+        connectedRequest = nil
+        muxTransportSend = nil
         requestedVideoStreamPort = nil
         sequenceByBuffer.removeAll()
         pendingAcknowledgements.removeAll()
@@ -1397,17 +1842,45 @@ final class ARSDKCommandClient {
             maximumAcknowledgementInterval: nil
         )
         resetVideoAssemblyLocked(negotiation: arstream1Negotiation)
-        if let source = readSource {
-            source.cancel()
-            readSource = nil
-        } else if socketFD >= 0 {
-            Darwin.close(socketFD)
-        }
-        socketFD = -1
+        closeSocketLocked()
     }
 
-    private func log(_ message: String) {
-        DispatchQueue.main.async { [weak self] in self?.onLog?(message) }
+    private func closeSocketLocked() {
+        readSource?.setEventHandler {}
+        readSource?.cancel()
+        readSource = nil
+        let fd = socketFD
+        socketFD = -1
+        if fd >= 0 { Darwin.close(fd) }
+    }
+
+    private func dispatchMain(
+        generation: UInt64,
+        _ operation: @escaping (ARSDKCommandClient) -> Void
+    ) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.callbackGenerationLock.lock()
+            let isCurrent = self.callbackGeneration == generation
+            self.callbackGenerationLock.unlock()
+            guard isCurrent else { return }
+            operation(self)
+        }
+    }
+
+    private func currentCallbackGeneration() -> UInt64 {
+        callbackGenerationLock.lock()
+        defer { callbackGenerationLock.unlock() }
+        return callbackGeneration
+    }
+
+    private func log(_ message: String, generation: UInt64? = nil) {
+        callbackGenerationLock.lock()
+        let callbackGeneration = generation ?? self.callbackGeneration
+        callbackGenerationLock.unlock()
+        dispatchMain(generation: callbackGeneration) { client in
+            client.onLog?(message)
+        }
     }
 }
 

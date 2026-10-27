@@ -1,0 +1,69 @@
+{
+  "format": "parrot-lab-sc3-tools-v1",
+  "api": 1,
+  "firmware": "1.8.1",
+  "hardware": "3",
+  "payload": "native-sumo-v1c",
+  "files": {
+    "sc3_tool.py": {
+      "bytes": 26844,
+      "sha256": "12516cb800da607a7fc4e648b69c7f5f0e4904f844f4984120d44a96adcf6e08",
+      "sha1": "71ede8724a66a60a3eae799f3a4b10b880eb9001",
+      "source": "tools/sc3_app_tools/sc3_tool.py"
+    },
+    "README.md": {
+      "bytes": 12312,
+      "sha256": "cef83b4f12eaaa72ffcdcf49fe58ed293cb076018ae5aa58d361fc098c1d2583",
+      "sha1": "d3891f6241826cf10da3edbf60a98ff15c9dffe9",
+      "source": "tools/sc3_app_tools/README.md"
+    },
+    "device/sumo-tool.sh": {
+      "bytes": 5829,
+      "sha256": "f1c68b9864fcee59018d3287b74b47923ee88a545dfc3d073a6f3423241b8a40",
+      "sha1": "fc684f2a8b4263314a2d9051aae26d2941bfb2fb",
+      "source": "tools/sc3_app_tools/device/sumo-tool.sh"
+    },
+    "assets/startup.sh": {
+      "bytes": 2671,
+      "sha256": "47b9bdb3122267bec7e4855d38ebb68c23e7f94994d7af44ff2a3ce596e2ae8a",
+      "sha1": "0be1f74b8829fb66d07a8401fd7330b4a5016d87",
+      "source": "tools/sc3_sumo_native/startup.sh"
+    },
+    "assets/control.sh": {
+      "bytes": 3293,
+      "sha256": "ea316303e6719a0fccb3c0b660f2fe22c338d19bdbb073ee11b3f9f7996b50a1",
+      "sha1": "1b22641d969a0a2fef45d72d1f51bd4ab5c66b99",
+      "source": "tools/sc3_sumo_native/control.sh"
+    },
+    "assets/99-mppd.native.rc": {
+      "bytes": 131,
+      "sha256": "ec8bf947da51fbf052fe096a851ae6e2302fd4efb3cd1939bdc42f1dd365d762",
+      "sha1": "5e6af16f7bddfdf0c604c364a3e6d129497ff07f",
+      "source": "tools/sc3_sumo_native/99-mppd.native.rc"
+    },
+    "legacy/backup_nand.py": {
+      "bytes": 13443,
+      "sha256": "734f1e2625755834ce9b0ec021fed1f1362abe324649ccfa0d80645273ae3f91",
+      "sha1": "6b74d106a25ce4c63f82ac372fab00d6dfed627b",
+      "source": "tools/sc3_ramdiag/backup_nand.py"
+    },
+    "legacy/persistent_debug_trial.py": {
+      "bytes": 14893,
+      "sha256": "a1f9de42a09044ee7c7967744a5cecd5f755a91ecdda7edf900195f5c716b212",
+      "sha1": "d3f0ee3d9aad3125ebd805338dc5c4c4c48ebbaa",
+      "source": "tools/sc3_ramdiag/persistent_debug_trial.py"
+    },
+    "assets/sc3-ramdiag-v5.img": {
+      "bytes": 8681472,
+      "sha256": "1af51a48d6523902baf589574b6e56daba3134dd48a7514558c9a6253511c3a0",
+      "sha1": "fb4dcbdba400a65ee64522a1c467eff357356ce1",
+      "source": "build/sc3-ramdiag-v5-bindfirst/sc3-ramdiag-v5-bindfirst.img"
+    },
+    "assets/mppd.native-sumo-v1c": {
+      "bytes": 264098,
+      "sha256": "f561113254ea50465eca823b6b1ebb8d3acefddb9f0920043fc960c4218a5c96",
+      "sha1": "83874fd41722c8391b3e530c7fce0e2ff3bab461",
+      "source": "build/sc3-sumo-native-v1c/mppd.native-sumo"
+    }
+  }
+}

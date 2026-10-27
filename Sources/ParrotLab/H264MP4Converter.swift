@@ -8,7 +8,7 @@ enum BundledFFmpeg {
             ProcessInfo.processInfo.environment["PARROTLAB_FFMPEG"]
                 .map { URL(fileURLWithPath: $0) },
             URL(fileURLWithPath: "/opt/homebrew/bin/ffmpeg"),
-            URL(fileURLWithPath: "/usr/local/bin/ffmpeg"),
+            URL(fileURLWithPath: "/usr/local/bin/ffmpeg")
         ]
         return candidates.compactMap { $0 }.first {
             FileManager.default.isExecutableFile(atPath: $0.path)
@@ -50,11 +50,17 @@ struct H264MP4ConversionResult {
 final class H264MP4Converter {
     var onCompletion: ((Result<H264MP4ConversionResult, Error>) -> Void)?
 
+    private let executableURLOverride: URL?
     private let stateLock = NSLock()
     private var process: Process?
+    private var completionGroup: DispatchGroup?
     private var cancellationRequested = false
     private var diagnosticData = Data()
     private let maximumDiagnosticBytes = 128 * 1_024
+
+    init(executableURLOverride: URL? = nil) {
+        self.executableURLOverride = executableURLOverride
+    }
 
     var isConverting: Bool {
         stateLock.lock()
@@ -63,7 +69,7 @@ final class H264MP4Converter {
     }
 
     func convert(inputURL: URL, outputURL: URL, quality: MP4ConversionQuality) {
-        guard let executable = BundledFFmpeg.executableURL() else {
+        guard let executable = executableURLOverride ?? BundledFFmpeg.executableURL() else {
             finish(.failure(conversionError("The bundled FFmpeg executable is unavailable.")))
             return
         }
@@ -86,6 +92,9 @@ final class H264MP4Converter {
             return
         }
         process = newProcess
+        let group = DispatchGroup()
+        group.enter()
+        completionGroup = group
         cancellationRequested = false
         diagnosticData.removeAll(keepingCapacity: true)
         stateLock.unlock()
@@ -107,17 +116,24 @@ final class H264MP4Converter {
                 outputURL: outputURL,
                 quality: quality
             )
+            group.leave()
         }
 
         do {
             try newProcess.run()
+            stateLock.lock()
+            let shouldCancel = process === newProcess && cancellationRequested
+            stateLock.unlock()
+            if shouldCancel, newProcess.isRunning { newProcess.terminate() }
         } catch {
             errorPipe.fileHandleForReading.readabilityHandler = nil
             stateLock.lock()
             process = nil
+            completionGroup = nil
             stateLock.unlock()
             try? FileManager.default.removeItem(at: outputURL)
             finish(.failure(error))
+            group.leave()
         }
     }
 
@@ -127,6 +143,16 @@ final class H264MP4Converter {
         let current = process
         stateLock.unlock()
         if current?.isRunning == true { current?.terminate() }
+    }
+
+    @discardableResult
+    func cancelAndWait(timeout: TimeInterval = 3) -> Bool {
+        cancel()
+        stateLock.lock()
+        let group = completionGroup
+        stateLock.unlock()
+        guard let group else { return true }
+        return group.wait(timeout: .now() + timeout) == .success
     }
 
     static func arguments(
@@ -163,7 +189,59 @@ final class H264MP4Converter {
         return copy.contains("copy") && !copy.contains("libx264") &&
             encoded.contains("libx264") && encoded.contains("-crf") &&
             MP4ConversionQuality(percent: 101) == .original &&
-            MP4ConversionQuality(percent: 50).percent == MP4ConversionQuality.minimum
+            MP4ConversionQuality(percent: 50).percent == MP4ConversionQuality.minimum &&
+            cancellationSelfTest() && cancelledSuccessfulExitSelfTest()
+    }
+
+    private static func cancellationSelfTest() -> Bool {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("parrotlab-conversion-test-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let executable = directory.appendingPathComponent("fake-ffmpeg.sh")
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try Data("#!/bin/sh\nexec /bin/sleep 30\n".utf8).write(to: executable)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
+        } catch { return false }
+        let converter = H264MP4Converter(executableURLOverride: executable)
+        var completions = 0
+        converter.onCompletion = { _ in completions += 1 }
+        let output = directory.appendingPathComponent("output.mp4")
+        converter.convert(inputURL: directory.appendingPathComponent("input.h264"),
+                          outputURL: output, quality: .original)
+        guard converter.isConverting, converter.cancelAndWait(timeout: 3),
+              !converter.isConverting, !FileManager.default.fileExists(atPath: output.path) else { return false }
+        let deadline = Date().addingTimeInterval(1)
+        while completions < 1, Date() < deadline {
+            _ = RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.01))
+        }
+        return completions == 1
+    }
+
+    private static func cancelledSuccessfulExitSelfTest() -> Bool {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("parrotlab-cancel-zero-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let executable = directory.appendingPathComponent("fake-ffmpeg.sh"), output = directory.appendingPathComponent("partial.mp4")
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+            let script = "#!/bin/sh\nfor output do :; done\ntrap 'exit 0' TERM\nprintf partial > \"$output\"\nwhile :; do /bin/sleep 0.02; done\n"
+            try Data(script.utf8).write(to: executable)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
+        } catch { return false }
+        let converter = H264MP4Converter(executableURLOverride: executable)
+        var completion: Result<H264MP4ConversionResult, Error>?
+        converter.onCompletion = { completion = $0 }
+        converter.convert(inputURL: directory.appendingPathComponent("input.h264"), outputURL: output, quality: .original)
+        let ready = Date().addingTimeInterval(2)
+        while !FileManager.default.fileExists(atPath: output.path), Date() < ready { Thread.sleep(forTimeInterval: 0.01) }
+        guard FileManager.default.fileExists(atPath: output.path), converter.cancelAndWait() else { return false }
+        let delivered = Date().addingTimeInterval(1)
+        while completion == nil, Date() < delivered { RunLoop.current.run(until: Date().addingTimeInterval(0.01)) }
+        guard case .failure(let error) = completion, error.localizedDescription.contains("cancelled"),
+              !FileManager.default.fileExists(atPath: output.path) else {
+            fputs("Cancelled conversion with exit 0 was accepted or its partial output survived\n", stderr); return false
+        }
+        return true
     }
 
     private func appendDiagnostics(_ data: Data) {
@@ -185,11 +263,12 @@ final class H264MP4Converter {
         let diagnostics = String(data: diagnosticData, encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         process = nil
+        completionGroup = nil
         cancellationRequested = false
         diagnosticData.removeAll(keepingCapacity: false)
         stateLock.unlock()
 
-        if status == 0,
+        if !cancelled, status == 0,
            let attributes = try? FileManager.default.attributesOfItem(atPath: outputURL.path),
            let byteCount = attributes[.size] as? NSNumber,
            byteCount.uint64Value > 0 {

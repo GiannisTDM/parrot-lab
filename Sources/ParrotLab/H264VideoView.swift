@@ -9,10 +9,12 @@ import VideoToolbox
 private final class DecodedVideoFrameContext {
     let timing: VideoFrameTiming
     let motion: VerifiedVideoFrameMotion?
+    let visibleRect: CGRect?
 
-    init(timing: VideoFrameTiming, motion: VerifiedVideoFrameMotion?) {
+    init(timing: VideoFrameTiming, motion: VerifiedVideoFrameMotion?, visibleRect: CGRect?) {
         self.timing = timing
         self.motion = motion
+        self.visibleRect = visibleRect
     }
 }
 
@@ -273,6 +275,20 @@ final class H264VideoView: NSView {
         rollingShutterStatus: "RS OFF · CALIBRATION AVAILABLE"
     )
 
+    var diagnosticSummary: String {
+        mjpegDecodeLock.lock()
+        let generation = mjpegDecodeGeneration
+        let mjpegActive = mjpegDecodeInFlight
+        let mjpegPending = pendingMJPEGFrame != nil
+        mjpegDecodeLock.unlock()
+        hardwareFrameLock.lock()
+        let displayPending = pendingHardwareFrames.count
+        hardwareFrameLock.unlock()
+        let decoder = decompressionSession != nil ? "VideoToolbox" : softwareDecoder != nil ? "FFmpeg" : "none"
+        return "video gen=\(generation) decoder=\(decoder) mjpeg-active=\(mjpegActive) " +
+            "mjpeg-pending=\(mjpegPending) display-pending=\(displayPending) timer=\(generatedDisplayTimer != nil)"
+    }
+
     private static let legacyFrameInfoUUID = Data([
         0x97, 0x77, 0x08, 0x83, 0xc8, 0xd3, 0x40, 0x2e,
         0x9c, 0xf8, 0xb1, 0x0a, 0x41, 0xf9, 0x12, 0xd4
@@ -302,6 +318,20 @@ final class H264VideoView: NSView {
     }
 
     required init?(coder: NSCoder) { nil }
+
+    deinit {
+        hardwareFallbackWorkItem?.cancel()
+        generatedDisplayTimer?.cancel()
+        if let decompressionSession {
+            // The VideoToolbox callback holds an unretained refcon to this view.
+            // Drain it before the view's storage can disappear.
+            VTDecompressionSessionWaitForAsynchronousFrames(decompressionSession)
+            VTDecompressionSessionInvalidate(decompressionSession)
+        }
+        softwareDecoder?.stop()
+        try? dumpHandle?.close()
+        try? extensionDumpHandle?.close()
+    }
 
     override func layout() {
         super.layout()
@@ -442,7 +472,9 @@ final class H264VideoView: NSView {
                         kCGImageSourceShouldCache: true,
                         kCGImageSourceShouldAllowFloat: false
                       ] as CFDictionary) else {
-                    self.onDebug?("Jumping Sumo MJPEG frame decode failed")
+                    self.dispatchMJPEGMain(generation: request.generation) { view in
+                        view.onDebug?("Jumping Sumo MJPEG frame decode failed")
+                    }
                     self.finishMJPEGDecode(request)
                     return
                 }
@@ -457,24 +489,27 @@ final class H264VideoView: NSView {
 
                 let timing = self.mjpegTiming(for: request)
                 let dimensions = (width: image.width, height: image.height)
-                if self.mjpegFormat?.width != dimensions.width ||
-                    self.mjpegFormat?.height != dimensions.height {
-                    self.mjpegFormat = dimensions
-                    self.visibleSourceRect = CGRect(
-                        x: 0, y: 0,
-                        width: dimensions.width, height: dimensions.height
-                    )
-                    DispatchQueue.main.async { [weak self] in
-                        self?.onFormat?(dimensions.width, dimensions.height)
-                        self?.onCodedFormat?(dimensions.width, dimensions.height)
-                        self?.onDebug?("Jumping Sumo MJPEG decoder ready: \(dimensions.width)x\(dimensions.height)")
+                let visibleRect = CGRect(
+                    x: 0, y: 0,
+                    width: dimensions.width, height: dimensions.height
+                )
+                self.mjpegDecodeLock.lock()
+                let formatChanged = self.mjpegFormat?.width != dimensions.width ||
+                    self.mjpegFormat?.height != dimensions.height
+                if formatChanged { self.mjpegFormat = dimensions }
+                self.mjpegDecodeLock.unlock()
+                if formatChanged {
+                    self.dispatchMJPEGMain(generation: request.generation) { view in
+                        view.onFormat?(dimensions.width, dimensions.height)
+                        view.onCodedFormat?(dimensions.width, dimensions.height)
+                        view.onDebug?("Jumping Sumo MJPEG decoder ready: \(dimensions.width)x\(dimensions.height)")
                     }
                 }
                 self.recordFrameRate(decoded: 1, displayed: 0)
                 self.processingPipeline.submit(DecodedVideoFrame(
                     image: .cgImage(image),
                     timing: timing,
-                    visibleRect: self.visibleSourceRect,
+                    visibleRect: visibleRect,
                     verifiedMotion: nil
                 ))
                 self.finishMJPEGDecode(request)
@@ -489,6 +524,20 @@ final class H264VideoView: NSView {
         if next == nil { mjpegDecodeInFlight = false }
         mjpegDecodeLock.unlock()
         if let next { decodeMJPEG(next) }
+    }
+
+    private func dispatchMJPEGMain(
+        generation: UInt64,
+        _ operation: @escaping (H264VideoView) -> Void
+    ) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.mjpegDecodeLock.lock()
+            let isCurrent = self.mjpegDecodeGeneration == generation
+            self.mjpegDecodeLock.unlock()
+            guard isCurrent else { return }
+            operation(self)
+        }
     }
 
     /// ARStream 1's fragment header exposes a frame counter, not the camera's
@@ -534,6 +583,15 @@ final class H264VideoView: NSView {
     func reset() {
         hardwareFallbackWorkItem?.cancel()
         hardwareFallbackWorkItem = nil
+        mjpegDecodeLock.lock()
+        mjpegDecodeGeneration &+= 1
+        pendingMJPEGFrame = nil
+        mjpegDecodeLock.unlock()
+        mjpegDecodeQueue.sync {}
+        mjpegDecodeLock.lock()
+        mjpegDecodeInFlight = false
+        mjpegFormat = nil
+        mjpegDecodeLock.unlock()
         if let decompressionSession {
             VTDecompressionSessionWaitForAsynchronousFrames(decompressionSession)
             VTDecompressionSessionInvalidate(decompressionSession)
@@ -569,12 +627,6 @@ final class H264VideoView: NSView {
         try? extensionDumpHandle?.close()
         extensionDumpHandle = nil
         dumpedExtensionAccessUnits = 0
-        mjpegDecodeLock.lock()
-        mjpegDecodeGeneration &+= 1
-        pendingMJPEGFrame = nil
-        mjpegDecodeInFlight = false
-        mjpegDecodeLock.unlock()
-        mjpegFormat = nil
         frameRateLock.lock()
         decodedFramesInWindow = 0
         displayedFramesInWindow = 0
@@ -693,6 +745,7 @@ final class H264VideoView: NSView {
         hardwareFallbackWorkItem?.cancel()
         hardwareFallbackWorkItem = nil
         if let decompressionSession {
+            VTDecompressionSessionWaitForAsynchronousFrames(decompressionSession)
             VTDecompressionSessionInvalidate(decompressionSession)
             self.decompressionSession = nil
         }
@@ -753,7 +806,8 @@ final class H264VideoView: NSView {
                     status: status,
                     imageBuffer: imageBuffer,
                     timing: context?.timing,
-                    motion: context?.motion
+                    motion: context?.motion,
+                    visibleRect: context?.visibleRect
                 )
             },
             decompressionOutputRefCon: Unmanaged.passUnretained(self).toOpaque()
@@ -786,6 +840,7 @@ final class H264VideoView: NSView {
             guard let self, !self.reportedFirstDecodedFrame, self.softwareDecoder == nil else { return }
             self.onDebug?("VideoToolbox produced no frame in 3 seconds; switching the 900p receiver to the recovery decoder")
             if let decompressionSession = self.decompressionSession {
+                VTDecompressionSessionWaitForAsynchronousFrames(decompressionSession)
                 VTDecompressionSessionInvalidate(decompressionSession)
                 self.decompressionSession = nil
             }
@@ -802,7 +857,11 @@ final class H264VideoView: NSView {
     ) {
         guard let decompressionSession else { return }
         let frameContext = Unmanaged.passRetained(
-            DecodedVideoFrameContext(timing: timing, motion: motion)
+            DecodedVideoFrameContext(
+                timing: timing,
+                motion: motion,
+                visibleRect: visibleSourceRect
+            )
         )
         var infoFlags = VTDecodeInfoFlags()
         let status = VTDecompressionSessionDecodeFrame(
@@ -822,7 +881,8 @@ final class H264VideoView: NSView {
         status: OSStatus,
         imageBuffer: CVImageBuffer?,
         timing: VideoFrameTiming?,
-        motion: VerifiedVideoFrameMotion?
+        motion: VerifiedVideoFrameMotion?,
+        visibleRect: CGRect?
     ) {
         guard status == noErr, let imageBuffer, let timing else {
             DispatchQueue.main.async { [weak self] in
@@ -834,7 +894,7 @@ final class H264VideoView: NSView {
         processingPipeline.submit(DecodedVideoFrame(
             image: .pixelBuffer(imageBuffer),
             timing: timing,
-            visibleRect: visibleSourceRect,
+            visibleRect: visibleRect,
             verifiedMotion: motion
         ))
     }
@@ -882,6 +942,12 @@ final class H264VideoView: NSView {
     private func ensureGeneratedDisplayTimer() {
         dispatchPrecondition(condition: .onQueue(.main))
         guard generatedDisplayTimer == nil else { return }
+        hardwareFrameLock.lock()
+        let hasPendingFrames = !pendingHardwareFrames.isEmpty
+        hardwareFrameLock.unlock()
+        // A queued callback from the stream being reset must not recreate a
+        // repeating display timer after reset has released its frame queue.
+        guard hasPendingFrames else { return }
         let timer = DispatchSource.makeTimerSource(queue: .main)
         timer.schedule(deadline: .now(), repeating: .milliseconds(22), leeway: .milliseconds(2))
         timer.setEventHandler { [weak self] in self?.deliverGeneratedHardwareFrame() }
@@ -947,6 +1013,14 @@ final class H264VideoView: NSView {
                 verifiedMotion: motion
             ))
         }
+    }
+
+    /// Main-queue metadata only; selecting a tracking target never converts the image.
+    var latestFrameSize: CGSize {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard let latestProcessedPixelBuffer else { return .zero }
+        return CGSize(width: CVPixelBufferGetWidth(latestProcessedPixelBuffer),
+                      height: CVPixelBufferGetHeight(latestProcessedPixelBuffer))
     }
 
     /// Returns the most recent processed output frame without the HUD overlay.
@@ -1124,6 +1198,36 @@ final class H264VideoView: NSView {
         return containsLegacyFrameInfoSEI(in: [matchingSEI]) &&
             !containsLegacyFrameInfoSEI(in: [wrongNALType]) &&
             !containsLegacyFrameInfoSEI(in: [Data([0x06, 0x01, 0x02])])
+    }
+
+    static func resetLifecycleSelfTest() -> Bool {
+        guard Thread.isMainThread else { return false }
+        var pixelBuffer: CVPixelBuffer?
+        guard CVPixelBufferCreate(
+            kCFAllocatorDefault, 2, 2, kCVPixelFormatType_32BGRA, nil, &pixelBuffer
+        ) == kCVReturnSuccess, let pixelBuffer else { return false }
+        let view = H264VideoView(frame: NSRect(x: 0, y: 0, width: 2, height: 2))
+        let timing = VideoFrameTiming(
+            rtpTimestamp: 0, presentationTime: .zero,
+            nominalDuration: CMTime(value: 3_000, timescale: 90_000)
+        )
+        for index in 0..<5 {
+            view.hardwareFrameLock.lock()
+            view.pendingHardwareFrames = [ProcessedVideoFrame(
+                pixelBuffer: pixelBuffer, timing: timing,
+                sequenceNumber: UInt64(index), processingLatencyMilliseconds: 0,
+                isSynthetic: false, targetFrameRate: 45
+            )]
+            view.hardwareFrameLock.unlock()
+            view.ensureGeneratedDisplayTimer()
+            guard view.generatedDisplayTimer != nil else { return false }
+            view.reset()
+            // Simulate a timer-install callback queued before reset.
+            view.ensureGeneratedDisplayTimer()
+            guard view.generatedDisplayTimer == nil,
+                  view.diagnosticSummary.contains("display-pending=0") else { return false }
+        }
+        return true
     }
 
     private func isRandomAccessNAL(_ nalu: Data) -> Bool {

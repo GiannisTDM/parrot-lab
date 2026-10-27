@@ -9,12 +9,18 @@ enum LabThemeMode {
 
 /// Short, user-triggered transitions only. Never animate telemetry or video frames.
 enum LabMotion {
-    static let workspaceDuration: TimeInterval = 0.38
+    static let workspaceDuration: TimeInterval = 0.26
+    private static let revealAnimationKey = "lab.reveal"
+    private static let workspaceFadeKey = "lab.workspace.fade"
+    private static let workspaceSettleKey = "lab.workspace.settle"
 
     static func duration(for view: NSView) -> TimeInterval {
-        guard view.window?.isVisible == true,
-              !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else { return 0 }
-        return 0.18
+        duration(isVisible: view.window?.isVisible == true && !view.isHiddenOrHasHiddenAncestor,
+                 reduceMotion: NSWorkspace.shared.accessibilityDisplayShouldReduceMotion)
+    }
+
+    private static func duration(isVisible: Bool, reduceMotion: Bool) -> TimeInterval {
+        isVisible && !reduceMotion ? 0.16 : 0
     }
 
     static func layout(in view: NSView, changes: () -> Void) {
@@ -31,16 +37,28 @@ enum LabMotion {
 
     static func reveal(_ view: NSView) {
         let interval = duration(for: view)
-        guard interval > 0, !view.isHidden else { return }
+        guard interval > 0 else {
+            cancelReveal(view)
+            return
+        }
         view.wantsLayer = true
         let animation = CABasicAnimation(keyPath: "opacity")
-        animation.fromValue = view.layer?.animation(forKey: "lab.reveal") != nil
+        animation.fromValue = view.layer?.animation(forKey: revealAnimationKey) != nil
             ? (view.layer?.presentation()?.opacity ?? 0) : 0
-        animation.toValue = 1
+        animation.toValue = view.layer?.opacity ?? 1
         animation.duration = interval
         animation.timingFunction = CAMediaTimingFunction(name: .easeOut)
         // The model remains fully visible, including after rapid repeated toggles.
-        view.layer?.add(animation, forKey: "lab.reveal")
+        view.layer?.add(animation, forKey: revealAnimationKey)
+    }
+
+    fileprivate static func cancelReveal(_ view: NSView) {
+        view.layer?.removeAnimation(forKey: revealAnimationKey)
+    }
+
+    private static func cancelWorkspaceTransition(_ view: NSView) {
+        view.layer?.removeAnimation(forKey: workspaceFadeKey)
+        view.layer?.removeAnimation(forKey: workspaceSettleKey)
     }
 
     /// Crossfade only interface chrome, never a captured or frozen video surface.
@@ -48,19 +66,23 @@ enum LabMotion {
     static func workspace(in root: NSView, chrome: [NSView], enteringGround: Bool,
                           changes: () -> Void) {
         guard duration(for: root) > 0 else {
+            // A new synchronous change must also stop an earlier transition,
+            // including when Reduce Motion was enabled during that transition.
+            chrome.forEach(cancelWorkspaceTransition)
             changes()
             root.layoutSubtreeIfNeeded()
             return
         }
         root.layoutSubtreeIfNeeded()
         let visibleChrome = chrome.filter { !$0.isHiddenOrHasHiddenAncestor }
+        chrome.filter { $0.isHiddenOrHasHiddenAncestor }.forEach(cancelWorkspaceTransition)
         for panel in visibleChrome {
             panel.wantsLayer = true
             let dissolve = CATransition()
             dissolve.type = .fade
             dissolve.duration = workspaceDuration
             dissolve.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-            panel.layer?.add(dissolve, forKey: "lab.workspace.fade")
+            panel.layer?.add(dissolve, forKey: workspaceFadeKey)
         }
         NSAnimationContext.runAnimationGroup { context in
             context.duration = workspaceDuration
@@ -72,13 +94,13 @@ enum LabMotion {
         for panel in visibleChrome {
             let settle = CABasicAnimation(keyPath: "transform.translation.y")
             let direction: CGFloat = enteringGround ? -1 : 1
-            settle.fromValue = panel.layer?.animation(forKey: "lab.workspace.settle") != nil
+            settle.fromValue = panel.layer?.animation(forKey: workspaceSettleKey) != nil
                 ? panel.layer?.presentation()?.value(forKeyPath: "transform.translation.y")
                 : direction * 5
             settle.toValue = 0
             settle.duration = workspaceDuration
             settle.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            panel.layer?.add(settle, forKey: "lab.workspace.settle")
+            panel.layer?.add(settle, forKey: workspaceSettleKey)
         }
     }
 
@@ -98,10 +120,44 @@ enum LabMotion {
         animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
         layer.add(animation, forKey: animationKey)
     }
+
+    /// No clock or visible window is required: verify final model state and
+    /// cleanup when an interrupted transition must become synchronous.
+    static func selfTest() -> Bool {
+        _ = NSApplication.shared
+        guard duration(isVisible: true, reduceMotion: false) == 0.16,
+              duration(isVisible: true, reduceMotion: true) == 0,
+              duration(isVisible: false, reduceMotion: false) == 0 else { return false }
+        let root = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
+        let panel = NSView(frame: root.bounds)
+        root.addSubview(panel)
+        panel.wantsLayer = true
+        guard let layer = panel.layer else { return false }
+        let animation = CABasicAnimation(keyPath: "opacity")
+        animation.fromValue = 0
+        animation.toValue = 1
+        animation.duration = 30
+        layer.add(animation, forKey: revealAnimationKey)
+        layer.add(animation, forKey: "unrelated")
+        reveal(panel)
+        guard layer.animation(forKey: revealAnimationKey) == nil,
+              layer.animation(forKey: "unrelated") != nil else { return false }
+        layer.add(animation, forKey: workspaceFadeKey)
+        layer.add(animation, forKey: workspaceSettleKey)
+        var changed = false
+        workspace(in: root, chrome: [panel], enteringGround: true) { changed = true }
+        guard changed, layer.animation(forKey: workspaceFadeKey) == nil,
+              layer.animation(forKey: workspaceSettleKey) == nil,
+              layer.animation(forKey: "unrelated") != nil else { return false }
+        layer.add(animation, forKey: "lab.theme.opacity")
+        theme(layer, key: "opacity", value: Float(0.8), in: panel)
+        guard layer.opacity == 0.8, layer.animation(forKey: "lab.theme.opacity") == nil else { return false }
+        return LabDisclosureButton.transitionSelfTest()
+    }
 }
 
 enum LabVisualStyle {
-    private static let airAccent = NSColor(srgbRed: 0.35, green: 0.76, blue: 1, alpha: 1)
+    private static let airAccent = NSColor(srgbRed: 0.30, green: 0.86, blue: 0.62, alpha: 1)
     private static let groundAccent = NSColor(srgbRed: 0.94, green: 0.64, blue: 0.39, alpha: 1)
     private(set) static var themeMode = LabThemeMode.air
 
@@ -113,13 +169,13 @@ enum LabVisualStyle {
         if themeMode == .miniDrone { return NSColor(srgbRed: 0.105, green: 0.088, blue: 0.14, alpha: 1) }
         return themeMode == .ground
             ? NSColor(srgbRed: 0.108, green: 0.094, blue: 0.082, alpha: 1)
-            : NSColor(srgbRed: 0.072, green: 0.087, blue: 0.108, alpha: 1)
+            : NSColor(srgbRed: 0.075, green: 0.085, blue: 0.09, alpha: 1)
     }
     static var raisedPanel: NSColor {
         if themeMode == .miniDrone { return NSColor(srgbRed: 0.15, green: 0.12, blue: 0.195, alpha: 1) }
         return themeMode == .ground
             ? NSColor(srgbRed: 0.15, green: 0.124, blue: 0.103, alpha: 1)
-            : NSColor(srgbRed: 0.095, green: 0.12, blue: 0.153, alpha: 1)
+            : NSColor(srgbRed: 0.11, green: 0.125, blue: 0.13, alpha: 1)
     }
     static let border = NSColor.white.withAlphaComponent(0.09)
     static let mutedText = NSColor.white.withAlphaComponent(0.59)
@@ -138,9 +194,9 @@ enum LabVisualStyle {
             ]
         }
         return [
-            NSColor(srgbRed: 0.025, green: 0.035, blue: 0.05, alpha: 1).cgColor,
-            NSColor(srgbRed: 0.045, green: 0.065, blue: 0.085, alpha: 1).cgColor,
-            NSColor(srgbRed: 0.025, green: 0.03, blue: 0.04, alpha: 1).cgColor
+            NSColor(srgbRed: 0.035, green: 0.045, blue: 0.05, alpha: 1).cgColor,
+            NSColor(srgbRed: 0.045, green: 0.055, blue: 0.06, alpha: 1).cgColor,
+            NSColor(srgbRed: 0.025, green: 0.035, blue: 0.04, alpha: 1).cgColor
         ]
     }
 
@@ -260,9 +316,32 @@ final class LabDisclosureButton: NSButton {
     private func refresh() {
         title = label
         image = NSImage(systemSymbolName: expanded ? "chevron.down" : "chevron.right", accessibilityDescription: nil)
-        contentViews.forEach { $0.isHidden = !expanded }
+        contentViews.forEach {
+            $0.isHidden = !expanded
+            if !expanded { LabMotion.cancelReveal($0) }
+        }
         setAccessibilityLabel(label)
         setAccessibilityValue(expanded ? "Expanded" : "Collapsed")
+    }
+
+    fileprivate static func transitionSelfTest() -> Bool {
+        let content = NSView()
+        content.wantsLayer = true
+        let button = LabDisclosureButton(title: "Camera options", views: [content])
+        guard !button.expanded, content.isHidden else { return false }
+        for _ in 0..<20 {
+            button.toggleDisclosure()
+            guard button.expanded, !content.isHidden else { return false }
+            let interruptedReveal = CABasicAnimation(keyPath: "opacity")
+            interruptedReveal.fromValue = 0
+            interruptedReveal.toValue = 1
+            interruptedReveal.duration = 30
+            content.layer?.add(interruptedReveal, forKey: "lab.reveal")
+            button.toggleDisclosure()
+            guard !button.expanded, content.isHidden,
+                  content.layer?.animation(forKey: "lab.reveal") == nil else { return false }
+        }
+        return true
     }
 }
 

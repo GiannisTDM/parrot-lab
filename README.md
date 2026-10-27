@@ -1,12 +1,31 @@
 # Parrot Lab for macOS
 
 Parrot Lab is a native macOS HUD and diagnostic client for the Parrot
-SkyController 2, Bebop Drone (BB1), Bebop 2, Jumping Sumo, and preliminary
-Bluetooth MiniDrone/Mambo control. It is intentionally built from
+SkyController 2, Bebop Drone (BB1), Bebop 2, Jumping Sumo, Mambo, and experimental
+ANAFI 4K / SkyController 3 network support. It is intentionally built from
 Apple system frameworks rather than Electron or an embedded browser.
 
-See [CHANGELOG.md](CHANGELOG.md) for the V1.6 release highlights and known
-limitations.
+See [CHANGELOG.md](CHANGELOG.md) for the V1.7 release highlights and known
+limitations, and [RELEASING.md](RELEASING.md) for packaging instructions.
+
+## New in 1.7
+
+- Mac-side Sumo subject following for people, legs, cats and manually selected
+  targets, with motion presets, target recovery and built-in sound controls.
+- Experimental ANAFI 4K workspace for video, camera modes, gimbal/zoom, SD
+  capture and Mac recording through Direct Wi-Fi or SC3 network routes.
+- Experimental SC3 Sumo relay/native viewer routes, video startup tools and
+  SC3 RF Lab with explicit preview/save and readback.
+- SC2 libmux session, discovery and video-channel support behind a raw USB
+  adapter boundary; the macOS accessory adapter still needs validation.
+- More reliable reconnects, input neutralization, recording/conversion
+  cancellation and bounded video cleanup, plus refined menus and settings.
+
+ANAFI and SC3 paths remain experimental. Flypad is currently unsupported.
+
+| Air workspace | Ground workspace |
+| --- | --- |
+| ![Parrot Lab Air workspace](docs/images/parrot-lab-air-mode.png) | ![Parrot Lab Ground workspace](docs/images/parrot-lab-ground-mode.png) |
 
 The cockpit keeps connection controls on the first toolbar row and video/media
 controls on the second. **Focus** hides the right inspector; **Inspector** brings
@@ -17,21 +36,24 @@ workspaces use blue and copper accents respectively.
 
 > [!WARNING]
 > **Development preview — not flight-ready.** The app now receives live video
-> through the established SC2 route, but direct production USB/libmux support is
-> not complete. Dragon Lab restarts the drone's flight process and must only be
+> through the established SC2 route. The 1.7 libmux session is implemented, but
+> its macOS AOA/iAP2 descriptor adapter still needs live hardware validation.
+> Dragon Lab restarts the drone's flight process and must only be
 > used while landed with the props removed. Do not rely on this build as a
 > flight display or as a replacement for FreeFlight.
 
-The intended production transport is the SC2 mobile link used by FreeFlight: Bebop 2 video and telemetry arrive at `mppd` over Wi-Fi and are forwarded to the mobile client through Parrot's USB `libmux` channels. Version 1.6 does not yet implement that USB video path.
+The intended production transport is the SC2 mobile link used by FreeFlight:
+BB1, BB2 or Sumo video and telemetry arrive at `mppd` over Wi-Fi and are
+forwarded through Parrot's USB `libmux` channels. Version 1.7 implements the
+mux handshake, product discovery, backend connection, ARNetwork transport and
+RTP channel routing behind a duplex descriptor boundary. Opening the raw
+AOA/iAP2 descriptor on macOS remains the platform-specific step.
 
-Version 1.6 provides:
+Parrot Lab also provides:
 
-- a preliminary **MiniDrone Mode** for direct Bluetooth Mambo-class drones,
-  with discovery, connection state, battery, flight commands, remappable
-  keyboard/macOS GameController input, and accessory-aware grabber/cannon
-  controls; Flypad is not supported and live hardware validation is still
-  required—see [MINIDRONE.md](MINIDRONE.md);
-
+- preliminary Bluetooth MiniDrone/Mambo control with discovery, battery/flight
+  telemetry, keyboard/gamepad input, and cannon/grabber accessory controls—see
+  [MINIDRONE.md](MINIDRONE.md);
 - a large **Ground Mode** switch with a brown ground-vehicle theme and a direct
   Jumping Sumo backend (`0x0902`, `_arsdk-0902._udp`);
 - native JumpingSumo speed/turn PCMD at 20 Hz with the same bounded keyboard
@@ -96,18 +118,24 @@ Version 1.6 provides:
   embedded in the application bundle;
 - an ad-hoc-signed, double-clickable Apple-silicon `.app` bundle.
 
-The program performs no RF/NVM writes and never edits
-`persist.dragon-prog.post_cmd`. Dragon Lab can explicitly stop and relaunch
-Dragon with runtime-only arguments after a landed-state check. Applying a
+Normal connection and video operation perform no RF/NVM writes. Optional device
+tools have their own explicit write/restore workflows; see the relevant tool
+documentation before using them. Dragon Lab never edits
+`persist.dragon-prog.post_cmd`; it can explicitly stop and relaunch Dragon with
+runtime-only arguments after a landed-state check. Applying a Dragon runtime
 profile is immediate and does not show an additional confirmation sheet.
 
 ## Requirements
 
 - macOS 13 or later on Apple silicon;
-- a Bebop Drone or Bebop 2, optionally associated with an SC2, or a Jumping Sumo for direct Ground Mode;
-- a network route from the Mac to `192.168.42.88`;
-- the project's explicitly enabled SC2 Telnet service on TCP 23;
-- Local Network access when macOS requests it.
+- a supported vehicle: Bebop/BB2, Jumping Sumo, Mambo, or experimental ANAFI 4K;
+- a network route appropriate to the selected mode: direct Bebop normally
+  `192.168.42.1`, direct Sumo `192.168.2.1`, or the controller's current address
+  (SC2 normally `192.168.42.88`, Apple-NCM commonly `192.168.53.1`);
+- SC2 Telnet on TCP 23 for its diagnostic and deployment tools; BLE MiniDrone
+  control uses Bluetooth instead—see [MINIDRONE.md](MINIDRONE.md);
+- Local Network or Bluetooth permission when macOS requests it. Experimental
+  routes have additional prerequisites in their linked guides.
 
 ## Current macOS release status
 
@@ -233,7 +261,7 @@ The encoder input is the same selected processed resolution shown by the live
 view. It uses a latest-frame-only pre-encoder slot, at most three submitted
 frames in flight, and a 16 MiB disk queue. If recording cannot keep up it drops
 or stops explicitly; it can never make the FPV display accumulate latency.
-The **Video → Archive Untouched Incoming H.264 (Developer)** option can
+The **Tools → Developer → Archive Original H.264** option can
 simultaneously create a separate `RawVideoBB2-…h264` diagnostic file. That raw
 archive preserves Dragon's original NAL units and SEI, but is not the normal
 user-facing recording.
@@ -325,7 +353,7 @@ recording remain latest-frame-only and bounded.
 
 ### Experimental temporal reconstruction
 
-For Jumping Sumo, enable **Video → Sumo · 720p + 30→45 FPS Optical Flow**.
+For Jumping Sumo, enable **Video → Sumo Motion Smoothing**.
 This works with either direct Wi-Fi or the SC2 JPEG restream. The ground preset
 uses image-only bidirectional motion estimation, a lighter history blend and
 photometric/occlusion rejection—no IMU or Bebop calibration. Settings controls
@@ -359,8 +387,7 @@ latest-frame-only; temporal work can reduce processed FPS but cannot add an
 unbounded FPV queue. Detailed developer video diagnostics show flow latency
 and whether history was used or reset.
 
-The optional **Image Enhancement → H.264 Artifact Repair · Color Blocks +
-Mosquito Noise** pass is independent of the heavier optical-flow feature. A
+The optional **Video → Image Enhancement → H.264 Artifact Repair** pass is independent of the heavier optical-flow feature. A
 Metal shader identifies locally coherent chroma blocks that disagree with
 several surrounding regions, including isolated decoder-green corruption. It
 also applies conservative edge-aware spatial cleanup and a single-frame,
@@ -416,7 +443,7 @@ falling back to direct Bebop Telnet at `192.168.42.1:23` only for bench use:
 /data/ftp/internal_000/parrotlab_dragon_video.sh
 ```
 
-Before first use, choose **Tools → Install/Update Dragon Lab on Bebop 2**. The
+Before first use, choose **Tools → Device Tools → Bebop 2 → Install / Update Dragon Lab…**. The
 app uploads these bundled files to the drone's writable `internal_000`
 directory through the stock anonymous FTP service at `192.168.42.1:21`:
 
@@ -469,8 +496,8 @@ Bebop Telnet must be running before the SC2 associates with the aircraft. The
 persistent Bebop Telnet tool makes that true on subsequent boots; for its
 one-time installation, manually enable Telnet before connecting the SC2.
 
-After installing a release containing this change, run **Tools →
-Install/Update Dragon Lab on Bebop 2** once to replace the older foreground
+After installing a release containing this change, run **Tools → Device Tools → Bebop 2 →
+Install / Update Dragon Lab…** once to replace the older foreground
 helper on the drone. Worker state is recorded in
 `/data/ftp/internal_000/parrotlab-dragon-video.state`; Dragon and worker output
 remain available in `/tmp/parrotlab-dragon-video.log` and
@@ -593,6 +620,11 @@ SkyController routes are mutually exclusive. For Jumping Sumo, use the large
 discovers `_arsdk-0902._udp`, and uses direct ARStream1 MJPEG rather than the
 Bebop H.264 path.
 
+When driving Sumo through an SC2, use either physical controller input or Parrot
+Lab keyboard/gamepad control at a time. Simultaneous PCMD streams can produce
+choppy movement. The matched SC2 Sumo patch and manual association steps remain
+in [experimental/jumping-sumo/README.md](experimental/jumping-sumo/README.md).
+
 After connecting a gamepad, sweep both sticks fully in every direction and
 release them to center once. The app learns each physical direction's maximum
 independently, so asymmetric stick travel can reach the selected limit. Learning
@@ -660,8 +692,10 @@ Sumo aliases are documented in the local `mppd.jpsumo.jsprofile.patch.txt` and
 native device behavior still needs testing on the connected controller.
 
 
-The **Start video** control uses the live-proven SC2 restream path available in
-the current lab setup. In standalone mode, ARDiscovery advertises the selected
+The **Start video** control prefers an attached SC2 libmux mobile link and feeds
+channel 4 RTP directly to the H.264 or JPEG receiver. Until the macOS USB
+descriptor is available, it retains the existing SC2 restream compatibility
+path. In standalone mode, ARDiscovery advertises the selected
 local RTP port and its adjacent ARStream2 control port to the drone, then sends
 `MediaStreaming.VideoEnable` instead of probing the SC2 restream service.
 
@@ -675,9 +709,9 @@ The app:
 
 The request/port assumptions came from a separate SC2 1.0.9 restream facility. Hardware testing established that this is not a working replacement for the FreeFlight USB-mobile session. FreeFlight uses `mppd`'s AOA/iAP2 `libmux` transport with dedicated command, stream-data and stream-control channels.
 
-Failure of this path does not affect SC2 control or the telemetry HUD. Direct
-USB role negotiation and the Parrot mux session still need to be implemented
-for a production controller-forwarded flight stream.
+Failure of the compatibility path does not affect SC2 control or telemetry.
+The libmux protocol session is hardware-independent and tested; macOS USB role
+negotiation and live AOA/iAP2 descriptor acquisition remain to be completed.
 
 ## Air and Ground tools (1.6)
 
@@ -689,6 +723,18 @@ automatically reused as the controller's install target. The explicitly named
 
 Ground tools include:
 
+- **Tools → Device Tools → Jumping Sumo → Startup Dragon** provides **Install B29
+  as Default…** and **Restore Original Dragon…**. Install uploads the supplied
+  prebuilt B29 and `parrotlab_sumo_dragon_swap.sh`, verifies their digests, and
+  makes B29 `/usr/bin/dragon-prog`. The original inode, permissions and owner are
+  retained at `/usr/bin/dragon-prog.parrotlab-original`. Restore puts the original
+  back and preserves B29 at `/usr/bin/B29`. A checksum record beside the backup
+  identifies both files; unknown backups, symlinks and changed executables are
+  refused. A hard link followed by an atomic rename keeps `dragon-prog` present
+  throughout either operation, including interrupted attempts. Root returns to
+  its original mount mode. Neither action kills a process, edits startup scripts
+  or reboots Sumo: restart Sumo yourself when ready. This changes the executable
+  used by subsequent boots. Keep the checksum record and original backup intact.
 - **Start Sumo 30 FPS Dragon (B29)**: uploads the supplied `start_sumo_b29.sh`
   to `/data/ftp/internal_000`, verifies it, makes it and the existing `B29`
   executable, and queues the launcher independently of Telnet. It does not
@@ -710,8 +756,9 @@ These Sumo tools ask for Sumo's own address (normally `192.168.2.1`). In the SC2
 route they open SC2 HOST:23 and run `exec /usr/bin/telnet <Sumo IP>` on SC2,
 matching the manual nested Telnet hop. SC2 handles downstream Telnet negotiation
 instead of forwarding raw negotiation through nc. They confirm a
-downstream shell before sending commands. Small scripts are transferred through
-the same tunnel in acknowledged chunks and MD5-verified before replacement, so
+downstream shell before sending commands. Scripts and the fixed B29 staging
+asset are transferred through the same tunnel in acknowledged chunks and
+MD5-verified before use, so
 the Mac does not need direct Sumo FTP access. Both devices need Telnet enabled.
 No controller firmware, persistent relay or routing setting is changed. The old
 2324 relay remains untouched because it targets Bebop's fixed IP. In direct mode,
@@ -719,6 +766,14 @@ the Mac still uses Sumo FTP:21 and Telnet:23. Keep the vehicle stationary during
 restarts. RF profiles are
 owner-tested, not regulatory-certified; use only where permitted. SC2's existing
 EPA2/PD16/MAXP80 profile is unchanged and controlled separately.
+
+`--self-test-sumo-swap` exercises the shipping helper using a temporary filesystem
+and mocked mount commands: install/restore cycles, inode/permission preservation,
+failed renames and retries, read-only/writable mount restoration, corrupt backups,
+unexpected files, symlinks, concurrent-operation locks and binary bridge uploads.
+No device is contacted. Live testing still needs to confirm Sumo's writable root
+and hard-link support, B29 startup/video after a manual reboot, and stock startup
+after restoring. A successful file replacement alone does not prove boot behavior.
 
 ## Why the app runs on the Mac
 
@@ -742,3 +797,209 @@ The drone should spend its resources on stabilization, encoding, networking, and
 - a strict landed-state interlock before any configuration write.
 
 Old Bebop camera options changed meaning across firmware generations. The future Video Lab must inspect the installed firmware and current `persist.dragon-prog.post_cmd` value before offering a preset.
+
+## ANAFI 4K
+
+Experimental ANAFI 4K Direct Wi-Fi and SkyController 3 network support is
+available from the **ANAFI 4K** toolbar button, with live preview, camera modes,
+SD capture, gimbal controls, and Mac recording. See [ANAFI.md](ANAFI.md) for
+connection prerequisites, the SC3 USB adapter boundary, and hardware validation.
+The preliminary **SC3 USB bridge** route now supports libmux commands and its
+native aircraft video proxy through a local USB/accessory byte adapter.
+
+### Menu layout
+
+Video groups image enhancement, MetalFX scaling and mode-specific motion processing.
+Video Processing Settings opens the advanced controls directly. Tools keeps input
+settings and mappings first, followed by calibration, connection and device tools;
+diagnostic recording options live under Developer. Local H.264-to-MP4 conversion is
+available under Tools in every vehicle mode. View → Focus View (⇧⌘F) toggles
+the camera inspector in Air, Ground and ANAFI. Full Screen keeps its standard ⌃⌘F
+shortcut. MiniDrone and ANAFI hide the Bebop/Sumo processing menu.
+
+`--self-test-ui` checks menu hierarchy, shortcuts, mode visibility, settings and
+interrupted transitions without connecting to a device. Local builds optionally
+accept `PARROTLAB_BUILD_ROOT=/absolute/path` to isolate compiler caches; the default
+remains the project’s `.build` directory.
+
+### Sumo through SC3 (experimental)
+
+**Tools → SkyController 3 RF Lab…** opens the native QCA6174 panel in any vehicle
+mode. It supports the already-rooted SC3 1.8.1 only, with explicit transport
+selection, real driver observations and five locally staged settings. Preview
+and typed APPLY are required to save; no automatic reboot/reload occurs. See
+[SC3-RF-LAB.md](SC3-RF-LAB.md) for validation boundaries and fixture UI captures.
+
+**SC3 native · experimental** uses the controller's existing native mobile
+state proxy and preserves its upstream Sumo session. Mac piloting is off;
+video uses the v2 raw-stream observer. **Tools → Device Tools → SkyController 3**
+can enable it at startup, restore controls-only startup, or show its status on
+the verified SC3 1.8.1/native v1c setup. Changes take effect on the next controller
+restart; the current session continues. Its mapping editor
+shows verified v1c defaults and prepares local drafts; native Apply is not yet
+available. See [SC3-SUMO-NATIVE.md](SC3-SUMO-NATIVE.md) for actual SC3 checks,
+remaining integration limits and the next bench checkpoint. Focused checks:
+`--self-test-sc3-sumo-native`.
+
+Ground mode also has an explicit **SC3 USB relay · experimental** route. It uses
+direct Sumo ARNetwork/ARStream-1 MJPEG through the separately started relay at
+TCP 44446 and its negotiated UDP port. Movement starts disabled; Wi-Fi
+association, relay deployment and native SC3 HID mapping are not automated or
+hardware-validated. See [SC3-SUMO.md](SC3-SUMO.md) for prerequisites, input safety,
+diagnostics and the live test checklist. Existing direct/SC2/ANAFI routes remain
+separate. Focused checks: `--self-test-sc3-sumo`.
+
+### Sumo subject-follow demo (Mac side)
+
+In Ground mode, start live video, then use **SUBJECT FOLLOW · DEMO**. Choose
+**Person**, **Person · legs / close**, or **Cat**, then **Track**. Click a visible
+subject to choose it directly, or drag around its visible part. A click that
+misses recognition keeps looking at that point; it cannot silently pick another
+subject elsewhere. macOS Vision selects
+a visible matching subject and tracks its image on the Mac. Legs mode uses visible
+lower-body joints and a lower-body rectangle fallback. With a floor-level view,
+only shoes/legs may be visible: **Draw target…** lets you draw around that
+visible region when automatic recognition cannot identify it. Selection labels
+the result as Target; it does not claim to classify an arbitrary selected region.
+The preview shows the box and confidence; the panel shows relative height and
+processing time. No downloaded model or drone-side tracking code is involved.
+
+Recognition and appearance matching use Apple's on-device Vision models and
+Core ML compute-device APIs. On macOS 14+, each inference request prefers an
+advertised Neural Engine device, then GPU/CPU; macOS 13 uses Vision's automatic
+selection. Unsupported explicit assignments retry once with automatic selection.
+This selects supported hardware, rather than claiming a measured speedup or that
+every optical-tracking operation can run on the Neural Engine. Hover the tracking
+status or copy Developer connection diagnostics to inspect the requested device.
+
+Healthy tracking now gets periodic semantic checks (about 2.5 per second), so a
+manual selection containing bedding/background can be refined around the cat.
+The held size is translated when that box representation changes, preventing a
+refinement alone from causing a distance correction. A first appearance anchor
+and up to three verified recent views help rank recovery candidates. Search can
+consider a wider area and the last observed velocity; those predictions never
+generate movement commands. Gallery entries contain embeddings, not retained
+video frames, and are cleared with the session. Missed class labels alone do not
+discard a good optical/appearance track: dark or partial views may be unrecognized.
+On macOS 14+, optional foreground instance masking can remove background from
+appearance crops. Ambiguous, merged or unavailable masks fall back to the
+original crop. The gallery keeps paired descriptors and compares matching
+representations only. This is an appearance aid, not individual cat recognition.
+First model startup can exceed the frame budget; stale results remain neutral
+and preserve the last good optical model rather than issuing a late command.
+
+Stand at the desired following distance, then click **Follow**. Selection and
+**Track** never arm movement; beginning a new click/drag immediately disarms
+Follow. The app
+sends ordinary repeating ARSDK Sumo PCMD through the current direct/SC2 session.
+It continuously steers toward the box center, approaches when its height shrinks,
+and reverses when it grows, holding the height captured by that single Follow click.
+Choose **Gentle**, **Responsive** or **Cinematic** for motion presets. Existing
+saved tuning is preserved; manual adjustments show **Custom**. Presets retain
+the target-memory interval and desired subject size. Expand **Advanced** for separate turning response/limit and distance
+response/drive limit, acceleration smoothness, target memory, and relative subject
+size. Settings are remembered separately for each subject mode. Larger subject size
+means a closer following distance. Defaults soften turning to reduce camera blur:
+Person/Legs limits are ±30% drive / ±24% turn; Cat defaults are ±15% / ±20%.
+Person/Legs can be tuned up to ±40% / ±50%; Cat is limited to ±20% / ±30%.
+The main drive-speed slider further limits both directions. Processing runs at up
+to 20 Vision updates per second with one job/frame at a time and no frame backlog.
+It slows forward drive while turning and stops forward drive for large heading
+errors. Reverse remains available when the subject is off-center. A reverse
+request immediately cancels any remaining forward ramp, then eases into reverse
+within the selected drive limit.
+An image sharpness monitor reduces turning when detail drops and restores it
+gradually as the image clears. Size filtering keeps steering tied to the current
+observed center while pausing distance control for cropped views, abrupt size
+changes and pose changes. Sustained shape changes are rebased rather than
+immediately chased; that calibration survives a brief recovery pause.
+Retreat uses a more immediate size measurement, with a smaller reverse deadband.
+Several fresh, consistent increases in both width and height can anticipate
+approach by up to 0.2 seconds, adding at most 20% to the measured size. This
+anticipation is reverse-only, resets on pose/representation changes or recovery,
+and never runs on missing/stale observations. After an established approach,
+edge contact may still allow bounded reverse from the current visible size;
+uncertain cropping cannot authorize forward motion.
+Box size is a relative distance cue, not a range sensor.
+
+**Stop following**, **Stop tracking**, Escape, Mac keyboard/gamepad input,
+opening another window, app deactivation, video loss and disconnect stop the
+automatic commands. Commands also expire on the ARSDK queue about half a second
+after their source frame, even if the UI or detector stalls. A brief uncertain frame
+immediately pauses movement while Follow remains armed. Target memory (default
+1.5 seconds, adjustable 0–3) attempts recovery near the last good target; it never
+commands predicted movement during missing frames. Ambiguous or distant candidates
+are rejected. Recovery requires at least three consistent fresh matches over
+120 ms before movement can resume. Provisional matches do not extend the memory
+deadline. Recovery resumes with a fresh acceleration ramp and the same size
+reference. The sidebar and camera badge show Tracking, Following, Recovering or
+Lost. Expired memory stops tracking; Track or a new selection is required to start
+again. Zero memory stops on the first unrecovered miss. Camera health and slow
+Vision requests have separate watchdogs.
+
+This remains a demonstration, with no obstacle avoidance or reliable individual
+identity recognition. The box is a Mac overlay and is not
+burned into recordings. First verify steering direction, stop behavior and loss
+of target with the wheels clear of the ground, then use a clear supervised area.
+Actual partial-body/cat recognition, reacquisition quality, SC2 physical-stick
+arbitration, RF latency and following behavior still require live-device testing.
+
+**Sumo sounds** exposes its documented built-in Default/Robot/Insect/Monster
+personalities and speaker volume, with telemetry confirmation. The original
+Jumping Sumo SDK does not expose custom voice-clip upload/playback; these controls
+do not implement that. See [Parrot's public AudioSettings definitions](https://github.com/Parrot-Developers/arsdk-xml/blob/d8a86c226384ca33452b48787ea6a94ca5d45934/xml/jpsumo.xml).
+
+`--self-test-sumo-follow` checks mode-specific limits, acceleration, tuning persistence,
+relative-size control, selection geometry, recovery deadlines, the field-editor
+regression, command expiry and stale sessions. It also exercises person/pose/cat
+and manual tracking requests using a generated blank frame (not a recognition
+accuracy test). `--self-test-sumo-audio` checks packet fixtures, reliable transport,
+and sound-control state. Full self-tests include the deterministic checks.
+Neither test commands hardware.
+
+The follow checks also cover bounded appearance memory, pose-tolerant optical
+continuation, strict/ambiguous recovery matching, descriptor-unavailable fallback,
+and size rebasing. Generated image fixtures exercise actual feature-print inference.
+They also cover blur/noise, pose changes, recovery confirmation, foreground-mask
+selection/compositing, paired descriptors, preset migration, click/drag coordinates
+and immediate neutralization at the start of selection.
+Reverse regressions cover braking an existing forward command, off-center retreat,
+consistent approach versus a single size jump/jitter, near-full-frame sizes,
+reverse-only clipped measurements, and clearing approach history on pose,
+representation, timing or recovery changes.
+`--self-test-sumo-compute` lists the selected devices and checks supported-device
+assignment/fallback. Appearance thresholds are heuristics, not proof of individual
+cat identity; live motion, lighting changes and occlusions still need validation.
+
+Live checks: start with wheels raised; verify left/right steering, forward/reverse
+size correction, immediate Escape/manual override, and no movement on a missing
+target. Briefly obscure the target: movement should stop, then resume within the
+memory interval only on a matching nearby target. Obscure it longer: Follow must
+disarm. Try a legs-only view and a cat, using manual selection if needed. Tune
+turning limit/response down and smoothness up if camera blur causes repeated losses.
+Verify sound volume/personality confirmation, then disconnect/reconnect: controls
+must show waiting until the new session reports its own settings.
+
+Additional live checks for tracking polish:
+
+- Click a cat/person, then drag another selection while following. Motion must
+  stop on mouse-down, and the new target must remain stationary until **Follow**.
+  Clicking empty space must not select an unrelated subject.
+- Try each preset, then change an Advanced slider: it should show **Custom**.
+  Restart the app and confirm per-mode tuning, size and memory survive.
+- Move the subject sideways in dim light. Turning should ease while blurred,
+  then return gradually; configured turn/drive caps must still hold.
+- Crouch or briefly crop the subject. Forward/reverse must pause rather than
+  jump from a pose change. A confirmed approaching target may still trigger
+  bounded retreat as it reaches an image edge. Return a crouched target after a short occlusion: there must be no surge
+  caused solely by recovery forgetting the previous size calibration.
+- Obscure the target briefly: expect **Recovering**, neutral controls and no
+  resumption from a single glimpse. Past the memory deadline expect **Lost**
+  and no automatic restart. Disconnect or press Escape during a selection and
+  verify releasing the mouse cannot revive the old target or arm movement.
+- Walk slowly towards the camera while following, then approach from one side.
+  Expect earlier negative SPEED commands, including near the image edge, within
+  the configured drive limit. Reversing from forward motion must never retain a
+  positive SPEED command after reverse is requested. Stop approaching: a steady
+  held-size target must settle without continued anticipatory retreat. Losing
+  the target must still neutralize movement immediately.

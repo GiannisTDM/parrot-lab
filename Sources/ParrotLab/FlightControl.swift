@@ -315,6 +315,17 @@ struct FlightControlConfiguration: Equatable, Codable {
         UserDefaults.standard.set(data, forKey: Self.defaultsKey)
     }
 
+    /// Keep one action per physical key, matching button and stick remapping.
+    mutating func bindKeyboardKey(_ keyCode: UInt16, to action: FlightControlAction) {
+        if keyCode != UInt16.max {
+            for existingAction in FlightControlAction.allCases
+                where existingAction != action && keyboardKeys[existingAction] == keyCode {
+                keyboardKeys[existingAction] = UInt16.max
+            }
+        }
+        keyboardKeys[action] = keyCode
+    }
+
     /// A physical button may trigger only one discrete action. Rebinding it
     /// moves the button instead of leaving two commands on the same press.
     mutating func bindControllerButton(_ button: FlightControllerButton, to action: FlightControlAction) {
@@ -380,24 +391,55 @@ struct FlightControlConfiguration: Equatable, Codable {
     }
 }
 
+/// A conservative admission rule for the unverified SC3 relay trial only.
+/// GameController names/categories are identification hints, not evidence that
+/// the SC3's physical HID layout has been verified. Generic HID is excluded.
+enum FlightGameControllerAdmission {
+    static func allows(vendorName: String?, productCategory: String, restricted: Bool) -> Bool {
+        guard restricted else { return true }
+        func compact(_ value: String) -> String {
+            value.lowercased().filter { $0.isLetter || $0.isNumber }
+        }
+        let vendor = compact(vendorName ?? "")
+        let category = compact(productCategory)
+        let identity = vendor + category
+        guard !["parrot", "skycontroller", "sc3"].contains(where: identity.contains) else { return false }
+        let knownCategories = [GCProductCategoryXboxOne, GCProductCategoryDualShock4, GCProductCategoryDualSense]
+        if knownCategories.contains(productCategory) { return true }
+        return ["xbox", "microsoft", "dualsense", "dualshock", "playstation", "sony", "nintendo",
+                "gulikit", "8bitdo", "steelseries", "gamesir", "logitech", "razer", "powera",
+                "backbone", "nacon", "hori"].contains(where: vendor.contains)
+    }
+}
+
 /// App-focused keyboard and native macOS GameController input. Xbox, PlayStation
 /// and MFi pads use Apple's GameController framework; macOS does not expose XInput.
 final class FlightInputManager {
     var onPilotingInput: ((BebopPilotingInput) -> Void)?
     var onAction: ((FlightControlAction) -> Void)?
     var onStatus: ((String) -> Void)?
+    /// Focus/input loss is distinct from an ordinary neutral command. A relay
+    /// session can disarm here without recursively reacting to neutralize().
+    var onControlLoss: (() -> Void)?
 
     private(set) var configuration = FlightControlConfiguration.load()
+    private(set) var requiresVerifiedExternalGameController = false
+    private let inputSourcesInstalled: Bool
     private var localEventMonitor: Any?
     private var controllerObservers: [NSObjectProtocol] = []
     private var pressedKeys = Set<UInt16>()
     private var pressedControllerActions = Set<FlightControlAction>()
     private var controllerInput = BebopPilotingInput.neutral
+    private var lastEmittedInput = BebopPilotingInput.neutral
     private var controlsAreAvailable = false
     private var groundMode = false
     private var stickRanges: [ObjectIdentifier: ControllerStickRanges] = [:]
 
-    init() {
+    init(installInputSources: Bool = true) {
+        inputSourcesInstalled = installInputSources
+        // Deterministic self-tests exercise policy/state without registering
+        // event monitors or starting wireless controller discovery.
+        guard installInputSources else { return }
         localEventMonitor = NSEvent.addLocalMonitorForEvents(
             matching: [.keyDown, .keyUp, .flagsChanged]
         ) { [weak self] event in
@@ -418,20 +460,18 @@ final class FlightInputManager {
                let gamepad = controller.extendedGamepad {
                 self?.stickRanges.removeValue(forKey: ObjectIdentifier(gamepad))
             }
-            self?.controllerInput = .neutral
-            self?.pressedControllerActions.removeAll()
-            self?.emitCombinedInput()
+            self?.handleControlLoss()
             self?.reportControllerStatus()
         })
         controllerObservers.append(center.addObserver(
             forName: NSApplication.didResignActiveNotification, object: nil, queue: .main
-        ) { [weak self] _ in self?.neutralize() })
+        ) { [weak self] _ in self?.handleControlLoss() })
         controllerObservers.append(center.addObserver(
             forName: NSWindow.didResignKeyNotification, object: nil, queue: .main
         ) { [weak self] note in
             guard let window = note.object as? NSWindow,
                   window.contentViewController is MainViewController else { return }
-            self?.neutralize()
+            self?.handleControlLoss()
         })
         GCController.controllers().forEach(configure)
         GCController.startWirelessControllerDiscovery(completionHandler: nil)
@@ -440,14 +480,14 @@ final class FlightInputManager {
     deinit {
         if let localEventMonitor { NSEvent.removeMonitor(localEventMonitor) }
         controllerObservers.forEach(NotificationCenter.default.removeObserver)
-        GCController.stopWirelessControllerDiscovery()
+        if inputSourcesInstalled { GCController.stopWirelessControllerDiscovery() }
     }
 
     func apply(_ configuration: FlightControlConfiguration) {
         neutralize()
         self.configuration = configuration
         configuration.save()
-        GCController.controllers().forEach(configure)
+        if inputSourcesInstalled { GCController.controllers().forEach(configure) }
         emitCombinedInput()
         reportControllerStatus()
     }
@@ -464,6 +504,14 @@ final class FlightInputManager {
         reportControllerStatus()
     }
 
+    func setRequiresVerifiedExternalGameController(_ required: Bool) {
+        guard requiresVerifiedExternalGameController != required else { return }
+        neutralize()
+        requiresVerifiedExternalGameController = required
+        if inputSourcesInstalled { GCController.controllers().forEach(configure) }
+        reportControllerStatus()
+    }
+
     func reemitInput() {
         emitCombinedInput()
     }
@@ -473,13 +521,68 @@ final class FlightInputManager {
         pressedKeys.removeAll()
         controllerInput = .neutral
         pressedControllerActions.removeAll()
+        lastEmittedInput = .neutral
         onPilotingInput?(.neutral)
+    }
+
+    private func handleControlLoss() {
+        neutralize()
+        onControlLoss?()
+    }
+
+    var diagnosticSummary: String {
+        let value = lastEmittedInput
+        return "input available=\(controlsAreAvailable) axes=\(value.roll),\(value.pitch),\(value.yaw),\(value.gaz) " +
+            "keys=\(pressedKeys.count) buttons=\(pressedControllerActions.count) " +
+            "external-gamepads-only=\(requiresVerifiedExternalGameController)"
+    }
+    var hasNeutralOutput: Bool { lastEmittedInput == .neutral }
+
+    /// Availability forces output to zero, so output alone cannot prove a
+    /// held stick/button was released before explicitly arming the relay.
+    /// These are existing GameController snapshots; no discovery is started.
+    var hasNeutralInputsForArming: Bool {
+        guard hasNeutralOutput,
+              !configuration.keyboardEnabled || pressedKeys.isEmpty,
+              !configuration.controllerEnabled || (controllerInput == .neutral && pressedControllerActions.isEmpty) else { return false }
+        if configuration.keyboardEnabled, inputSourcesInstalled,
+           !Self.boundKeysReleasedForArming(Array(configuration.keyboardKeys.values), isDown: {
+               CGEventSource.keyState(.combinedSessionState, key: CGKeyCode($0))
+           }) { return false }
+        guard configuration.controllerEnabled, inputSourcesInstalled else { return true }
+        let directions = Set(configuration.controllerAxisDirections.filter { $0.key.isContinuousAxis }.map(\.value))
+        let buttons = Set(configuration.controllerButtons.filter { !$0.key.isContinuousAxis }.map(\.value))
+        let deadzone = Float(configuration.controllerDeadzone)
+        return GCController.controllers().filter(accepts).allSatisfy { controller in
+            guard let gamepad = controller.extendedGamepad else { return true }
+            let rawAxes = [gamepad.leftThumbstick.xAxis.value, gamepad.leftThumbstick.yAxis.value,
+                           gamepad.rightThumbstick.xAxis.value, gamepad.rightThumbstick.yAxis.value]
+            guard rawAxes.allSatisfy(\.isFinite) else { return false }
+            return Self.inputsAreNeutralForArming(keysHeld: false,
+                axisMagnitudes: directions.map { $0.magnitude(on: gamepad) },
+                buttonsHeld: buttons.contains { isPressed($0, on: gamepad) }, deadzone: deadzone)
+        }
+    }
+
+    static func inputsAreNeutralForArming(keysHeld: Bool, axisMagnitudes: [Float], buttonsHeld: Bool, deadzone: Float) -> Bool {
+        !keysHeld && !buttonsHeld && deadzone.isFinite && (0..<1).contains(deadzone) &&
+            axisMagnitudes.allSatisfy { $0.isFinite && (0...deadzone).contains($0) }
+    }
+
+    static func boundKeysReleasedForArming(_ bindings: [UInt16], isDown: (UInt16) -> Bool) -> Bool {
+        var keys = Set(bindings.filter { $0 != UInt16.max })
+        // Keyboard events intentionally share the two Shift safety keys.
+        if keys.contains(56) || keys.contains(60) { keys.formUnion([56, 60]) }
+        return !keys.contains(where: isDown)
     }
 
     private func handleKeyboard(_ event: NSEvent) {
         guard configuration.keyboardEnabled else { return }
         guard isMainFlightWindowActive, !isEditingText else {
-            pressedKeys.removeAll()
+            if !pressedKeys.isEmpty {
+                pressedKeys.removeAll()
+                emitCombinedInput()
+            }
             return
         }
         let code = event.keyCode
@@ -539,14 +642,22 @@ final class FlightInputManager {
             reportControllerStatus()
             return
         }
-        gamepad.valueChangedHandler = { [weak self, weak gamepad] _, _ in
-            guard let self, let gamepad else { return }
-            self.read(gamepad)
+        gamepad.valueChangedHandler = { [weak self, weak controller, weak gamepad] _, _ in
+            guard let self, let controller, let gamepad else { return }
+            self.read(gamepad, controller: controller)
         }
         reportControllerStatus()
     }
 
-    private func read(_ gamepad: GCExtendedGamepad) {
+    private func accepts(_ controller: GCController) -> Bool {
+        FlightGameControllerAdmission.allows(vendorName: controller.vendorName,
+            productCategory: controller.productCategory, restricted: requiresVerifiedExternalGameController)
+    }
+
+    private func read(_ gamepad: GCExtendedGamepad, controller: GCController) {
+        // An excluded native HID must neither drive nor clear an accepted
+        // external gamepad's current input when it produces an event.
+        guard accepts(controller) else { return }
         guard configuration.controllerEnabled, isMainFlightWindowActive else {
             stickRanges[ObjectIdentifier(gamepad)]?.cancelGesture()
             controllerInput = .neutral
@@ -625,6 +736,7 @@ final class FlightInputManager {
 
     private func emitCombinedInput() {
         guard controlsAreAvailable else {
+            lastEmittedInput = .neutral
             onPilotingInput?(.neutral)
             return
         }
@@ -632,17 +744,69 @@ final class FlightInputManager {
         func combine(_ first: Int8, _ second: Int8) -> Int8 {
             Int8(clamping: Int(first) + Int(second))
         }
-        onPilotingInput?(BebopPilotingInput(
+        let combined = BebopPilotingInput(
             roll: combine(keyboard.roll, controllerInput.roll),
             pitch: combine(keyboard.pitch, controllerInput.pitch),
             yaw: combine(keyboard.yaw, controllerInput.yaw),
             gaz: combine(keyboard.gaz, controllerInput.gaz)
-        ))
+        )
+        lastEmittedInput = combined
+        onPilotingInput?(combined)
     }
 
     private func reportControllerStatus() {
-        let connected = GCController.controllers().filter { $0.extendedGamepad != nil }.count
+        let controllers = inputSourcesInstalled ? GCController.controllers().filter { $0.extendedGamepad != nil } : []
+        let connected = controllers.filter(accepts).count
         let state = controlsAreAvailable ? "READY" : "WAITING FOR ARSDK"
-        onStatus?("\(state) · \(connected) GAMEPAD\(connected == 1 ? "" : "S")")
+        let restriction = requiresVerifiedExternalGameController ? " · SC3 HID UNVERIFIED · \(controllers.count - connected) EXCLUDED" : ""
+        onStatus?("\(state) · \(connected) GAMEPAD\(connected == 1 ? "" : "S")\(restriction)")
+    }
+
+    static func relayInputSafetySelfTest() -> Bool {
+        let manager = FlightInputManager(installInputSources: false)
+        var emitted = [BebopPilotingInput]()
+        var losses = 0
+        var neutralAtLoss = false
+        manager.onPilotingInput = { emitted.append($0) }
+        manager.onControlLoss = { [weak manager] in
+            guard let manager else { return }
+            losses += 1
+            neutralAtLoss = manager.hasNeutralOutput && manager.pressedKeys.isEmpty &&
+                manager.pressedControllerActions.isEmpty && manager.controllerInput == .neutral
+        }
+        defer { manager.onControlLoss = nil }
+        guard !manager.requiresVerifiedExternalGameController else { return false }
+        manager.pressedKeys = [49]
+        manager.pressedControllerActions = [.highJump]
+        manager.controllerInput = BebopPilotingInput(roll: 25, pitch: 30, yaw: 0, gaz: 0)
+        manager.lastEmittedInput = manager.controllerInput
+        manager.setRequiresVerifiedExternalGameController(true)
+        guard manager.requiresVerifiedExternalGameController, manager.hasNeutralOutput,
+              manager.controllerInput == .neutral, manager.pressedKeys.isEmpty,
+              manager.pressedControllerActions.isEmpty, emitted == [.neutral], losses == 0 else { return false }
+        manager.setRequiresVerifiedExternalGameController(true)
+        guard emitted.count == 1 else { return false }
+        manager.pressedKeys = [56]
+        manager.pressedControllerActions = [.longJump]
+        manager.controllerInput = BebopPilotingInput(roll: 0, pitch: -30, yaw: 0, gaz: 0)
+        manager.lastEmittedInput = manager.controllerInput
+        manager.handleControlLoss()
+        guard losses == 1, neutralAtLoss, emitted == [.neutral, .neutral] else { return false }
+        manager.neutralize()
+        manager.setRequiresVerifiedExternalGameController(false)
+        manager.onControlLoss = nil
+        guard losses == 1, !manager.requiresVerifiedExternalGameController, manager.hasNeutralOutput,
+              manager.hasNeutralInputsForArming else { return false }
+        manager.configuration.keyboardEnabled = true
+        manager.pressedKeys = [56, 13]
+        // The emitted output is neutral while unavailable, but Shift+W is
+        // still held and must not become movement after arming.
+        guard manager.hasNeutralOutput, !manager.hasNeutralInputsForArming else { return false }
+        manager.pressedKeys.removeAll()
+        manager.configuration.controllerEnabled = true
+        manager.pressedControllerActions = [.highJump]
+        guard manager.hasNeutralOutput, !manager.hasNeutralInputsForArming else { return false }
+        manager.pressedControllerActions.removeAll()
+        return manager.hasNeutralInputsForArming
     }
 }

@@ -7,7 +7,8 @@ enum MiniDroneSelfTest {
             ("encoding", encoding), ("BLE adapter lifecycle", MiniDroneBLEClient.offlineSelfTest),
             ("control mappings", mappings), ("reliable retry", retry), ("backpressure and FIFO", backpressure),
             ("emergency priority", emergency), ("notifications and sequences", notifications),
-            ("telemetry and accessories", telemetry), ("subscription and reconnect reset", reset)
+            ("telemetry and accessories", telemetry), ("flight-state flow and malformed packets", stateFlow),
+            ("subscription and reconnect reset", reset)
         ]
         for (name, test) in tests where !test() {
             fputs("MiniDrone self-test failed: \(name)\n", stderr)
@@ -111,11 +112,13 @@ enum MiniDroneSelfTest {
               link.receive(Data([4, 255]) + battery, on: .state) == battery,
               link.receive(Data([4, 0]) + battery, on: .state) == battery,
               link.receive(Data([2, 0]) + battery, on: .telemetry) == battery,
+              link.receive(Data([3, 1]) + battery, on: .state) == battery,
+              link.receive(Data([4, 1]) + battery, on: .telemetry) == battery,
               link.receive(Data([1, 1, 0]), on: .state) == nil else { return false }
         link.tick(now: 0, pcmd: nil) { sent.append($0); return true }
-        guard sent.count == 5, sent.allSatisfy({ $0.channel == .acknowledge }),
+        guard sent.count == 6, sent.allSatisfy({ $0.channel == .acknowledge }),
               sent[0].data == Data([1, 1, 254]), sent[1].data == Data([1, 2, 254]),
-              sent[4].data == Data([1, 5, 0]) else { return false }
+              sent[4].data == Data([1, 5, 0]), sent[5].data == Data([1, 6, 1]) else { return false }
         // Every command channel wraps independently; a late ACK cannot pop a new command.
         link = MiniDroneLink()
         for index in 1...257 {
@@ -140,25 +143,65 @@ enum MiniDroneSelfTest {
         guard state.battery == 63, state.flightState == .flying else { return false }
         state.consume(Data([2, 3, 1, 0, 255, 0, 0, 0]))
         guard state.flightState == nil else { return false }
-        state.consume(Data([2, 15, 1, 0, 37, 0, 0, 0, 0, 1]))
-        state.consume(Data([2, 15, 1, 0, 38, 2, 0, 0, 0, 2]))
-        state.consume(Data([2, 15, 2, 0, 93, 0, 0, 0, 0, 3]))
+        state.consume(Data([2, 16, 1, 0, 37, 0, 0, 0, 0, 1]))
+        state.consume(Data([2, 16, 1, 0, 38, 2, 0, 0, 0, 2]))
+        state.consume(Data([2, 16, 2, 0, 93, 0, 0, 0, 0, 3]))
         guard state.canUseGrabber(37), state.canUseGrabber(38), state.canFireCannon(93),
               !state.canFireCannon(37) else { return false }
-        state.consume(Data([2, 15, 2, 0, 93, 1, 0, 0, 0, 0]))
-        state.consume(Data([2, 15, 1, 0, 37, 1, 0, 0, 0, 0]))
+        state.consume(Data([2, 16, 2, 0, 93, 1, 0, 0, 0, 0]))
+        state.consume(Data([2, 16, 1, 0, 37, 1, 0, 0, 0, 0]))
         guard !state.canFireCannon(93), !state.canUseGrabber(37) else { return false }
-        state.consume(Data([2, 15, 1, 0, 37, 0, 0, 0, 0, 8]))
+        state.consume(Data([2, 16, 1, 0, 37, 0, 0, 0, 0, 8]))
         guard state.grabbers[37] == nil, state.grabbers.count == 1 else { return false }
-        state.consume(Data([2, 15, 1, 0, 0, 0, 0, 0, 0, 4]))
-        state.consume(Data([2, 15, 2, 0, 19, 99, 0, 0, 0, 3]))
+        state.consume(Data([2, 16, 1, 0, 0, 0, 0, 0, 0, 4]))
+        state.consume(Data([2, 16, 2, 0, 19, 99, 0, 0, 0, 3]))
         guard state.grabbers.isEmpty, state.cannons.count == 1, !state.canFireCannon(19) else { return false }
-        state.consume(Data([2, 15, 2, 0, 21, 0, 3]))
+        state.consume(Data([2, 16, 2, 0, 21, 0, 3]))
         guard state.canFireCannon(21) else { return false }
         for length in Array(0..<7) + [8, 9] {
-            state.consume(Data([2, 15, 2, 0, 99, 0, 0, 0, 0, 3].prefix(length)))
+            state.consume(Data([2, 16, 2, 0, 99, 0, 0, 0, 0, 3].prefix(length)))
         }
         return state.cannons[99] == nil && state.cannons.count == 1 && state.canFireCannon(21)
+    }
+
+    private static func stateFlow() -> Bool {
+        var link = MiniDroneLink()
+        var telemetry = MiniDroneTelemetry()
+        let steps: [(MiniDroneChannel, UInt8, MiniDroneFlyingState)] = [
+            (.state, 254, .landed), (.telemetry, 254, .takingOff),
+            (.state, 255, .hovering), (.telemetry, 255, .flying),
+            (.state, 0, .landing), (.telemetry, 0, .landed)
+        ]
+        for (channel, sequence, expected) in steps {
+            let payload = Data([2, 3, 1, 0]) + Data(MiniDroneCommand.le32(expected.rawValue))
+            guard let decoded = link.receive(Data([4, sequence]) + payload, on: channel) else { return false }
+            telemetry.consume(decoded)
+            guard telemetry.flightState == expected else { return false }
+            guard link.receive(Data([4, sequence]) + payload, on: channel) == nil,
+                  telemetry.flightState == expected else { return false }
+        }
+        // Reliable retransmits on either notification characteristic need an
+        // ACK even when their event must not be applied a second time.
+        var acknowledgements: [MiniDroneLink.Write] = []
+        link.tick(now: 0, pcmd: nil) { acknowledgements.append($0); return true }
+        guard acknowledgements.count == 12,
+              acknowledgements.allSatisfy({ $0.channel == .acknowledge }),
+              link.duplicateNotifications == 6 else { return false }
+
+        let before = telemetry.flightState
+        for channel in [MiniDroneChannel.state, .telemetry] {
+            for truncated in [Data(), Data([4]), Data([4, 1, 2, 3, 1]), Data(repeating: 0, count: 21)] {
+                guard link.receive(truncated, on: channel) == nil else { return false }
+            }
+            guard let truncatedCommand = link.receive(Data([4, 1, 2, 3, 1, 0]), on: channel) else { return false }
+            telemetry.consume(truncatedCommand)
+        }
+        guard telemetry.flightState == before, link.malformedPackets == 8 else { return false }
+        let accessory = Data([2, 16, 2, 0, 93, 0, 0, 0, 0, 3])
+        guard let decoded = link.receive(Data([4, 2]) + accessory, on: .telemetry) else { return false }
+        telemetry.consume(decoded)
+        guard telemetry.canFireCannon(93) else { return false }
+        return link.diagnosticSummary.contains("ackq=3")
     }
 
     private static func reset() -> Bool {

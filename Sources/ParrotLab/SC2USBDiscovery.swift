@@ -36,9 +36,14 @@ final class SC2USBDiscovery {
     private let queue = DispatchQueue(label: "parrotlab.sc2-usb-discovery")
     private var discoveryID: UUID?
     private var activeConnection: NWConnection?
+    private let callbackLock = NSLock()
+    private var callbackDiscoveryID: UUID?
 
     func discover(completion: @escaping (Result<SC2USBDiscoveryResult, Error>) -> Void) {
         let identifier = UUID()
+        callbackLock.lock()
+        callbackDiscoveryID = identifier
+        callbackLock.unlock()
         queue.async { [weak self] in
             guard let self else { return }
             self.activeConnection?.cancel()
@@ -57,6 +62,9 @@ final class SC2USBDiscovery {
     }
 
     func cancel() {
+        callbackLock.lock()
+        callbackDiscoveryID = nil
+        callbackLock.unlock()
         queue.async { [weak self] in
             self?.discoveryID = nil
             self?.activeConnection?.cancel()
@@ -153,7 +161,14 @@ final class SC2USBDiscovery {
         discoveryID = nil
         activeConnection?.cancel()
         activeConnection = nil
-        DispatchQueue.main.async { completion(result) }
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.callbackLock.lock()
+            let isCurrent = self.callbackDiscoveryID == id
+            self.callbackLock.unlock()
+            guard isCurrent else { return }
+            completion(result)
+        }
     }
 
     private func report(_ message: String) {

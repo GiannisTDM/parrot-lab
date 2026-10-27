@@ -1,6 +1,21 @@
 import Foundation
 
 enum SumoDeviceTools {
+    static func replacementCommand(md5: String, b29MD5: String?, token: String, restore: Bool) -> String? {
+        guard launchCommand(md5: md5, token: token) != nil else { return nil }
+        if !restore {
+            guard let b29MD5, b29MD5.count == 32,
+                  b29MD5.allSatisfy({ $0.isHexDigit && $0.isASCII && !$0.isUppercase }) else { return nil }
+        }
+        let prefix = "__PARROTLAB_SUMO_\(token)__="
+        let operation = restore ? "restore" : "install \(b29MD5!)"
+        return "cd /data/ftp/internal_000 || { echo \(prefix)ERROR_DIRECTORY; exit; }; " +
+            "D=$(md5sum parrotlab_sumo_dragon_swap.sh); D=${D%% *}; " +
+            "[ \"$D\" = \(md5) ] || { echo \(prefix)ERROR_DIGEST; exit; }; " +
+            "if sh ./parrotlab_sumo_dragon_swap.sh \(operation); then echo \(prefix)SWAP_OK; " +
+            "else echo \(prefix)ERROR_SWAP; fi; exit"
+    }
+
     static func rfCommand(md5: String, token: String, enable: Bool) -> String? {
         guard launchCommand(md5: md5, token: token) != nil else { return nil }
         let prefix = "__PARROTLAB_SUMO_\(token)__="
@@ -31,6 +46,9 @@ enum SumoDeviceTools {
 
     static func selfTest() -> Bool {
         let token = UUID().uuidString
+        guard replacementCommand(md5: String(repeating: "a", count: 32), b29MD5: String(repeating: "b", count: 32), token: token, restore: false)?.contains(" install ") == true,
+              replacementCommand(md5: String(repeating: "a", count: 32), b29MD5: nil, token: token, restore: true)?.contains(" restore;") == true,
+              replacementCommand(md5: String(repeating: "a", count: 32), b29MD5: "bad; reboot", token: token, restore: false) == nil else { return false }
         guard let command = launchCommand(md5: String(repeating: "a", count: 32), token: token),
               command.contains("trap '' HUP"), command.contains("</dev/null"),
               command.contains("exec ./start_sumo_b29.sh"),

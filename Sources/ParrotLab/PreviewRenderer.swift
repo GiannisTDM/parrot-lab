@@ -1,6 +1,9 @@
 import AppKit
 
 enum PreviewRenderer {
+    static func renderAnafi(to path: String) -> Bool {
+        renderApplication(to: path, anafi: true)
+    }
     static func render(to path: String) -> Bool {
         let hud = VideoHUDView(frame: NSRect(x: 0, y: 0, width: 1280, height: 720))
         hud.layoutSubtreeIfNeeded()
@@ -43,13 +46,20 @@ enum PreviewRenderer {
         return writePNG(of: hud, to: path)
     }
 
-    static func renderApplication(to path: String, groundMode: Bool = false, miniDrone: Bool = false) -> Bool {
+    static func renderApplication(to path: String, groundMode: Bool = false, miniDrone: Bool = false, anafi: Bool = false) -> Bool {
         let controller = MainViewController()
         let appView = controller.view
         controller.setGroundModeForPreview(groundMode)
+        if groundMode, ProcessInfo.processInfo.environment["PARROTLAB_PREVIEW_SC3_SUMO"] == "1" {
+            controller.setSumoSC3RelayForPreview()
+        }
+        if groundMode, ProcessInfo.processInfo.environment["PARROTLAB_PREVIEW_SC3_SUMO_NATIVE"] == "1" {
+            controller.setSumoSC3NativeForPreview()
+        }
         if miniDrone { controller.enterMiniDroneMode() }
         let compact = ProcessInfo.processInfo.environment["PARROTLAB_PREVIEW_COMPACT"] == "1"
         appView.frame = NSRect(x: 0, y: 0, width: compact ? 1180 : 1440, height: compact ? 720 : 900)
+        if anafi { controller.enterAnafiMode() }
         let expanded = ProcessInfo.processInfo.environment["PARROTLAB_PREVIEW_EXPANDED"] == "1"
         let focus = ProcessInfo.processInfo.environment["PARROTLAB_PREVIEW_FOCUS"] == "1"
         func exercisePresentation(_ view: NSView) {
@@ -93,7 +103,11 @@ enum PreviewRenderer {
         return writePNG(of: view, to: path)
     }
 
-    private static func writePNG(of view: NSView, to path: String) -> Bool {
+    static func renderSettings(to path: String, miniDrone: Bool = false) -> Bool {
+        AppDelegate.renderSettingsPreview(to: path, miniDrone: miniDrone)
+    }
+
+    static func writePNG(of view: NSView, to path: String) -> Bool {
         guard let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return false }
         view.cacheDisplay(in: view.bounds, to: bitmap)
         guard let png = bitmap.representation(using: .png, properties: [:]) else { return false }

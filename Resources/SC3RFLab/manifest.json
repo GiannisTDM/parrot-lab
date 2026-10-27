@@ -1,0 +1,15 @@
+{
+  "version": "0.2.0",
+  "files": {
+    "parrot_sc3_rf_lab.sh": {
+      "size": 39322,
+      "sha256": "8625c5fb49099da61ece7abd1b1bb4436e1904774d742604b62f18d125968e21",
+      "sha1": "4d7bc3bf06ae19f0b08360372efa24909cfc033a"
+    },
+    "sc3-qca-rssi": {
+      "size": 4848,
+      "sha256": "bf03655041c586e2e5bc31bdeccbb71ca2da9d3b0cbd42cee30ba186be8e3684",
+      "sha1": "93951c7d300504c08cb420036418e0dee7e8b1c7"
+    }
+  }
+}

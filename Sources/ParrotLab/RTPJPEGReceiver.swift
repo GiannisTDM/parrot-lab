@@ -27,8 +27,13 @@ final class RTPJPEGReceiver {
     var onDebug: ((String) -> Void)?
 
     private let queue = DispatchQueue(label: "parrotlab.rtp-jpeg", qos: .userInteractive)
+    private let queueKey = DispatchSpecificKey<Void>()
+    private let callbackLock = NSLock()
     private var socketFD: Int32 = -1
     private var readSource: DispatchSourceRead?
+    private var muxActive = false
+    private var generation: UInt64 = 0
+    private var callbackGeneration: UInt64 = 0
     private var payloadType: UInt8 = 96
     private var wireFormat = RTPJPEGWireFormat.unknown
     private var rfc2435 = RFC2435JPEGAssembler()
@@ -44,12 +49,14 @@ final class RTPJPEGReceiver {
     private var assemblingFrameCompleted = false
     private var lastDiagnosticLog = Date.distantPast
 
+    init() {
+        queue.setSpecific(key: queueKey, value: ())
+    }
+
     func start(port: UInt16, payloadType: UInt8 = 96) throws {
         stop()
-        self.payloadType = payloadType
         let fd = Darwin.socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
         guard fd >= 0 else { throw socketError("Could not open JPEG/RTP UDP socket") }
-        socketFD = fd
 
         var reuse: Int32 = 1
         _ = withUnsafePointer(to: &reuse) {
@@ -77,9 +84,9 @@ final class RTPJPEGReceiver {
             }
         }
         guard bindResult == 0 else {
+            let code = errno
             Darwin.close(fd)
-            socketFD = -1
-            throw socketError("Could not bind JPEG/RTP UDP \(port)")
+            throw socketError("Could not bind JPEG/RTP UDP \(port)", code: code)
         }
         _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK)
 
@@ -89,27 +96,61 @@ final class RTPJPEGReceiver {
             getsockopt(fd, SOL_SOCKET, SO_RCVBUF, $0, &optionLength)
         }
         let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
-        source.setEventHandler { [weak self] in self?.receiveDatagrams() }
-        source.setCancelHandler { Darwin.close(fd) }
-        readSource = source
-        source.resume()
-        resetAssemblers()
+        source.setEventHandler { [weak self] in self?.receiveDatagrams(from: fd) }
+        withQueueSync {
+            self.payloadType = payloadType
+            socketFD = fd
+            readSource = source
+            muxActive = false
+            resetAssemblers()
+            source.resume()
+        }
         debug("Listening for SC2 JPEG/RTP on UDP \(port) · payload type \(payloadType) · RX buffer \(actualReceiveBytes) bytes")
     }
 
-    func stop() {
-        if let source = readSource {
-            source.cancel()
-            readSource = nil
-        } else if socketFD >= 0 {
-            Darwin.close(socketFD)
+    func startMux(payloadType: UInt8 = 96) {
+        withQueueSync {
+            stopLocked()
+            self.payloadType = payloadType
+            muxActive = true
+            resetAssemblers()
         }
+        debug("Receiving JPEG/RTP from SC2 libmux stream-data channel 4")
+    }
+
+    func consumeMuxPacket(_ data: Data) {
+        queue.async { [weak self] in
+            guard let self, self.muxActive else { return }
+            self.consume(data)
+        }
+    }
+
+    func stop() {
+        withQueueSync { stopLocked() }
+    }
+
+    private func stopLocked() {
+        generation &+= 1
+        callbackLock.lock()
+        callbackGeneration = generation
+        callbackLock.unlock()
+        readSource?.setEventHandler {}
+        readSource?.cancel()
+        readSource = nil
+        let fd = socketFD
         socketFD = -1
+        if fd >= 0 { Darwin.close(fd) }
+        muxActive = false
         resetAssemblers()
         stats = RTPJPEGStats()
         packetsInWindow = 0
         framesInWindow = 0
         windowStarted = Date()
+    }
+
+    private func withQueueSync(_ operation: () -> Void) {
+        if DispatchQueue.getSpecific(key: queueKey) != nil { operation() }
+        else { queue.sync(execute: operation) }
     }
 
     private func resetAssemblers() {
@@ -124,11 +165,11 @@ final class RTPJPEGReceiver {
         lastDiagnosticLog = .distantPast
     }
 
-    private func receiveDatagrams() {
-        guard socketFD >= 0 else { return }
+    private func receiveDatagrams(from fd: Int32) {
+        guard socketFD == fd else { return }
         var bytes = [UInt8](repeating: 0, count: 65_535)
         while true {
-            let count = Darwin.recv(socketFD, &bytes, bytes.count, MSG_DONTWAIT)
+            let count = Darwin.recv(fd, &bytes, bytes.count, MSG_DONTWAIT)
             if count > 0 {
                 consume(Data(bytes.prefix(count)))
                 continue
@@ -140,11 +181,11 @@ final class RTPJPEGReceiver {
         }
     }
 
-    private func socketError(_ prefix: String) -> NSError {
+    private func socketError(_ prefix: String, code: Int32 = errno) -> NSError {
         NSError(
             domain: "ParrotLab.RTPJPEG",
-            code: Int(errno),
-            userInfo: [NSLocalizedDescriptionKey: "\(prefix): \(String(cString: strerror(errno)))"]
+            code: Int(code),
+            userInfo: [NSLocalizedDescriptionKey: "\(prefix): \(String(cString: strerror(code)))"]
         )
     }
 
@@ -212,7 +253,11 @@ final class RTPJPEGReceiver {
             framesInWindow &+= 1
             stats.lastFrameID = completedFrameID
             stats.lastAssembledJPEGBytes = completed.count
-            DispatchQueue.main.async { [weak self] in self?.onFrame?(completed, completedFrameID) }
+            let frameGeneration = generation
+            DispatchQueue.main.async { [weak self] in
+                guard self?.isCurrentCallbackGeneration(frameGeneration) == true else { return }
+                self?.onFrame?(completed, completedFrameID)
+            }
         }
         publishStatsIfNeeded()
     }
@@ -227,7 +272,11 @@ final class RTPJPEGReceiver {
         framesInWindow = 0
         windowStarted = Date()
         let snapshot = stats
-        DispatchQueue.main.async { [weak self] in self?.onStats?(snapshot) }
+        let statsGeneration = generation
+        DispatchQueue.main.async { [weak self] in
+            guard self?.isCurrentCallbackGeneration(statsGeneration) == true else { return }
+            self?.onStats?(snapshot)
+        }
         if Date().timeIntervalSince(lastDiagnosticLog) >= 5 {
             lastDiagnosticLog = Date()
             debug(
@@ -299,6 +348,12 @@ final class RTPJPEGReceiver {
     private func debug(_ message: String) {
         DispatchQueue.main.async { [weak self] in self?.onDebug?(message) }
     }
+
+    private func isCurrentCallbackGeneration(_ value: UInt64) -> Bool {
+        callbackLock.lock()
+        defer { callbackLock.unlock() }
+        return callbackGeneration == value
+    }
 }
 
 private struct BoundedRTPJPEGAssembler {
@@ -331,6 +386,8 @@ private struct BoundedRTPJPEGAssembler {
 }
 
 private struct RFC2435JPEGAssembler {
+    private static let maximumFrameBytes = 8 * 1_024 * 1_024
+    private static let maximumFragments = 4_096
     private struct Parameters {
         let type: UInt8
         let quality: UInt8
@@ -343,12 +400,14 @@ private struct RFC2435JPEGAssembler {
     private var timestamp: UInt32?
     private var parameters: Parameters?
     private var fragments: [Int: Data] = [:]
+    private var fragmentBytes = 0
     private var expectedSize: Int?
 
     mutating func reset() {
         timestamp = nil
         parameters = nil
         fragments.removeAll(keepingCapacity: false)
+        fragmentBytes = 0
         expectedSize = nil
     }
 
@@ -358,9 +417,14 @@ private struct RFC2435JPEGAssembler {
             timestamp = packet.timestamp
         }
         guard let fragment = parse(packet.payload) else { return nil }
+        guard fragments[fragment.offset] == nil,
+              fragments.count < Self.maximumFragments,
+              fragment.offset <= Self.maximumFrameBytes,
+              fragment.scan.count <= Self.maximumFrameBytes - fragment.offset,
+              fragment.scan.count <= Self.maximumFrameBytes - fragmentBytes else { return nil }
         if fragment.offset == 0 { parameters = fragment.parameters }
-        guard fragments[fragment.offset] == nil else { return nil }
         fragments[fragment.offset] = fragment.scan
+        fragmentBytes += fragment.scan.count
         if packet.marker { expectedSize = fragment.offset + fragment.scan.count }
         guard let expectedSize, let parameters else { return nil }
         var offset = 0

@@ -27,6 +27,7 @@ final class ProcessedH264Recorder {
         case idle
         case recording
         case finishing
+        case finalizing
     }
 
     private let stateLock = NSLock()
@@ -78,6 +79,17 @@ final class ProcessedH264Recorder {
     private var encodedFramesInStatsWindow = 0
     private var aircraftToken = "BB2"
 
+    deinit {
+        if let compressionSession {
+            VTCompressionSessionCompleteFrames(
+                compressionSession,
+                untilPresentationTimeStamp: .invalid
+            )
+            VTCompressionSessionInvalidate(compressionSession)
+        }
+        try? handle?.close()
+    }
+
     var isRecording: Bool {
         stateLock.lock()
         defer { stateLock.unlock() }
@@ -88,6 +100,13 @@ final class ProcessedH264Recorder {
         stateLock.lock()
         defer { stateLock.unlock() }
         return state != .idle
+    }
+
+    var diagnosticSummary: String {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return "processed-recorder state=\(state) frames=\(pendingFrames.count) in-flight=\(framesInFlight) " +
+            "disk-queued=\(pendingDiskBytes) encoded=\(encodedFrames)"
     }
 
     @discardableResult
@@ -355,7 +374,7 @@ final class ProcessedH264Recorder {
         }
 
         stateLock.lock()
-        guard state != .idle else {
+        guard state == .recording || state == .finishing else {
             stateLock.unlock()
             return
         }
@@ -381,6 +400,10 @@ final class ProcessedH264Recorder {
 
     private func failAndFinish(_ message: String) {
         stateLock.lock()
+        guard state == .recording || state == .finishing else {
+            stateLock.unlock()
+            return
+        }
         if finishError == nil { finishError = message }
         if state == .recording {
             state = .finishing
@@ -523,8 +546,7 @@ final class ProcessedH264Recorder {
         pendingChunkHead = 0
         pendingDiskBytes = 0
         pendingFrames.removeAll(keepingCapacity: false)
-        state = .idle
-        ioDrainScheduled = false
+        state = .finalizing
         encoderDrainScheduled = false
         encoderFinishScheduled = false
         encoderFinished = false
@@ -570,6 +592,10 @@ final class ProcessedH264Recorder {
             bytesWritten: state.bytesWritten,
             errorDescription: state.errorDescription
         )
+        stateLock.lock()
+        self.state = .idle
+        ioDrainScheduled = false
+        stateLock.unlock()
         DispatchQueue.main.async { [weak self] in self?.onFinished?(result) }
     }
 
@@ -682,9 +708,33 @@ final class ProcessedH264Recorder {
 
     static func selfTest() -> Bool {
         let avcc = Data([0, 0, 0, 3, 0x65, 0xaa, 0xbb, 0, 0, 0, 2, 0x41, 0xcc])
-        return convertLengthPrefixedNALs(avcc, lengthFieldBytes: 4) ==
+        guard convertLengthPrefixedNALs(avcc, lengthFieldBytes: 4) ==
             Data([0, 0, 0, 1, 0x65, 0xaa, 0xbb, 0, 0, 0, 1, 0x41, 0xcc]) &&
-            convertLengthPrefixedNALs(Data([0, 0, 0, 9, 0x65]), lengthFieldBytes: 4) == nil
+            convertLengthPrefixedNALs(Data([0, 0, 0, 9, 0x65]), lengthFieldBytes: 4) == nil else { return false }
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("parrotlab-processed-lifecycle-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let recorder = ProcessedH264Recorder()
+        var completions = 0
+        recorder.onFinished = { _ in completions += 1 }
+        do {
+            for _ in 0..<5 {
+                _ = try recorder.start(directory: directory)
+                recorder.stop()
+                recorder.stopAndWait()
+                guard !recorder.isActive else { return false }
+            }
+            let deadline = Date().addingTimeInterval(1)
+            while completions < 5, Date() < deadline {
+                _ = RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.01))
+            }
+            let files = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+                .filter { $0.pathExtension == "h264" }
+            return completions == 5 && files.count == 5 &&
+                files.allSatisfy { !$0.lastPathComponent.contains("recording") }
+        } catch {
+            return false
+        }
     }
 }
 
