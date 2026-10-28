@@ -23,7 +23,7 @@ limitations, and [RELEASING.md](RELEASING.md) for packaging instructions.
 
 ANAFI and SC3 paths remain experimental. Flypad is currently unsupported.
 
-| Air workspace | Ground workspace |
+| Air workspace · 1.7 | Ground workspace · 1.7 |
 | --- | --- |
 | ![Parrot Lab Air workspace](docs/images/parrot-lab-air-mode.png) | ![Parrot Lab Ground workspace](docs/images/parrot-lab-ground-mode.png) |
 
