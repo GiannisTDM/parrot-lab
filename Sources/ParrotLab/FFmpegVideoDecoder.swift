@@ -51,9 +51,24 @@ final class FFmpegVideoDecoder {
     }
 
     func start() -> Bool {
+        process.terminationHandler = { [weak self] process in
+            guard let self else { return }
+            self.stateLock.lock()
+            self.running = false
+            self.pendingInput.removeAll()
+            self.inputDrainScheduled = false
+            self.stateLock.unlock()
+            self.onDebug?("FFmpeg video decoder exited with status \(process.terminationStatus)")
+        }
+        stateLock.lock()
+        running = true
+        stateLock.unlock()
         do {
             try process.run()
         } catch {
+            stateLock.lock()
+            running = false
+            stateLock.unlock()
             onDebug?("Could not start FFmpeg decoder: \(error.localizedDescription)")
             return false
         }
@@ -61,14 +76,8 @@ final class FFmpegVideoDecoder {
         // the unused parent copies lets stdout deliver EOF when FFmpeg exits.
         try? inputPipe.fileHandleForReading.close()
         try? outputPipe.fileHandleForWriting.close()
-        stateLock.lock()
-        running = true
-        stateLock.unlock()
         readQueue.async { [weak self] in
             self?.readOutput()
-        }
-        process.terminationHandler = { [weak self] process in
-            self?.onDebug?("FFmpeg video decoder exited with status \(process.terminationStatus)")
         }
         onDebug?("FFmpeg recovery decoder started for \(width)x\(height)")
         return true
@@ -120,8 +129,11 @@ final class FFmpegVideoDecoder {
         pendingTimingHead = 0
         lastOutputTiming = nil
         stateLock.unlock()
-        try? inputPipe.fileHandleForWriting.close()
         if process.isRunning { process.terminate() }
+        let inputHandle = inputPipe.fileHandleForWriting
+        writeQueue.async {
+            try? inputHandle.close()
+        }
         // Do not close stdout from underneath readOutput(). FileHandle raises
         // an Objective-C exception when a blocking read races a close. Queue
         // the close behind the reader, which will leave after FFmpeg exits and

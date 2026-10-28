@@ -39,9 +39,13 @@ final class RTPH264Receiver {
     var onDebug: ((String) -> Void)?
 
     private let queue = DispatchQueue(label: "parrotlab.rtp-h264")
+    private let queueKey = DispatchSpecificKey<Void>()
     private let deliveryLock = NSLock()
     private var listener: NWListener?
     private var senderConnection: NWConnection?
+    private var muxActive = false
+    private var generation: UInt64 = 0
+    private var callbackGeneration: UInt64 = 0
     private var assembler = H264RTPAssembler()
     private var stats = RTPVideoStats()
     private var previousSequence: UInt16?
@@ -58,38 +62,73 @@ final class RTPH264Receiver {
     private var pendingAccessUnit: H264AccessUnit?
     private var accessUnitDeliveryScheduled = false
 
+    init() {
+        queue.setSpecific(key: queueKey, value: ())
+    }
+
     func start(port: UInt16) throws {
         stop()
         guard let endpointPort = NWEndpoint.Port(rawValue: port) else {
             throw NSError(domain: "ParrotLab.RTP", code: 1, userInfo: [NSLocalizedDescriptionKey: "Invalid UDP port"])
         }
         let listener = try NWListener(using: .udp, on: endpointPort)
-        self.listener = listener
-        listener.stateUpdateHandler = { [weak self] state in
-            switch state {
-            case .ready: self?.debug("Listening for H.264/RTP on UDP \(port)")
-            case .failed(let error): self?.debug("RTP listener failed: \(error.localizedDescription)")
-            default: break
+        withQueueSync {
+            self.listener = listener
+            muxActive = false
+            let generation = self.generation
+            listener.stateUpdateHandler = { [weak self, weak listener] state in
+                guard let self, let listener, self.generation == generation,
+                      self.listener === listener else { return }
+                switch state {
+                case .ready: self.debug("Listening for H.264/RTP on UDP \(port)")
+                case .failed(let error): self.debug("RTP listener failed: \(error.localizedDescription)")
+                default: break
+                }
             }
+            listener.newConnectionHandler = { [weak self, weak listener] connection in
+                guard let self, let listener, self.generation == generation,
+                      self.listener === listener else {
+                    connection.cancel()
+                    return
+                }
+                self.senderConnection?.cancel()
+                self.senderConnection = connection
+                self.assembler.reset()
+                self.previousSequence = nil
+                self.recentSequences.removeAll(keepingCapacity: true)
+                self.recentSequenceOrder.removeAll(keepingCapacity: true)
+                self.recentSequenceHead = 0
+                self.lastCompletedTimestamp = nil
+                self.debug("RTP sender connected: \(connection.endpoint)")
+                connection.start(queue: self.queue)
+                self.receive(on: connection, generation: generation)
+            }
+            listener.start(queue: queue)
         }
-        listener.newConnectionHandler = { [weak self] connection in
-            guard let self else { return }
-            self.senderConnection?.cancel()
-            self.senderConnection = connection
-            self.assembler.reset()
-            self.previousSequence = nil
-            self.recentSequences.removeAll(keepingCapacity: true)
-            self.recentSequenceOrder.removeAll(keepingCapacity: true)
-            self.recentSequenceHead = 0
-            self.lastCompletedTimestamp = nil
-            self.debug("RTP sender connected: \(connection.endpoint)")
-            connection.start(queue: self.queue)
-            self.receive(on: connection)
+    }
+
+    func startMux() {
+        withQueueSync {
+            stopLocked()
+            muxActive = true
         }
-        listener.start(queue: queue)
+        debug("Receiving H.264/RTP from SC2 libmux stream-data channel 4")
+    }
+
+    func consumeMuxPacket(_ data: Data) {
+        queue.async { [weak self] in
+            guard let self, self.muxActive else { return }
+            self.consume(packetData: data)
+        }
     }
 
     func stop() {
+        withQueueSync { stopLocked() }
+    }
+
+    private func stopLocked() {
+        generation &+= 1
+        muxActive = false
         listener?.cancel()
         listener = nil
         senderConnection?.cancel()
@@ -108,19 +147,27 @@ final class RTPH264Receiver {
         vclTimestampsInWindow.removeAll(keepingCapacity: false)
         windowStarted = Date()
         deliveryLock.lock()
+        callbackGeneration = generation
         pendingAccessUnit = nil
+        accessUnitDeliveryScheduled = false
         deliveryLock.unlock()
     }
 
-    private func receive(on connection: NWConnection) {
+    private func withQueueSync(_ operation: () -> Void) {
+        if DispatchQueue.getSpecific(key: queueKey) != nil { operation() }
+        else { queue.sync(execute: operation) }
+    }
+
+    private func receive(on connection: NWConnection, generation: UInt64) {
         connection.receiveMessage { [weak self, weak connection] data, _, _, error in
-            guard let self, let connection, self.senderConnection === connection else { return }
+            guard let self, let connection, self.generation == generation,
+                  self.senderConnection === connection else { return }
             if let data { self.consume(packetData: data) }
             if let error {
                 self.debug("RTP receive error: \(error.localizedDescription)")
                 return
             }
-            self.receive(on: connection)
+            self.receive(on: connection, generation: generation)
         }
     }
 
@@ -179,7 +226,11 @@ final class RTPH264Receiver {
             vclTimestampsInWindow.removeAll(keepingCapacity: true)
             windowStarted = Date()
             let current = stats
-            DispatchQueue.main.async { [weak self] in self?.onStats?(current) }
+            let statsGeneration = generation
+            DispatchQueue.main.async { [weak self] in
+                guard self?.isCurrentCallbackGeneration(statsGeneration) == true else { return }
+                self?.onStats?(current)
+            }
         }
     }
 
@@ -229,6 +280,7 @@ final class RTPH264Receiver {
     // refresh repair any frame skipped under pressure.
     private func enqueueLatestAccessUnit(_ accessUnit: H264AccessUnit) {
         deliveryLock.lock()
+        callbackGeneration = generation
         pendingAccessUnit = accessUnit
         let shouldSchedule = !accessUnitDeliveryScheduled
         if shouldSchedule { accessUnitDeliveryScheduled = true }
@@ -254,6 +306,12 @@ final class RTPH264Receiver {
         if shouldContinue {
             DispatchQueue.main.async { [weak self] in self?.deliverLatestAccessUnit() }
         }
+    }
+
+    private func isCurrentCallbackGeneration(_ value: UInt64) -> Bool {
+        deliveryLock.lock()
+        defer { deliveryLock.unlock() }
+        return callbackGeneration == value
     }
 
     static func assemblySelfTest() -> Bool {
@@ -313,6 +371,26 @@ final class RTPH264Receiver {
             payload: Data([0x61, 0x66])
         )), assembler.consume(packet: duplicateA).isEmpty,
             assembler.consume(packet: duplicateB).first?.nalUnits == [Data([0x61, 0x66])] else {
+            return false
+        }
+
+        // A corrupt sender that never advances its timestamp or marker cannot
+        // grow the access-unit buffer without bound, and the next frame recovers.
+        assembler.reset()
+        for index in 0...512 {
+            guard let packet = RTPPacket(data: makeTestPacket(
+                sequence: UInt16(truncatingIfNeeded: index),
+                timestamp: 540_000,
+                marker: false,
+                payload: Data([0x61, UInt8(index >> 8), UInt8(truncatingIfNeeded: index)])
+            )), assembler.consume(packet: packet).isEmpty else { return false }
+        }
+        guard let recovery = RTPPacket(data: makeTestPacket(
+            sequence: 514,
+            timestamp: 543_000,
+            marker: true,
+            payload: Data([0x65, 0x77])
+        )), assembler.consume(packet: recovery).first?.nalUnits == [Data([0x65, 0x77])] else {
             return false
         }
         return true
@@ -386,10 +464,15 @@ struct RTPPacket {
 }
 
 private struct H264RTPAssembler {
+    private static let maximumNALUnitsPerAccessUnit = 512
+    private static let maximumNALUnitBytes = 8 * 1_024 * 1_024
+    private static let maximumAccessUnitBytes = 16 * 1_024 * 1_024
     private var timestamp: UInt32?
     private var nalUnits: [Data] = []
     private var seenNALUnits = Set<Data>()
+    private var nalUnitBytes = 0
     private var fragmentedNAL: Data?
+    private var discardingCurrentTimestamp = false
     private var headerExtensions: [Data] = []
     private var headerExtensionBytes = 0
 
@@ -397,7 +480,9 @@ private struct H264RTPAssembler {
         timestamp = nil
         nalUnits.removeAll(keepingCapacity: false)
         seenNALUnits.removeAll(keepingCapacity: false)
+        nalUnitBytes = 0
         fragmentedNAL = nil
+        discardingCurrentTimestamp = false
         headerExtensions.removeAll(keepingCapacity: false)
         headerExtensionBytes = 0
     }
@@ -408,6 +493,7 @@ private struct H264RTPAssembler {
             if let accessUnit = finishAccessUnit() { completed.append(accessUnit) }
         }
         timestamp = packet.timestamp
+        guard !discardingCurrentTimestamp else { return completed }
 
         if let extensionData = packet.headerExtension,
            headerExtensionBytes + extensionData.count <= 64 * 1_024,
@@ -439,9 +525,9 @@ private struct H264RTPAssembler {
             let reconstructedHeader = (bytes[0] & 0xe0) | (bytes[1] & 0x1f)
             if start {
                 fragmentedNAL = Data([reconstructedHeader])
-                fragmentedNAL?.append(packet.payload.dropFirst(2))
+                appendFragment(packet.payload.dropFirst(2))
             } else {
-                fragmentedNAL?.append(packet.payload.dropFirst(2))
+                appendFragment(packet.payload.dropFirst(2))
             }
             if end, let complete = fragmentedNAL {
                 appendNALIfNew(complete)
@@ -458,15 +544,44 @@ private struct H264RTPAssembler {
     }
 
     private mutating func appendNALIfNew(_ nalUnit: Data) {
+        guard nalUnit.count <= Self.maximumNALUnitBytes,
+              nalUnits.count < Self.maximumNALUnitsPerAccessUnit,
+              nalUnit.count <= Self.maximumAccessUnitBytes - nalUnitBytes else {
+            discardCurrentAccessUnit()
+            return
+        }
         guard seenNALUnits.insert(nalUnit).inserted else { return }
         nalUnits.append(nalUnit)
+        nalUnitBytes += nalUnit.count
+    }
+
+    private mutating func appendFragment(_ bytes: Data.SubSequence) {
+        guard let current = fragmentedNAL,
+              bytes.count <= Self.maximumNALUnitBytes - current.count,
+              bytes.count <= Self.maximumAccessUnitBytes - nalUnitBytes - current.count else {
+            discardCurrentAccessUnit()
+            return
+        }
+        fragmentedNAL?.append(bytes)
+    }
+
+    private mutating func discardCurrentAccessUnit() {
+        nalUnits.removeAll(keepingCapacity: true)
+        seenNALUnits.removeAll(keepingCapacity: true)
+        nalUnitBytes = 0
+        fragmentedNAL = nil
+        headerExtensions.removeAll(keepingCapacity: true)
+        headerExtensionBytes = 0
+        discardingCurrentTimestamp = true
     }
 
     private mutating func finishAccessUnit() -> H264AccessUnit? {
-        guard let timestamp, !nalUnits.isEmpty else {
+        guard let timestamp, !discardingCurrentTimestamp, !nalUnits.isEmpty else {
             nalUnits.removeAll(keepingCapacity: true)
             seenNALUnits.removeAll(keepingCapacity: true)
+            nalUnitBytes = 0
             fragmentedNAL = nil
+            discardingCurrentTimestamp = false
             headerExtensions.removeAll(keepingCapacity: true)
             headerExtensionBytes = 0
             self.timestamp = nil
@@ -482,7 +597,9 @@ private struct H264RTPAssembler {
         )
         nalUnits.removeAll(keepingCapacity: true)
         seenNALUnits.removeAll(keepingCapacity: true)
+        nalUnitBytes = 0
         fragmentedNAL = nil
+        discardingCurrentTimestamp = false
         headerExtensions.removeAll(keepingCapacity: true)
         headerExtensionBytes = 0
         self.timestamp = nil

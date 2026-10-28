@@ -1,0 +1,7 @@
+service mppd /bin/sh /usr/bin/sc3-native-sumo-start
+    class mpp
+    user root
+    disabled
+
+on property:mpp.open=1
+   start mppd

@@ -174,6 +174,7 @@ struct ARSDKTelemetryReducer {
             snapshot.satelliteCount = count
 
         case .aircraftConnection, .productVersion, .flatTrimChanged,
+             .sumoAudioVolume, .sumoAudioTheme,
              .magnetometerCalibrationState, .magnetometerCalibrationRequired,
              .magnetometerCalibrationAxis, .magnetometerCalibrationStarted:
             return false

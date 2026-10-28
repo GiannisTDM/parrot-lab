@@ -1,6 +1,28 @@
 import AppKit
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
+    private var sc3RFWindow: SC3RFWindow?
+    private var sc3MaintenanceWindow: SC3MaintenanceWindow?
+    private var ownerMaintenanceUnlocked = false
+    @objc private func showSC3Maintenance(_ sender: Any?) {
+        guard ownerMaintenanceUnlocked else { return }
+        if sc3MaintenanceWindow == nil {
+            let panel = SC3MaintenanceWindow()
+            panel.onBegin = { [weak self] in self?.controller?.beginSC3OwnerMaintenance() ?? false }
+            panel.onEnd = { [weak self] in self?.controller?.endSC3OwnerMaintenance() }
+            sc3MaintenanceWindow = panel
+        }
+        sc3MaintenanceWindow?.showWindow(nil); NSApp.activate(ignoringOtherApps: true)
+    }
+    @objc private func showSC3RFLab(_ sender: Any?) {
+        if sc3RFWindow == nil {
+            let panel = SC3RFWindow()
+            panel.onBeginWrite = { [weak self] in self?.controller?.beginSC3RFWrite() ?? false }
+            panel.onEndWrite = { [weak self] in self?.controller?.endSC3RFWrite() }
+            sc3RFWindow = panel
+        }
+        sc3RFWindow?.showWindow(nil); NSApp.activate(ignoringOtherApps: true)
+    }
     private enum VehicleInputMode: Int, CaseIterable {
         case off
         case keyboard
@@ -32,12 +54,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private var window: NSWindow?
     private var controller: MainViewController?
     private weak var sc2MappingsButton: NSButton?
-    private var settingsAirOnlyViews: [NSView] = []
+    private var settingsMiniDroneHiddenViews: [NSView] = []
     private weak var miniDroneSettingsNote: NSTextField?
     private weak var flightSettingsTitle: NSTextField?
     private var settingsWindow: NSWindow?
     private var flightMappingsWindow: NSWindow?
+    private weak var advancedVideoDisclosure: LabDisclosureButton?
     private weak var standaloneBebopCheckbox: NSButton?
+    private weak var standaloneExplanationLabel: NSTextField?
     private weak var vehicleInputModePopup: NSPopUpButton?
     private weak var controllerDeadzoneSlider: NSSlider?
     private weak var controllerSensitivitySlider: NSSlider?
@@ -49,6 +73,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private var controllerMappingPopups: [FlightControlAction: NSPopUpButton] = [:]
     private var controllerAxisMappingPopups: [FlightControlAction: NSPopUpButton] = [:]
     private weak var developerDiagnosticsCheckbox: NSButton?
+    private weak var developerDiagnosticsExplanation: NSTextField?
     private weak var temporalEnabledCheckbox: NSButton?
     private weak var temporalBidirectionalCheckbox: NSButton?
     private weak var temporalFrameGenerationCheckbox: NSButton?
@@ -63,6 +88,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private weak var temporalLatencyValue: NSTextField?
     private weak var temporalFlowResolutionValue: NSTextField?
     private weak var temporalExplanationLabel: NSTextField?
+
+    // These helpers address native SC2 services or the product's FTP/Telnet
+    // endpoints. The SC3 relay forwards only Sumo discovery and ARNetwork.
+    private static let relayUnavailableActions: [Selector] = [
+        #selector(showSC2Mappings(_:)), #selector(findSC2HostThroughBebop(_:)),
+        #selector(findSC2USBHost(_:)), #selector(installSC2DriverPatch(_:)),
+        #selector(installDragonLabOnBebop2(_:)), #selector(enablePersistentTelnetOnBebop2(_:)),
+        #selector(uploadRFModSuiteToBebop2(_:)), #selector(uploadRFModSuiteToSkyController2(_:)),
+        #selector(configureRFPowerMod(_:)), #selector(configureSC2RFPowerMod(_:)),
+        #selector(uploadSumoRFModSuite(_:)), #selector(configureSumoRFPowerMod(_:)),
+        #selector(startSumoB29(_:)), #selector(installSumoStartupB29(_:)),
+        #selector(restoreSumoStartupDragon(_:)), #selector(performBebopFlatTrim(_:)),
+        #selector(toggleBebopMagnetometerCalibration(_:))
+    ]
+
+    private var deviceToolsAvailable: Bool { controller?.isSumoSC3Selected != true }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if let brandIcon = LabVisualStyle.brandIcon() {
@@ -85,29 +126,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         controller.onGroundModeChanged = { [weak self] _ in
             self?.refreshForGroundModeChange()
         }
+        controller.onOwnerMaintenanceRequested = { [weak self] in
+            guard let self else { return }
+            self.ownerMaintenanceUnlocked = true
+            self.rebuildToolsMenu()
+            self.showSC3Maintenance(nil)
+        }
         rebuildToolsMenu()
+        if let menu = NSApp.mainMenu { refreshModeMenus(menu) }
         NSApp.activate(ignoringOtherApps: true)
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 
     @objc func installDragonLabOnBebop2(_ sender: Any?) {
+        guard deviceToolsAvailable else { return }
         controller?.installDragonLabOnBebop2()
     }
 
     @objc func performBebopFlatTrim(_ sender: Any?) {
+        guard deviceToolsAvailable else { return }
         controller?.performBebopFlatTrim()
     }
 
     @objc func toggleBebopMagnetometerCalibration(_ sender: Any?) {
+        guard deviceToolsAvailable else { return }
         controller?.toggleBebopMagnetometerCalibration()
     }
 
     @objc func showSettings(_ sender: Any?) {
         let panel = settingsWindow ?? makeSettingsWindow()
         refreshSettingsControls()
+        if !panel.isVisible { panel.center() }
         panel.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc func showVideoProcessingSettings(_ sender: Any?) {
+        showSettings(sender)
+        guard let disclosure = advancedVideoDisclosure else { return }
+        if !disclosure.expanded { disclosure.performClick(nil) }
+        guard let scroll = settingsWindow?.contentView as? NSScrollView,
+              let document = scroll.documentView else { return }
+        document.layoutSubtreeIfNeeded()
+        let y = max(0, disclosure.convert(disclosure.bounds, to: document).minY - 16)
+        scroll.contentView.scroll(to: NSPoint(x: 0, y: y))
+        scroll.reflectScrolledClipView(scroll.contentView)
+    }
+
+    @objc func toggleWorkspaceFocus(_ sender: Any?) { controller?.toggleWorkspaceFocus() }
+
+    @objc func toggleMenuDiagnostics(_ sender: Any?) {
+        guard let controller else { return }
+        controller.setDeveloperVideoDiagnosticsEnabled(!controller.isDeveloperVideoDiagnosticsEnabled)
+        refreshSettingsControls()
     }
 
     private func makeSettingsWindow() -> NSPanel {
@@ -142,7 +214,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             stack.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             stack.topAnchor.constraint(equalTo: content.topAnchor),
             stack.bottomAnchor.constraint(equalTo: content.bottomAnchor),
-            content.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor)
+            content.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
+            content.heightAnchor.constraint(greaterThanOrEqualTo: scroll.contentView.heightAnchor)
         ])
 
         let flightTitle = NSTextField(labelWithString: "Connection and vehicle control")
@@ -175,6 +248,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         standaloneExplanation.maximumNumberOfLines = 2
         standaloneExplanation.widthAnchor.constraint(equalToConstant: 480).isActive = true
         stack.addArrangedSubview(standaloneExplanation)
+        standaloneExplanationLabel = standaloneExplanation
 
         let inputRow = NSStackView()
         inputRow.orientation = .horizontal
@@ -260,7 +334,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         stack.addArrangedSubview(title)
 
         let checkbox = NSButton(
-            checkboxWithTitle: "Show detailed video diagnostics in the sidebar",
+            checkboxWithTitle: "Show detailed video and connection diagnostics",
             target: self,
             action: #selector(toggleDeveloperVideoDiagnosticsSetting(_:))
         )
@@ -269,13 +343,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         stack.addArrangedSubview(checkbox)
 
         let explanation = NSTextField(wrappingLabelWithString:
-            "Keeps the normal Video card concise. Enable this only when inspecting RTP timing, decoder, motion, calibration, and processing details."
+            "Adds stream details in the sidebar and session transitions in Activity. Tools → Copy Connection Diagnostics gives a current snapshot at any time."
         )
         explanation.font = .systemFont(ofSize: 11.5)
         explanation.textColor = LabVisualStyle.mutedText
         explanation.maximumNumberOfLines = 3
         explanation.widthAnchor.constraint(equalToConstant: 480).isActive = true
         stack.addArrangedSubview(explanation)
+        developerDiagnosticsExplanation = explanation
 
         let separator = NSBox()
         separator.boxType = .separator
@@ -387,14 +462,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         temporalConsistencyValue = consistencyRow.value
         temporalLatencySlider = latencyRow.slider
         temporalLatencyValue = latencyRow.value
-        let videoStart = stack.arrangedSubviews.firstIndex(of: flightSeparator)!
-        settingsAirOnlyViews = [standaloneCheckbox, standaloneExplanation, sc2Mappings] +
-            Array(stack.arrangedSubviews[videoStart...])
+        let temporalStart = stack.arrangedSubviews.firstIndex(of: separator)!
+        let advanced = NSStackView(); advanced.orientation = .vertical; advanced.alignment = .leading; advanced.spacing = 10
+        for item in Array(stack.arrangedSubviews[temporalStart...]) {
+            stack.removeArrangedSubview(item); item.removeFromSuperview(); advanced.addArrangedSubview(item)
+        }
+        let advancedToggle = LabDisclosureButton(title: "Advanced video processing", views: [advanced])
+        advancedVideoDisclosure = advancedToggle
+        stack.addArrangedSubview(advancedToggle)
+        // Mode changes hide the wrapper, preserving the user's disclosure
+        // state instead of unhiding every advanced control during refresh.
+        let advancedWrapper = NSStackView(); advancedWrapper.orientation = .vertical; advancedWrapper.alignment = .leading
+        advancedWrapper.addArrangedSubview(advanced)
+        stack.addArrangedSubview(advancedWrapper)
+        settingsMiniDroneHiddenViews = [standaloneCheckbox, standaloneExplanation, sc2Mappings, advancedToggle, advancedWrapper]
         refreshSettingsControls()
         return panel
     }
 
-    @objc func showSC2Mappings(_ sender: Any?) { controller?.showSC2Mappings() }
+    @objc func showSC2Mappings(_ sender: Any?) {
+        guard deviceToolsAvailable else { return }
+        controller?.showSC2Mappings()
+    }
+    @objc func copyConnectionDiagnostics(_ sender: Any?) { controller?.copyConnectionDiagnostics() }
 
     @objc private func toggleDeveloperVideoDiagnosticsSetting(_ sender: Any?) {
         guard let checkbox = sender as? NSButton else { return }
@@ -468,7 +558,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     @objc private func flightControlSettingChanged(_ sender: Any?) {
         guard let controller else { return }
         var configuration = controller.currentFlightControlConfiguration
-        configuration.standaloneBebopEnabled = standaloneBebopCheckbox?.state == .on
+        // The explicit SC3 relay route has no representation in this legacy
+        // direct/SC2 checkbox. Input tuning must not select a different route.
+        if !controller.isSumoSC3Selected {
+            configuration.standaloneBebopEnabled = standaloneBebopCheckbox?.state == .on
+        }
         let inputMode = VehicleInputMode(rawValue: vehicleInputModePopup?.selectedTag() ?? 0) ?? .off
         configuration.keyboardEnabled = inputMode.enablesKeyboard
         configuration.controllerEnabled = inputMode.enablesGamepad
@@ -485,13 +579,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     @objc func showFlightControlMappings(_ sender: Any?) {
         guard let panel = flightMappingsWindow ?? makeFlightControlMappingsWindow() else { return }
         refreshFlightMappingControls()
+        if !panel.isVisible { panel.center() }
         panel.makeKeyAndOrderFront(nil)
     }
 
     private func makeFlightControlMappingsWindow() -> NSPanel? {
         guard let controller else { return nil }
+        let availableHeight = (window?.screen ?? NSScreen.main)?.visibleFrame.height ?? 800
         let panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 650, height: 720),
+            contentRect: NSRect(x: 0, y: 0, width: 650, height: min(720, max(420, availableHeight - 80))),
             styleMask: [.titled, .closable, .resizable],
             backing: .buffered,
             defer: false
@@ -633,7 +729,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
               let controller else { return }
         var configuration = controller.currentFlightControlConfiguration
         if identifier.hasPrefix("keyboard.") {
-            configuration.keyboardKeys[action] = UInt16(clamping: popup.selectedTag())
+            guard let keyCode = FlightKeyboardKey.choices.first(where: { Int($0.keyCode) == popup.selectedTag() })?.keyCode else { return }
+            configuration.bindKeyboardKey(keyCode, to: action)
         } else if identifier.hasPrefix("gamepadAxis."),
                   FlightControllerAxisDirection.allCases.indices.contains(popup.selectedTag()) {
             configuration.bindControllerAxisDirection(
@@ -703,19 +800,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     private func refreshSettingsControls() {
         let miniDrone = controller?.isMiniDroneModeActive == true
-        settingsAirOnlyViews.forEach { $0.isHidden = miniDrone }
+        let anafi = controller?.isAnafiModeActive == true
+        let sumoRelay = controller?.isSumoSC3Selected == true
+        settingsMiniDroneHiddenViews.forEach { $0.isHidden = miniDrone || anafi }
         miniDroneSettingsNote?.isHidden = !miniDrone
-        flightSettingsTitle?.stringValue = miniDrone ? "MiniDrone controls" : "Connection and vehicle control"
-        settingsWindow?.title = miniDrone ? "MiniDrone controls" : "Parrot Lab Settings"
-        let desiredHeight: CGFloat = miniDrone ? 440 : 820
-        if settingsWindow?.contentView?.bounds.height != desiredHeight {
-            settingsWindow?.setContentSize(NSSize(width: 540, height: desiredHeight))
+        flightSettingsTitle?.stringValue = anafi ? "ANAFI input controls" : miniDrone ? "MiniDrone controls" : "Connection and vehicle control"
+        settingsWindow?.title = anafi ? "ANAFI input controls" : miniDrone ? "MiniDrone controls" : "Parrot Lab Settings"
+        let desiredHeight: CGFloat = miniDrone || anafi ? 445 : 660
+        let availableHeight = (settingsWindow?.screen ?? window?.screen ?? NSScreen.main)?.visibleFrame.height
+            ?? (desiredHeight + 80)
+        let fittedHeight = min(desiredHeight, max(350, availableHeight - 80))
+        if settingsWindow?.contentView?.bounds.height != fittedHeight {
+            settingsWindow?.setContentSize(NSSize(width: 540, height: fittedHeight))
         }
-        sc2MappingsButton?.isHidden = miniDrone
+        sc2MappingsButton?.isHidden = miniDrone || anafi || sumoRelay
+        developerDiagnosticsCheckbox?.title = miniDrone
+            ? "Show detailed Bluetooth and connection diagnostics"
+            : "Show detailed video and connection diagnostics"
+        developerDiagnosticsExplanation?.stringValue = miniDrone
+            ? "Shows Bluetooth session and flight-state transitions in Activity. Tools → Copy Connection Diagnostics captures the current command and acknowledgement state."
+            : "Adds stream details in the sidebar and session transitions in Activity. Tools → Copy Connection Diagnostics gives a current snapshot at any time."
         developerDiagnosticsCheckbox?.state = controller?.isDeveloperVideoDiagnosticsEnabled == true ? .on : .off
         if let flight = controller?.currentFlightControlConfiguration {
-            standaloneBebopCheckbox?.state = flight.standaloneBebopEnabled ? .on : .off
-            standaloneBebopCheckbox?.isEnabled = controller?.isGroundModeActive != true && controller?.isMiniDroneModeActive != true
+            standaloneBebopCheckbox?.state = !sumoRelay && flight.standaloneBebopEnabled ? .on : .off
+            standaloneBebopCheckbox?.title = sumoRelay ? (controller?.isSumoSC3NativeSelected == true ? "Sumo via native SC3 (experimental)" : "Sumo via SC3 USB relay (experimental)") : controller?.isGroundModeActive == true
+                ? "Connect directly to Sumo Wi-Fi"
+                : "Connect directly to product Wi-Fi (Bebop / Sumo)"
+            standaloneExplanationLabel?.stringValue = sumoRelay
+                ? "Choose the route in the connection bar. Input settings preserve this route. Native SC3 mappings are separate from Mac mappings."
+                : controller?.isGroundModeActive == true
+                ? "Connect to Jumping Sumo directly or through SkyController 2. Disconnect before changing routes."
+                : "Connect to a Bebop or Sumo directly, or route it through SkyController 2. Disconnect before changing routes."
+            standaloneBebopCheckbox?.isEnabled = !miniDrone && !sumoRelay && controller?.canChangeConnectionRoute == true
             let inputMode = VehicleInputMode(
                 keyboardEnabled: flight.keyboardEnabled,
                 gamepadEnabled: flight.controllerEnabled
@@ -753,17 +869,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         temporalLatencyValue?.stringValue = String(format: "%.0f ms", configuration.latencyBudgetMilliseconds)
         temporalFlowResolutionValue?.stringValue = String(format: "%.0f%%", configuration.flowResolutionScale * 100)
         let controlsEnabled = configuration.isEnabled
-        temporalBidirectionalCheckbox?.isEnabled = controlsEnabled && !configuration.flowOnlyGround
-        temporalFrameGenerationCheckbox?.isEnabled = controlsEnabled && configuration.usesBidirectionalFlow
-        temporalFlowResolutionSlider?.isEnabled = controlsEnabled
-        temporalHistorySlider?.isEnabled = controlsEnabled
-        temporalGhostSlider?.isEnabled = controlsEnabled
-        temporalConsistencySlider?.isEnabled = controlsEnabled && configuration.usesBidirectionalFlow
-        temporalLatencySlider?.isEnabled = controlsEnabled
+        let editable = controller?.canAdjustVideoProcessing == true
+        temporalEnabledCheckbox?.isEnabled = editable
+        temporalBidirectionalCheckbox?.isEnabled = editable && controlsEnabled && !configuration.flowOnlyGround
+        temporalFrameGenerationCheckbox?.isEnabled = editable && controlsEnabled && configuration.usesBidirectionalFlow
+        temporalFlowResolutionSlider?.isEnabled = editable && controlsEnabled
+        temporalHistorySlider?.isEnabled = editable && controlsEnabled
+        temporalGhostSlider?.isEnabled = editable && controlsEnabled
+        temporalConsistencySlider?.isEnabled = editable && controlsEnabled && configuration.usesBidirectionalFlow
+        temporalLatencySlider?.isEnabled = editable && controlsEnabled
     }
 
     private func refreshForGroundModeChange() {
         rebuildToolsMenu()
+        if let menu = NSApp.mainMenu { refreshModeMenus(menu) }
         if let contentView = settingsWindow?.contentView {
             LabVisualStyle.applyTheme(
                 controller?.isMiniDroneModeActive == true ? .miniDrone : (controller?.isGroundModeActive == true ? .ground : .air),
@@ -772,6 +891,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             settingsWindow?.backgroundColor = LabVisualStyle.panel
         }
         refreshSettingsControls()
+        if let scroll = settingsWindow?.contentView as? NSScrollView {
+            scroll.contentView.scroll(to: .zero)
+            scroll.reflectScrolledClipView(scroll.contentView)
+        }
         guard let mappings = flightMappingsWindow else { return }
         let wasVisible = mappings.isVisible
         mappings.close()
@@ -783,74 +906,145 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     }
 
     @objc func enablePersistentTelnetOnBebop2(_ sender: Any?) {
+        guard deviceToolsAvailable else { return }
         controller?.enablePersistentTelnetOnBebop2()
     }
 
     @objc func uploadRFModSuiteToBebop2(_ sender: Any?) {
+        guard deviceToolsAvailable else { return }
         controller?.uploadRFModSuiteToBebop2()
     }
 
     @objc func uploadRFModSuiteToSkyController2(_ sender: Any?) {
+        guard deviceToolsAvailable else { return }
         controller?.uploadRFModSuiteToSkyController2()
     }
 
     @objc func configureRFPowerMod(_ sender: Any?) {
+        guard deviceToolsAvailable else { return }
         controller?.configureRFPowerMod()
     }
 
     @objc func configureSC2RFPowerMod(_ sender: Any?) {
+        guard deviceToolsAvailable else { return }
         controller?.configureRFPowerMod(sc2Only: true)
     }
 
-    @objc func uploadSumoRFModSuite(_ sender: Any?) { controller?.uploadSumoRFModSuite() }
-    @objc func configureSumoRFPowerMod(_ sender: Any?) { controller?.configureSumoRFPowerMod() }
-    @objc func startSumoB29(_ sender: Any?) { controller?.startSumoB29() }
+    @objc private func showSC3SumoMappings(_ sender: Any?) { controller?.showSC3SumoMappings() }
+    @objc private func installSC3SumoVideo(_ sender: Any?) { controller?.manageSC3SumoVideo(.install) }
+    @objc private func restoreSC3SumoVideo(_ sender: Any?) { controller?.manageSC3SumoVideo(.restore) }
+    @objc private func showSC3SumoVideoStatus(_ sender: Any?) { controller?.manageSC3SumoVideo(.status) }
+
+    @objc func uploadSumoRFModSuite(_ sender: Any?) {
+        guard deviceToolsAvailable else { return }
+        controller?.uploadSumoRFModSuite()
+    }
+    @objc func configureSumoRFPowerMod(_ sender: Any?) {
+        guard deviceToolsAvailable else { return }
+        controller?.configureSumoRFPowerMod()
+    }
+    @objc func startSumoB29(_ sender: Any?) {
+        guard deviceToolsAvailable else { return }
+        controller?.startSumoB29()
+    }
+    @objc func installSumoStartupB29(_ sender: Any?) {
+        guard deviceToolsAvailable else { return }
+        controller?.replaceSumoStartupDragon(restore: false)
+    }
+    @objc func restoreSumoStartupDragon(_ sender: Any?) {
+        guard deviceToolsAvailable else { return }
+        controller?.replaceSumoStartupDragon(restore: true)
+    }
 
     private func rebuildToolsMenu() {
         guard let menu = NSApp.mainMenu?.item(withTitle: "Tools")?.submenu else { return }
         populateToolsMenu(menu, ground: controller?.isGroundModeActive == true)
     }
 
+    private func refreshModeMenus(_ menu: NSMenu) {
+        let specialized = controller?.isMiniDroneModeActive == true || controller?.isAnafiModeActive == true
+        let ground = controller?.isGroundModeActive == true
+        let items = LabMenuBar.descendants(of: menu)
+        items.first { $0.identifier == LabMenuBar.videoID }?.isHidden = specialized
+        items.first { $0.identifier == LabMenuBar.motionID }?.isHidden = ground
+        items.first { $0.identifier == LabMenuBar.groundMotionID }?.isHidden = !ground
+    }
+
     func populateToolsMenu(_ menu: NSMenu, ground: Bool) {
         menu.removeAllItems()
-        func add(_ title: String, _ action: Selector) {
-            let item = menu.addItem(withTitle: title, action: action, keyEquivalent: "")
-            item.target = self
+        let specialized = controller?.isMiniDroneModeActive == true || controller?.isAnafiModeActive == true
+        LabMenuBar.command(menu, "Input Settings…", #selector(showSettings(_:)), target: self, symbol: "gamecontroller")
+        LabMenuBar.command(menu, "Keyboard & Gamepad Mappings…", #selector(showFlightControlMappings(_:)), target: self)
+        LabMenuBar.command(menu, "SkyController 3 RF Lab…", #selector(showSC3RFLab(_:)), target: self, symbol: "antenna.radiowaves.left.and.right")
+        if ownerMaintenanceUnlocked {
+            LabMenuBar.command(menu, "SkyController 3 Maintenance…", #selector(showSC3Maintenance(_:)), target: self, symbol: "wrench.and.screwdriver")
         }
-        if controller?.isMiniDroneModeActive == true {
-            add("Configure MiniDrone Controls…", #selector(showFlightControlMappings(_:)))
-            return
-        }
-        if ground {
-            add("Start Sumo 30 FPS Dragon (B29)…", #selector(startSumoB29(_:)))
-            add("Upload Sumo RF Lab…", #selector(uploadSumoRFModSuite(_:)))
-            add("Enable/Disable Sumo RF Power Mod…", #selector(configureSumoRFPowerMod(_:)))
-        } else {
-            add("Bebop Flat Trim", #selector(performBebopFlatTrim(_:)))
-            add("Start Bebop Magnetometer Calibration", #selector(toggleBebopMagnetometerCalibration(_:)))
+        if !specialized {
+            if ground {
+                LabMenuBar.command(menu, "Native SC3 Sumo Mappings…", #selector(showSC3SumoMappings(_:)), target: self)
+            }
+            LabMenuBar.command(menu, "SkyController 2 Mappings…", #selector(showSC2Mappings(_:)), target: self)
             menu.addItem(.separator())
-            add("Install/Update Dragon Lab on Bebop 2", #selector(installDragonLabOnBebop2(_:)))
-            add("Enable Persistent Telnet on Bebop 2…", #selector(enablePersistentTelnetOnBebop2(_:)))
-            add("Upload RF/MOD Suite to Bebop 2", #selector(uploadRFModSuiteToBebop2(_:)))
-            add("Enable/Disable Paired Bebop 2 + SC2 RF Power Mod…", #selector(configureRFPowerMod(_:)))
+            if !ground {
+                let calibration = LabMenuBar.submenu(menu, "Aircraft Calibration", symbol: "level")
+                LabMenuBar.command(calibration, "Flat Trim", #selector(performBebopFlatTrim(_:)), target: self)
+                LabMenuBar.command(calibration, "Start Magnetometer Calibration", #selector(toggleBebopMagnetometerCalibration(_:)), target: self)
+            }
+            let connection = LabMenuBar.submenu(menu, "Connection", symbol: "cable.connector")
+            LabMenuBar.command(connection, "Find SC2 via Bebop 2…", #selector(findSC2HostThroughBebop(_:)), target: self)
+            LabMenuBar.command(connection, "Find SC2 USB Address…", #selector(findSC2USBHost(_:)), target: self)
+            LabMenuBar.command(connection, "Install / Update SC2 Driver Patch…", #selector(installSC2DriverPatch(_:)), target: self)
+
+            let devices = LabMenuBar.submenu(menu, "Device Tools", symbol: "wrench.and.screwdriver")
+            let vehicle = LabMenuBar.submenu(devices, ground ? "Jumping Sumo" : "Bebop 2")
+            if ground {
+                LabMenuBar.command(vehicle, "Start 30 FPS Dragon (B29)…", #selector(startSumoB29(_:)), target: self)
+                let startup = LabMenuBar.submenu(vehicle, "Startup Dragon")
+                LabMenuBar.command(startup, "Install B29 as Default…", #selector(installSumoStartupB29(_:)), target: self)
+                LabMenuBar.command(startup, "Restore Original Dragon…", #selector(restoreSumoStartupDragon(_:)), target: self)
+                LabMenuBar.command(vehicle, "Upload RF Lab…", #selector(uploadSumoRFModSuite(_:)), target: self)
+                LabMenuBar.command(vehicle, "Configure RF Power Mod…", #selector(configureSumoRFPowerMod(_:)), target: self)
+            } else {
+                LabMenuBar.command(vehicle, "Install / Update Dragon Lab…", #selector(installDragonLabOnBebop2(_:)), target: self)
+                LabMenuBar.command(vehicle, "Enable Persistent Telnet…", #selector(enablePersistentTelnetOnBebop2(_:)), target: self)
+                LabMenuBar.command(vehicle, "Upload RF / MOD Suite…", #selector(uploadRFModSuiteToBebop2(_:)), target: self)
+                LabMenuBar.command(vehicle, "Configure Paired Bebop + SC2 RF Power…", #selector(configureRFPowerMod(_:)), target: self)
+            }
+            let sc2 = LabMenuBar.submenu(devices, "SkyController 2")
+            LabMenuBar.command(sc2, "Upload RF / MOD Suite…", #selector(uploadRFModSuiteToSkyController2(_:)), target: self)
+            LabMenuBar.command(sc2, "Configure RF Power Mod…", #selector(configureSC2RFPowerMod(_:)), target: self)
+            if ground {
+                let sc3 = LabMenuBar.submenu(devices, "SkyController 3")
+                LabMenuBar.command(sc3, "Enable Sumo Video at Startup…", #selector(installSC3SumoVideo(_:)), target: self)
+                LabMenuBar.command(sc3, "Restore Startup Without Sumo Video…", #selector(restoreSC3SumoVideo(_:)), target: self)
+                LabMenuBar.command(sc3, "Show Sumo Video Status…", #selector(showSC3SumoVideoStatus(_:)), target: self)
+            }
         }
         menu.addItem(.separator())
-        add("Upload RF/MOD Suite to SkyController 2", #selector(uploadRFModSuiteToSkyController2(_:)))
-        add("Enable/Disable SC2 RF Power Mod…", #selector(configureSC2RFPowerMod(_:)))
-        add("Configure SC2 Sticks & Buttons…", #selector(showSC2Mappings(_:)))
-        menu.addItem(.separator())
-        add("Find SC2 IP through Bebop 2…", #selector(findSC2HostThroughBebop(_:)))
-        add("Find SC2 USB Networking IP…", #selector(findSC2USBHost(_:)))
-        add("Install/Update SC2 Driver Patch", #selector(installSC2DriverPatch(_:)))
+        LabMenuBar.command(menu, "Convert H.264 to MP4…", #selector(convertFinishedH264ToMP4(_:)), target: self, symbol: "film")
+        LabMenuBar.command(menu, "Copy Connection Diagnostics", #selector(copyConnectionDiagnostics(_:)), target: self,
+                           symbol: "doc.on.clipboard")
+        let developer = LabMenuBar.submenu(menu, "Developer", symbol: "ladybug")
+        LabMenuBar.command(developer, "Detailed Diagnostics", #selector(toggleMenuDiagnostics(_:)), target: self)
+        if !specialized && !ground {
+            let raw = LabMenuBar.command(developer, "Archive Original H.264", #selector(toggleRawH264Archive(_:)), target: self)
+            raw.toolTip = "Also saves the untouched incoming Bebop stream during future Mac recordings."
+        }
     }
 
     static func toolsMenuSelfTest() -> Bool {
         let delegate = AppDelegate()
         let menu = NSMenu(title: "Tools")
+        delegate.showSC3Maintenance(nil)
+        guard delegate.sc3MaintenanceWindow == nil, SC3MaintenanceAccess.selfTest() else { return false }
+        for unlocked in [false, true] {
+        delegate.ownerMaintenanceUnlocked = unlocked
         for ground in [false, true, false, true] {
             delegate.populateToolsMenu(menu, ground: ground)
-            let actions = menu.items.compactMap(\.action)
+            let actions = LabMenuBar.descendants(of: menu).filter { $0.submenu == nil }.compactMap(\.action)
             guard actions.contains(#selector(startSumoB29(_:))) == ground,
+                  actions.contains(#selector(installSumoStartupB29(_:))) == ground,
+                  actions.contains(#selector(restoreSumoStartupDragon(_:))) == ground,
                   actions.contains(#selector(uploadSumoRFModSuite(_:))) == ground,
                   actions.contains(#selector(configureSumoRFPowerMod(_:))) == ground,
                   actions.contains(#selector(performBebopFlatTrim(_:))) == !ground,
@@ -860,9 +1054,82 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
                   actions.contains(#selector(uploadRFModSuiteToSkyController2(_:))),
                   actions.contains(#selector(installSC2DriverPatch(_:))),
                   actions.contains(#selector(findSC2USBHost(_:))),
+                  actions.contains(#selector(copyConnectionDiagnostics(_:))),
+                  actions.contains(#selector(showSC3RFLab(_:))),
+                  actions.contains(#selector(showSC3Maintenance(_:))) == unlocked,
                   Set(actions.map(NSStringFromSelector)).count == actions.count else { return false }
         }
-        return true
+        }
+        return LabMenuBar.selfTest(delegate: delegate)
+    }
+
+    /// Exercises route-specific AppKit validation without contacting a device.
+    static func sc3SumoMenuSelfTest() -> Bool {
+        _ = NSApplication.shared
+        let saved = UserDefaults.standard.object(forKey: FlightControlConfiguration.defaultsKey)
+        let previousTheme = LabVisualStyle.themeMode
+        let delegate = AppDelegate()
+        let controller = MainViewController()
+        delegate.controller = controller
+        _ = controller.view
+        defer {
+            controller.prepareForTermination()
+            if let saved { UserDefaults.standard.set(saved, forKey: FlightControlConfiguration.defaultsKey) }
+            else { UserDefaults.standard.removeObject(forKey: FlightControlConfiguration.defaultsKey) }
+            LabVisualStyle.applyTheme(previousTheme, to: NSView())
+        }
+        controller.setSumoSC3RelayForPreview()
+        _ = delegate.makeSettingsWindow()
+        guard controller.isSumoSC3RelaySelected,
+              delegate.sc2MappingsButton?.isHidden == true,
+              delegate.standaloneBebopCheckbox?.isEnabled == false,
+              delegate.standaloneBebopCheckbox?.title.contains("SC3 USB relay") == true else { return false }
+        let menu = NSMenu(title: "Tools")
+        delegate.populateToolsMenu(menu, ground: true)
+        for action in Self.relayUnavailableActions {
+            guard !delegate.validateMenuItem(NSMenuItem(title: "Device tool", action: action, keyEquivalent: "")) else { return false }
+        }
+        for action in [#selector(installSC3SumoVideo(_:)), #selector(restoreSC3SumoVideo(_:)), #selector(showSC3SumoVideoStatus(_:))] {
+            guard !delegate.validateMenuItem(NSMenuItem(title: "SC3 video", action: action, keyEquivalent: "")) else { return false }
+        }
+        for action in [#selector(showSettings(_:)), #selector(showFlightControlMappings(_:)),
+                       #selector(flightControlSettingChanged(_:)), #selector(flightMappingChanged(_:)),
+                       #selector(resetFlightMappings(_:)), #selector(convertFinishedH264ToMP4(_:)),
+                       #selector(copyConnectionDiagnostics(_:)), #selector(showVideoProcessingSettings(_:)),
+                       #selector(toggleGroundTemporal720p45(_:))] {
+            guard delegate.validateMenuItem(NSMenuItem(title: "Local tool", action: action, keyEquivalent: "")) else { return false }
+        }
+        // Even a stale checkbox value must not reroute a generic input edit.
+        delegate.standaloneBebopCheckbox?.state = .on
+        delegate.vehicleInputModePopup?.selectItem(withTag: VehicleInputMode.keyboardAndGamepad.rawValue)
+        delegate.flightControlSettingChanged(delegate.vehicleInputModePopup)
+        guard controller.isSumoSC3RelaySelected,
+              controller.currentFlightControlConfiguration.keyboardEnabled,
+              controller.currentFlightControlConfiguration.controllerEnabled,
+              delegate.standaloneBebopCheckbox?.isEnabled == false else { return false }
+        controller.setSumoSC3NativeForPreview()
+        delegate.refreshSettingsControls()
+        let airRoute = controller.currentFlightControlConfiguration.standaloneBebopEnabled
+        delegate.standaloneBebopCheckbox?.state = airRoute ? .off : .on
+        delegate.flightControlSettingChanged(delegate.vehicleInputModePopup)
+        guard controller.isSumoSC3NativeSelected,
+              controller.currentFlightControlConfiguration.standaloneBebopEnabled == airRoute,
+              delegate.standaloneBebopCheckbox?.isEnabled == false,
+              !delegate.deviceToolsAvailable,
+              delegate.validateMenuItem(NSMenuItem(title: "Native mappings", action: #selector(showSC3SumoMappings(_:)), keyEquivalent: "")) else { return false }
+        for action in [#selector(installSC3SumoVideo(_:)), #selector(restoreSC3SumoVideo(_:)), #selector(showSC3SumoVideoStatus(_:))] {
+            guard delegate.validateMenuItem(NSMenuItem(title: "SC3 video", action: action, keyEquivalent: "")) else { return false }
+        }
+        for action in Self.relayUnavailableActions {
+            guard !delegate.validateMenuItem(NSMenuItem(title: "Device tool", action: action, keyEquivalent: "")) else { return false }
+        }
+        controller.setGroundModeForPreview(true)
+        delegate.refreshSettingsControls()
+        return !controller.isSumoSC3RelaySelected &&
+            delegate.standaloneBebopCheckbox?.isEnabled == true &&
+            delegate.sc2MappingsButton?.isHidden == false &&
+            delegate.validateMenuItem(NSMenuItem(title: "SC2 mappings", action: #selector(showSC2Mappings(_:)), keyEquivalent: "")) &&
+            delegate.validateMenuItem(NSMenuItem(title: "B29", action: #selector(startSumoB29(_:)), keyEquivalent: ""))
     }
 
     @objc func selectVideoEnhancement(_ sender: Any?) {
@@ -904,15 +1171,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     }
 
     @objc func installSC2DriverPatch(_ sender: Any?) {
+        guard deviceToolsAvailable else { return }
         controller?.installSC2DriverPatch()
     }
 
     @objc func findSC2HostThroughBebop(_ sender: Any?) {
+        guard deviceToolsAvailable else { return }
         controller?.findSC2HostThroughBebop()
     }
 
     @objc func findSC2USBHost(_ sender: Any?) {
+        guard deviceToolsAvailable else { return }
         controller?.findSC2USBHost()
+    }
+
+    /// Builds real settings/mapping controls without showing windows or opening Bluetooth.
+    static func renderSettingsPreview(to path: String, miniDrone: Bool) -> Bool {
+        _ = NSApplication.shared
+        let previousTheme = LabVisualStyle.themeMode
+        let delegate = AppDelegate()
+        let controller = MainViewController()
+        delegate.controller = controller
+        _ = controller.view
+        if miniDrone { controller.enterMiniDroneMode() }
+        defer {
+            controller.prepareForTermination()
+            LabVisualStyle.applyTheme(previousTheme, to: NSView())
+        }
+        let panel = delegate.makeSettingsWindow()
+        guard let view = panel.contentView else { return false }
+        view.layoutSubtreeIfNeeded()
+        view.displayIfNeeded()
+        return PreviewRenderer.writePNG(of: view, to: path)
     }
 
     /// Builds real settings/mapping controls without showing windows or opening Bluetooth.
@@ -924,17 +1214,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         let controller = MainViewController()
         delegate.controller = controller
         _ = controller.view
-        controller.enterMiniDroneMode()
         defer {
             controller.prepareForTermination()
             if let saved { UserDefaults.standard.set(saved, forKey: FlightControlConfiguration.defaultsKey) }
             else { UserDefaults.standard.removeObject(forKey: FlightControlConfiguration.defaultsKey) }
             LabVisualStyle.applyTheme(previousTheme, to: NSView())
         }
+        controller.setGroundModeForPreview(true)
+        _ = delegate.makeSettingsWindow()
+        guard delegate.standaloneBebopCheckbox?.isEnabled == true,
+              delegate.standaloneBebopCheckbox?.title == "Connect directly to Sumo Wi-Fi" else { return false }
+        let groundMenu = LabMenuBar.make(delegate: delegate)
+        delegate.refreshModeMenus(groundMenu)
+        guard LabMenuBar.descendants(of: groundMenu).first(where: { $0.identifier == LabMenuBar.motionID })?.isHidden == true,
+              LabMenuBar.descendants(of: groundMenu).first(where: { $0.identifier == LabMenuBar.groundMotionID })?.isHidden == false,
+              groundMenu.item(withTitle: "Video")?.isHidden == false else { return false }
+        let focus = groundMenu.item(withTitle: "View")?.submenu?.items.first
+        guard let focus, delegate.validateMenuItem(focus), focus.state == .off else { return false }
+        delegate.toggleWorkspaceFocus(focus)
+        guard delegate.validateMenuItem(focus), focus.state == .on else { return false }
+        delegate.toggleWorkspaceFocus(focus)
+        let enhancement = NSMenuItem(title: "Denoise", action: #selector(selectVideoEnhancement(_:)), keyEquivalent: "")
+        enhancement.tag = VideoEnhancementPreset.denoise.rawValue
+        guard controller.setVideoEnhancement(rawValue: enhancement.tag),
+              delegate.validateMenuItem(enhancement), enhancement.state == .on else { return false }
+        guard let wrapper = delegate.settingsMiniDroneHiddenViews.last as? NSStackView,
+              let advanced = wrapper.arrangedSubviews.first,
+              let disclosure = delegate.settingsMiniDroneHiddenViews.dropLast().last as? LabDisclosureButton,
+              advanced.isHidden else { return false }
+        delegate.refreshSettingsControls()
+        guard advanced.isHidden else { return false }
+        disclosure.performClick(nil)
+        guard !advanced.isHidden else { return false }
+        delegate.refreshSettingsControls()
+        guard !advanced.isHidden else { return false }
+        controller.enterMiniDroneMode()
+        delegate.refreshSettingsControls()
         var config = controller.currentFlightControlConfiguration
         config.controllerEnabled = true
         controller.setFlightControlConfiguration(config)
-        _ = delegate.makeSettingsWindow()
         guard delegate.makeFlightControlMappingsWindow() != nil,
               let input = delegate.vehicleInputModePopup else { return false }
         for action in [#selector(flightControlSettingChanged(_:)), #selector(flightMappingChanged(_:)),
@@ -942,8 +1260,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             guard delegate.validateMenuItem(NSMenuItem(title: "Choice", action: action, keyEquivalent: "")) else { return false }
         }
         guard !delegate.validateMenuItem(NSMenuItem(title: "Device tool", action: #selector(installSC2DriverPatch(_:)), keyEquivalent: "")),
-              delegate.settingsAirOnlyViews.allSatisfy(\.isHidden),
-              delegate.miniDroneSettingsNote?.isHidden == false else { return false }
+              !delegate.validateMenuItem(enhancement),
+              delegate.settingsMiniDroneHiddenViews.allSatisfy(\.isHidden),
+              delegate.miniDroneSettingsNote?.isHidden == false,
+              delegate.developerDiagnosticsCheckbox?.isHidden == false,
+              delegate.developerDiagnosticsCheckbox?.title.contains("Bluetooth") == true,
+              let settingsScroll = delegate.settingsWindow?.contentView as? NSScrollView else { return false }
+        settingsScroll.layoutSubtreeIfNeeded()
+        guard (settingsScroll.documentView?.frame.height ?? 0) >= settingsScroll.contentView.bounds.height - 1 else { return false }
+        let menu = LabMenuBar.make(delegate: delegate)
+        delegate.refreshModeMenus(menu)
+        let miniTools = menu.item(withTitle: "Tools")?.submenu
+        guard menu.item(withTitle: "Video")?.isHidden == true,
+              !delegate.validateMenuItem(focus),
+              let miniTools,
+              let conversion = miniTools.items.first(where: { $0.action == #selector(convertFinishedH264ToMP4(_:)) }),
+              delegate.validateMenuItem(conversion),
+              !LabMenuBar.descendants(of: miniTools).contains(where: { $0.action == #selector(toggleRawH264Archive(_:)) }),
+              LabMenuBar.descendants(of: miniTools).contains(where: { $0.action == #selector(showFlightControlMappings(_:)) }) else { return false }
+        delegate.controller = nil
+        delegate.refreshModeMenus(menu)
+        guard menu.items.allSatisfy({ !$0.isHidden }) else { return false }
+        delegate.controller = controller
         let choices = [input] + Array(delegate.keyboardMappingPopups.values) +
             Array(delegate.controllerMappingPopups.values) + Array(delegate.controllerAxisMappingPopups.values)
         for popup in choices {
@@ -974,6 +1312,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
               updated.controllerAxisDirections[.pitchForward] == .leftStickUp,
               updated.keyboardKeys[.grabberOpen] == 18,
               FlightControlConfiguration.load() == updated else { return false }
+        keyboard.selectItem(withTag: 49)
+        delegate.flightMappingChanged(keyboard)
+        guard controller.currentFlightControlConfiguration.keyboardKeys[.grabberOpen] == 49,
+              controller.currentFlightControlConfiguration.keyboardKeys[.takeOffLand] == UInt16.max else { return false }
         delegate.resetFlightMappings(nil)
         return controller.currentFlightControlConfiguration.controllerButtons == FlightControlConfiguration.defaultControllerButtons &&
             MiniDroneViewController.pickerSelfTest()
@@ -982,24 +1324,62 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         guard let controller else { return false }
         let action = menuItem.action
-        if controller.isMiniDroneModeActive {
+        if action == #selector(showSC3RFLab(_:)) { return true }
+        if action == #selector(showSC3Maintenance(_:)) { return ownerMaintenanceUnlocked }
+        if action == #selector(showSC3SumoMappings(_:)) { return controller.isSumoSC3NativeSelected }
+        if [#selector(installSC3SumoVideo(_:)), #selector(restoreSC3SumoVideo(_:)), #selector(showSC3SumoVideoStatus(_:))].contains(where: { $0 == action }) {
+            return controller.canManageSC3SumoVideo
+        }
+        if controller.isSumoSC3Selected,
+           Self.relayUnavailableActions.contains(where: { $0 == action }) { return false }
+        if action == #selector(installSumoStartupB29(_:)) || action == #selector(restoreSumoStartupDragon(_:)) {
+            return controller.isGroundModeActive
+        }
+        if action == #selector(convertFinishedH264ToMP4(_:)) { return true }
+        if action == #selector(toggleWorkspaceFocus(_:)) {
+            menuItem.state = controller.isWorkspaceFocused ? .on : .off
+            return !controller.isMiniDroneModeActive
+        }
+        if action == #selector(toggleMenuDiagnostics(_:)) {
+            menuItem.state = controller.isDeveloperVideoDiagnosticsEnabled ? .on : .off
+            return true
+        }
+        if action == #selector(showVideoProcessingSettings(_:)) {
+            return !controller.isMiniDroneModeActive && !controller.isAnafiModeActive
+        }
+        if controller.isMiniDroneModeActive || controller.isAnafiModeActive {
             // AppKit validates popup choices through the control's action too.
             // Configuration actions must remain usable while device tools are hidden.
             return [#selector(showSettings(_:)), #selector(showFlightControlMappings(_:)),
                     #selector(flightControlSettingChanged(_:)), #selector(flightMappingChanged(_:)),
-                    #selector(resetFlightMappings(_:))].contains { $0 == action }
+                    #selector(resetFlightMappings(_:)), #selector(copyConnectionDiagnostics(_:))].contains { $0 == action }
+        }
+        if action == #selector(selectVideoEnhancement(_:)) {
+            guard let preset = VideoEnhancementPreset(rawValue: menuItem.tag) else { return false }
+            menuItem.state = controller.currentVideoEnhancement == preset ? .on : .off
+            return controller.canAdjustVideoProcessing
+        }
+        if action == #selector(selectMetalFXSpatialScaling(_:)) {
+            guard let mode = VideoSpatialScalingMode(rawValue: menuItem.tag) else { return false }
+            menuItem.state = controller.currentSpatialScaling == mode ? .on : .off
+            return controller.canAdjustVideoProcessing &&
+                (!mode.usesMetalFX || controller.isMetalFXSpatialScalingSupported)
+        }
+        if action == #selector(toggleRawH264Archive(_:)) {
+            menuItem.state = controller.isRawH264ArchiveEnabled ? .on : .off
+            return !controller.isGroundModeActive && controller.canAdjustVideoProcessing
         }
         if action == #selector(toggleGroundTemporal720p45(_:)) {
             menuItem.state = controller.isGroundModeActive && controller.currentTemporalReconstructionConfiguration.isEnabled ? .on : .off
-            return controller.isGroundModeActive
+            return controller.isGroundModeActive && controller.canAdjustVideoProcessing
         }
         if action == #selector(performBebopFlatTrim(_:)) {
             return controller.canUseBebopCalibrationTools
         }
         if action == #selector(toggleBebopMagnetometerCalibration(_:)) {
             menuItem.title = controller.isMagnetometerCalibrationActive
-                ? "Stop Bebop Magnetometer Calibration"
-                : "Start Bebop Magnetometer Calibration"
+                ? "Stop Magnetometer Calibration"
+                : "Start Magnetometer Calibration"
             return controller.canUseBebopCalibrationTools
         }
         if action == #selector(installDragonLabOnBebop2(_:)) {
@@ -1013,18 +1393,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             return controller.aircraftCapabilities.supportsValidatedRFMod
         }
         if action == #selector(toggleCalibratedRollingShutter(_:)) {
+            menuItem.state = controller.isCalibratedRollingShutterEnabled ? .on : .off
             return controller.aircraftCapabilities.supportsBB2CameraCalibration ||
                 controller.isCalibratedRollingShutterEnabled
-        }
-        if controller.isGroundModeActive {
-            if action == #selector(toggleRawH264Archive(_:)) {
-                return false
-            }
         }
         return true
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        sc3MaintenanceWindow?.stopReadOnly()
+        sc3RFWindow?.stop()
         controller?.prepareForTermination()
+    }
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard SC3MaintenanceCoordinator.shared.critical else { return .terminateNow }
+        let alert = NSAlert(); alert.messageText = "SC3 maintenance is still active"
+        alert.informativeText = "A storage/reboot phase must not be interrupted. Wait for its checked result or STOP checkpoint; private evidence and locks must be preserved."
+        alert.runModal(); return .terminateCancel
     }
 }

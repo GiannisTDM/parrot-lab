@@ -15,9 +15,11 @@ final class TelnetClient {
     var onDebug: ((String) -> Void)?
 
     private let queue = DispatchQueue(label: "parrotlab.telnet")
+    private let queueKey = DispatchSpecificKey<Void>()
     private var connection: NWConnection?
     private var connectionID: UUID?
     private var lineBuffer = Data()
+    private var telnetControlBuffer = Data()
     private var bridgeChallenge: String?
     private var bridgeStartupCommand: String?
     private var state: State = .idle {
@@ -27,8 +29,23 @@ final class TelnetClient {
         }
     }
 
+    init() {
+        queue.setSpecific(key: queueKey, value: ())
+    }
+
     func connect(host: String, port: UInt16 = 23, startupCommand: String = "ulogcat", viaSC2 bridgeHost: String? = nil) {
-        stop()
+        withQueueSync {
+            connectLocked(host: host, port: port, startupCommand: startupCommand, bridgeHost: bridgeHost)
+        }
+    }
+
+    private func connectLocked(
+        host: String,
+        port: UInt16,
+        startupCommand: String,
+        bridgeHost: String?
+    ) {
+        stopLocked()
         let bridgeCommand = bridgeHost == nil ? nil : Self.bridgeHopCommand(host: host, port: port)
         if bridgeHost != nil, bridgeCommand == nil {
             state = .failed("Invalid downstream Telnet IPv4 address")
@@ -56,6 +73,7 @@ final class TelnetClient {
                 self.onDebugMain(bridgeHost.map { "SC2 Telnet connected to \($0):23; opening tunnel to \(host):\(port)" } ?? "Telnet connected to \(host):\(port)")
                 self.receive(on: connection)
                 self.queue.asyncAfter(deadline: .now() + 0.15) {
+                    guard self.connectionID == connectionID else { return }
                     self.send("\r\n", on: connection)
                 }
                 self.queue.asyncAfter(deadline: .now() + 0.45) {
@@ -75,7 +93,7 @@ final class TelnetClient {
                     self.probeBridge(on: connection, id: connectionID, attempts: 12)
                 }
             case .failed(let error):
-                self.state = .failed(error.localizedDescription)
+                self.finishLocked(id: connectionID, state: .failed(error.localizedDescription))
                 self.onDebugMain("Telnet failed: \(error.localizedDescription)")
             case .cancelled:
                 if self.state != .stopped { self.state = .stopped }
@@ -87,18 +105,43 @@ final class TelnetClient {
     }
 
     func sendCommand(_ command: String) {
-        guard let connection else { return }
-        send(command + "\r\n", on: connection)
+        queue.async { [weak self] in
+            guard let self, let connection = self.connection else { return }
+            self.send(command + "\r\n", on: connection)
+        }
     }
 
     func stop() {
+        withQueueSync { stopLocked() }
+    }
+
+    private func stopLocked() {
         connectionID = nil
         connection?.cancel()
         connection = nil
         lineBuffer.removeAll(keepingCapacity: false)
+        telnetControlBuffer.removeAll(keepingCapacity: false)
         bridgeChallenge = nil
         bridgeStartupCommand = nil
         state = .stopped
+    }
+
+    private func withQueueSync(_ operation: () -> Void) {
+        if DispatchQueue.getSpecific(key: queueKey) != nil { operation() }
+        else { queue.sync(execute: operation) }
+    }
+
+    private func finishLocked(id: UUID, state: State) {
+        guard connectionID == id else { return }
+        connectionID = nil
+        let connection = connection
+        self.connection = nil
+        lineBuffer.removeAll(keepingCapacity: false)
+        telnetControlBuffer.removeAll(keepingCapacity: false)
+        bridgeChallenge = nil
+        bridgeStartupCommand = nil
+        self.state = state
+        connection?.cancel()
     }
 
     private func receive(on connection: NWConnection) {
@@ -109,17 +152,21 @@ final class TelnetClient {
                 self.consumeText(payload)
             }
             if let error {
-                self.state = .failed(error.localizedDescription)
+                guard let id = self.connectionID else { return }
+                self.finishLocked(id: id, state: .failed(error.localizedDescription))
                 self.onDebugMain("Telnet receive error: \(error.localizedDescription)")
                 return
             }
             if complete {
                 if self.bridgeChallenge != nil {
-                    self.bridgeChallenge = nil
-                    self.bridgeStartupCommand = nil
-                    self.state = .failed("SC2 Telnet hop closed before the downstream shell was confirmed. Check the nested Telnet session and Sumo address.")
+                    guard let id = self.connectionID else { return }
+                    self.finishLocked(
+                        id: id,
+                        state: .failed("SC2 Telnet hop closed before the downstream shell was confirmed. Check the nested Telnet session and Sumo address.")
+                    )
                 } else {
-                    self.state = .stopped
+                    guard let id = self.connectionID else { return }
+                    self.finishLocked(id: id, state: .stopped)
                 }
                 self.onDebugMain("Telnet connection closed")
                 return
@@ -129,13 +176,24 @@ final class TelnetClient {
     }
 
     private func processTelnet(_ data: Data, on connection: NWConnection) -> Data {
-        let bytes = [UInt8](data)
+        var combined = telnetControlBuffer
+        combined.append(data)
+        telnetControlBuffer.removeAll(keepingCapacity: true)
+        let bytes = [UInt8](combined)
         var output = Data()
         var index = 0
         while index < bytes.count {
-            if bytes[index] == 255, index + 1 < bytes.count {
+            if bytes[index] == 255 {
+                guard index + 1 < bytes.count else {
+                    telnetControlBuffer.append(contentsOf: bytes[index...])
+                    break
+                }
                 let command = bytes[index + 1]
-                if [251, 252, 253, 254].contains(command), index + 2 < bytes.count {
+                if [251, 252, 253, 254].contains(command) {
+                    guard index + 2 < bytes.count else {
+                        telnetControlBuffer.append(contentsOf: bytes[index...])
+                        break
+                    }
                     let option = bytes[index + 2]
                     let response: UInt8 = (command == 253 || command == 254) ? 252 : 254
                     connection.send(content: Data([255, response, option]), completion: .contentProcessed { _ in })
@@ -145,6 +203,21 @@ final class TelnetClient {
                 if command == 255 {
                     output.append(255)
                     index += 2
+                    continue
+                }
+                if command == 250 {
+                    var end = index + 2
+                    while end + 1 < bytes.count,
+                          !(bytes[end] == 255 && bytes[end + 1] == 240) {
+                        end += 1
+                    }
+                    guard end + 1 < bytes.count else {
+                        if bytes.count - index <= 65_536 {
+                            telnetControlBuffer.append(contentsOf: bytes[index...])
+                        }
+                        break
+                    }
+                    index = end + 2
                     continue
                 }
                 index += 2
@@ -158,6 +231,10 @@ final class TelnetClient {
 
     private func consumeText(_ data: Data) {
         lineBuffer.append(data)
+        if lineBuffer.count > 1_048_576 {
+            lineBuffer = Data(lineBuffer.suffix(65_536))
+            onDebugMain("Telnet discarded an oversized line without a newline")
+        }
         while let newline = lineBuffer.firstIndex(of: 10) {
             let lineData = lineBuffer.prefix(upTo: newline)
             lineBuffer.removeSubrange(...newline)
@@ -188,10 +265,10 @@ final class TelnetClient {
         queue.asyncAfter(deadline: .now() + 0.7) { [weak self] in
             guard let self, self.connectionID == id, let challenge = self.bridgeChallenge else { return }
             guard attempts > 0 else {
-                self.bridgeChallenge = nil
-                self.bridgeStartupCommand = nil
-                self.state = .failed("SC2 Telnet hop did not confirm the Sumo shell within 9 seconds. No device command was issued; this does not prove Sumo is unreachable.")
-                connection.cancel()
+                self.finishLocked(
+                    id: id,
+                    state: .failed("SC2 Telnet hop did not confirm the Sumo shell within 9 seconds. No device command was issued; this does not prove Sumo is unreachable.")
+                )
                 return
             }
             // Read-only handshake; no upload/launch is sent until its exact echo

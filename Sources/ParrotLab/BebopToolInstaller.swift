@@ -7,6 +7,8 @@ enum BebopToolPackage: String {
     case rfModSuite
     case sumoRFModSuite
     case sumoB29Launcher
+    case sumoB29Install
+    case sumoB29Replacement
     case sc2Discovery
     case sc2DriverPatch
 
@@ -21,6 +23,8 @@ enum BebopToolPackage: String {
         case .rfModSuite: return "RF/MOD Suite"
         case .sumoRFModSuite: return "Sumo RF Lab"
         case .sumoB29Launcher: return "Sumo B29 Launcher"
+        case .sumoB29Install: return "Sumo B29 Startup Install"
+        case .sumoB29Replacement: return "Sumo Dragon Restore"
         case .sc2Discovery: return "SC2 Address Discovery"
         case .sc2DriverPatch: return "SC2 Driver Patch"
         }
@@ -61,6 +65,11 @@ enum BebopToolPackage: String {
             return [BebopToolAsset(sourceRelativePath: "tools/parrot_sumo_rf_lab.sh", remoteName: "parrot_sumo_rf_lab.sh")]
         case .sumoB29Launcher:
             return [BebopToolAsset(sourceRelativePath: "tools/start_sumo_b29.sh", remoteName: "start_sumo_b29.sh")]
+        case .sumoB29Install:
+            return [BebopToolAsset(sourceRelativePath: "tools/parrotlab_sumo_dragon_swap.sh", remoteName: "parrotlab_sumo_dragon_swap.sh"),
+                    BebopToolAsset(sourceRelativePath: "experimental/jumping-sumo/sumo/dragon-prog-B29", remoteName: "parrotlab-sumo-B29.upload")]
+        case .sumoB29Replacement:
+            return [BebopToolAsset(sourceRelativePath: "tools/parrotlab_sumo_dragon_swap.sh", remoteName: "parrotlab_sumo_dragon_swap.sh")]
         case .sc2Discovery:
             return [
                 BebopToolAsset(
@@ -142,15 +151,24 @@ enum BebopToolInstallerError: LocalizedError {
 /// It never writes outside FTP-visible `internal_000` and verifies every
 /// upload by downloading it again and comparing a SHA-256 digest.
 final class BebopToolInstaller: @unchecked Sendable {
-    /// Small Sumo scripts can travel over an SC2 Telnet tunnel when direct FTP
-    /// is not reachable. Never expose arbitrary files/binaries to this path.
+    /// Only fixed app-owned Sumo assets may travel through the SC2 tunnel.
+    static func sumoAssets(_ package: BebopToolPackage) throws -> [(Data, BebopInstalledAsset)] {
+        guard [.sumoB29Launcher, .sumoRFModSuite, .sumoB29Install, .sumoB29Replacement].contains(package) else {
+            throw BebopToolInstallerError.invalidHost
+        }
+        return try package.assets.map { asset in
+            let data = try Data(contentsOf: resolve(asset))
+            let limit = asset.remoteName == "parrotlab-sumo-B29.upload" ? 2_097_152 : 32_768
+            guard !data.isEmpty, data.count <= limit else { throw BebopToolInstallerError.oversizedAsset(asset.remoteName) }
+            return (data, BebopInstalledAsset(assetName: asset.remoteName, remoteName: asset.remoteName,
+                        byteCount: data.count, sha256: hex(SHA256.hash(data: data)), md5: hex(Insecure.MD5.hash(data: data))))
+        }
+    }
+
     static func sumoScript(_ package: BebopToolPackage) throws -> (Data, BebopInstalledAsset) {
-        guard package == .sumoB29Launcher || package == .sumoRFModSuite,
-              let asset = package.assets.first else { throw BebopToolInstallerError.invalidHost }
-        let data = try Data(contentsOf: resolve(asset))
-        guard data.count <= 32_768 else { throw BebopToolInstallerError.oversizedAsset(asset.remoteName) }
-        return (data, BebopInstalledAsset(assetName: asset.remoteName, remoteName: asset.remoteName,
-                byteCount: data.count, sha256: hex(SHA256.hash(data: data)), md5: hex(Insecure.MD5.hash(data: data))))
+        let assets = try sumoAssets(package)
+        guard assets.count == 1, let asset = assets.first else { throw BebopToolInstallerError.invalidHost }
+        return asset
     }
 
     static let maximumAssetBytes = 50 * 1_024 * 1_024
@@ -266,11 +284,21 @@ final class BebopToolInstaller: @unchecked Sendable {
         } catch {
             throw BebopToolInstallerError.commandFailed("Could not start the macOS FTP client: \(error.localizedDescription)")
         }
+        if processLock.withLock({ cancelled }), process.isRunning { process.terminate() }
+        let errorGroup = DispatchGroup()
+        let errorLock = NSLock()
+        var errorData = Data()
+        errorGroup.enter()
+        DispatchQueue.global(qos: .utility).async {
+            let data = errorPipe.fileHandleForReading.readDataToEndOfFile()
+            errorLock.withLock { errorData = data }
+            errorGroup.leave()
+        }
         process.waitUntilExit()
+        errorGroup.wait()
         try checkCancellation()
         guard process.terminationStatus == 0 else {
-            let data = errorPipe.fileHandleForReading.readDataToEndOfFile()
-            let detail = String(data: data, encoding: .utf8)?
+            let detail = String(data: errorData, encoding: .utf8)?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             throw BebopToolInstallerError.commandFailed(
                 detail?.isEmpty == false ? detail! : "Bebop FTP transfer failed (curl \(process.terminationStatus))."
@@ -342,6 +370,7 @@ final class BebopToolInstaller: @unchecked Sendable {
             BebopToolPackage.rfModSuite.assets.allSatisfy { (try? resolve($0)) != nil } &&
             BebopToolPackage.sumoRFModSuite.assets.allSatisfy { (try? resolve($0)) != nil } &&
             BebopToolPackage.sumoB29Launcher.assets.allSatisfy { (try? resolve($0)) != nil } &&
+            BebopToolPackage.sumoB29Install.assets.allSatisfy { (try? resolve($0)) != nil } &&
             BebopToolPackage.sc2Discovery.assets.allSatisfy { (try? resolve($0)) != nil } &&
             BebopToolPackage.sc2DriverPatch.assets.allSatisfy { (try? resolve($0)) != nil }
     }

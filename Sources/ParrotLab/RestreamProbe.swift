@@ -20,20 +20,44 @@ final class RestreamProbe {
     var onDebug: ((String) -> Void)?
 
     private let queue = DispatchQueue(label: "parrotlab.restream-probe")
+    private let queueKey = DispatchSpecificKey<Void>()
     private var connection: NWConnection?
     private var activeProbeID: UUID?
+    private let callbackLock = NSLock()
+    private var callbackProbeID: UUID?
+
+    init() {
+        queue.setSpecific(key: queueKey, value: ())
+    }
 
     func probe(host: String, ports: [UInt16] = [7711, 6007], completion: @escaping (Result<RestreamDescriptor, Error>) -> Void) {
-        cancel()
-        let probeID = UUID()
-        activeProbeID = probeID
-        probe(host: host, remainingPorts: ports, lastError: nil, probeID: probeID, completion: completion)
+        withQueueSync {
+            cancelLocked()
+            let probeID = UUID()
+            activeProbeID = probeID
+            callbackLock.lock()
+            callbackProbeID = probeID
+            callbackLock.unlock()
+            probe(host: host, remainingPorts: ports, lastError: nil, probeID: probeID, completion: completion)
+        }
     }
 
     func cancel() {
+        withQueueSync { cancelLocked() }
+    }
+
+    private func cancelLocked() {
         activeProbeID = nil
+        callbackLock.lock()
+        callbackProbeID = nil
+        callbackLock.unlock()
         connection?.cancel()
         connection = nil
+    }
+
+    private func withQueueSync(_ operation: () -> Void) {
+        if DispatchQueue.getSpecific(key: queueKey) != nil { operation() }
+        else { queue.sync(execute: operation) }
     }
 
     private func probe(
@@ -50,7 +74,9 @@ final class RestreamProbe {
                 code: 1,
                 userInfo: [NSLocalizedDescriptionKey: "No SC2 restream endpoint responded"]
             )
-            DispatchQueue.main.async { completion(.failure(error)) }
+            activeProbeID = nil
+            connection = nil
+            dispatchCompletion(.failure(error), id: probeID, completion: completion)
             return
         }
         guard let endpointPort = NWEndpoint.Port(rawValue: port) else {
@@ -84,12 +110,20 @@ final class RestreamProbe {
             connection.cancel()
             self.connection = nil
             self.activeProbeID = nil
-            DispatchQueue.main.async { completion(result) }
+            dispatchCompletion(result, id: probeID, completion: completion)
         }
 
         func receive() {
             connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { data, _, isComplete, error in
                 if let data { response.append(data) }
+                guard response.count <= 1_048_576 else {
+                    tryNext(NSError(
+                        domain: "ParrotLab.Restream",
+                        code: Int(port),
+                        userInfo: [NSLocalizedDescriptionKey: "Oversized response from port \(port)"]
+                    ))
+                    return
+                }
                 if let error {
                     self.debug("Port \(port) did not respond: \(error.localizedDescription)")
                     tryNext(error)
@@ -121,7 +155,7 @@ final class RestreamProbe {
             case .ready:
                 let request = "GET /video HTTP/1.1\r\nHost: \(host)\r\nConnection: close\r\n\r\n"
                 connection.send(content: Data(request.utf8), completion: .contentProcessed { error in
-                    if let error { finish(.failure(error)) }
+                    if let error { tryNext(error) }
                     else { receive() }
                 })
             case .failed(let error):
@@ -193,5 +227,20 @@ final class RestreamProbe {
 
     private func debug(_ message: String) {
         DispatchQueue.main.async { [weak self] in self?.onDebug?(message) }
+    }
+
+    private func dispatchCompletion(
+        _ result: Result<RestreamDescriptor, Error>,
+        id: UUID,
+        completion: @escaping (Result<RestreamDescriptor, Error>) -> Void
+    ) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.callbackLock.lock()
+            let isCurrent = self.callbackProbeID == id
+            self.callbackLock.unlock()
+            guard isCurrent else { return }
+            completion(result)
+        }
     }
 }

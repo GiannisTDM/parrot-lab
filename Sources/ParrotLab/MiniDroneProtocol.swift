@@ -72,7 +72,7 @@ struct MiniDroneTelemetry {
             // emit the same value as a single byte, so accept both forms.
             let value = b.count >= 8 ? word(4) : UInt32(b[4])
             flightState = MiniDroneFlyingState(rawValue: value)
-        case (2, 15, 1), (2, 15, 2):
+        case (2, 16, 1), (2, 16, 2):
             guard b.count == 7 || b.count >= 10 else { return }
             var inventory = command == 1 ? grabbers : cannons
             let legacyEnum = b.count < 10
@@ -116,7 +116,18 @@ struct MiniDroneLink {
     private var queues: [MiniDroneChannel: [Pending]] = [:]
     private var acknowledgements: [Write] = []
     private(set) var failure: String?
+    private(set) var malformedPackets: UInt64 = 0
+    private(set) var duplicateNotifications: UInt64 = 0
+    private(set) var droppedAcknowledgements: UInt64 = 0
     var pendingCount: Int { queues.values.reduce(0) { $0 + $1.count } }
+    var diagnosticSummary: String {
+        let tx = [MiniDroneChannel.piloting, .command, .emergency, .acknowledge]
+            .map { "\($0.rawValue):\(sequences[$0] ?? 0)" }.joined(separator: ",")
+        let rx = [MiniDroneChannel.state, .telemetry]
+            .map { "\($0.rawValue):\(receivedSequences[$0].map(String.init) ?? "-")" }.joined(separator: ",")
+        return "tx=[\(tx)] rx=[\(rx)] pending=\(pendingCount) ackq=\(acknowledgements.count) " +
+            "duplicate=\(duplicateNotifications) malformed=\(malformedPackets) ack-drop=\(droppedAcknowledgements)"
+    }
 
     private mutating func frame(_ payload: Data, channel: MiniDroneChannel, type: UInt8) -> Write {
         let sequence = (sequences[channel] ?? 0) &+ 1
@@ -145,27 +156,47 @@ struct MiniDroneLink {
 
     mutating func receive(_ data: Data, on channel: MiniDroneChannel) -> Data? {
         let bytes = [UInt8](data)
-        guard bytes.count >= 3, bytes.count <= 20 else { return nil }
+        guard bytes.count >= 3, bytes.count <= 20 else {
+            malformedPackets &+= 1
+            return nil
+        }
         if channel == .commandACK || channel == .emergencyACK {
             let output: MiniDroneChannel = channel == .commandACK ? .command : .emergency
-            guard bytes.count == 3, bytes[0] == 1,
-                  let pending = queues[output]?.first, pending.sentAt != nil,
+            guard bytes.count == 3, bytes[0] == 1 else {
+                malformedPackets &+= 1
+                return nil
+            }
+            guard let pending = queues[output]?.first, pending.sentAt != nil,
                   pending.write.data[1] == bytes[2] else { return nil }
             queues[output]?.removeFirst()
             return nil
         }
-        // The GATT characteristic determines whether the packet needs an ACK.
-        // Firmware revisions have used both ARNetwork data markers on FB0E/FB0F.
-        guard bytes[0] == 2 || bytes[0] == 4, bytes.count >= 6 else { return nil }
-        if channel == .state {
+        guard channel == .state || channel == .telemetry else {
+            malformedPackets &+= 1
+            return nil
+        }
+        // Firmware revisions use normal, low-latency and acknowledged ARNetwork
+        // data markers on both notification characteristics.
+        guard bytes[0] == 2 || bytes[0] == 3 || bytes[0] == 4,
+              bytes.count >= 6 else {
+            malformedPackets &+= 1
+            return nil
+        }
+        if bytes[0] == 4 {
             // ACK duplicate notifications too: the drone may have lost our ACK.
             let ack = frame(Data([bytes[1]]), channel: .acknowledge, type: 1)
-            if acknowledgements.count >= 32 { acknowledgements.removeFirst() }
+            if acknowledgements.count >= 32 {
+                acknowledgements.removeFirst()
+                droppedAcknowledgements &+= 1
+            }
             acknowledgements.append(ack)
         }
         if let previous = receivedSequences[channel] {
             let delta = bytes[1] &- previous
-            guard delta > 0, delta < 128 else { return nil }
+            guard delta > 0, delta < 128 else {
+                duplicateNotifications &+= 1
+                return nil
+            }
         }
         receivedSequences[channel] = bytes[1]
         return Data(bytes.dropFirst(2))

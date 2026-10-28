@@ -105,11 +105,12 @@ enum ParrotLabSelfTest {
             fputs("Self-test failed: Dragon profile/custom launch\n", stderr)
             return 1
         }
-        guard BebopToolInstaller.selfTest(), SumoDeviceTools.selfTest(), SumoBridgeUploader.selfTest(), TelnetClient.bridgeSelfTest(), AppDelegate.toolsMenuSelfTest() else {
+        guard BebopToolInstaller.selfTest(), SumoDeviceTools.selfTest(), SumoBridgeUploader.selfTest(),
+              SumoDragonSwapSelfTest.run(), TelnetClient.bridgeSelfTest(), AppDelegate.toolsMenuSelfTest() else {
             fputs("Self-test failed: bundled device tools\n", stderr)
             return 1
         }
-        guard H264VideoView.metadataSelfTest() else {
+        guard H264VideoView.metadataSelfTest(), H264VideoView.resetLifecycleSelfTest() else {
             fputs("Self-test failed: FrameInfo metadata\n", stderr)
             return 1
         }
@@ -160,8 +161,15 @@ enum ParrotLabSelfTest {
             return 1
         }
 
+        guard H264StreamRecorder.selfTest() else {
+            fputs("Self-test failed: raw recording lifecycle\n", stderr)
+            return 1
+        }
+        guard ProcessedH264Recorder.selfTest() else {
+            fputs("Self-test failed: processed recording lifecycle\n", stderr)
+            return 1
+        }
         guard MediaFileNamer.selfTest(), StillImageWriter.selfTest(),
-              H264StreamRecorder.selfTest(), ProcessedH264Recorder.selfTest(),
               H264MP4Converter.selfTest(),
               ProductSupportSelfTest.run(),
               FlightControlSelfTest.run(),
@@ -172,8 +180,36 @@ enum ParrotLabSelfTest {
         }
 
         guard MiniDroneSelfTest.run() else { return 1 }
-        guard AppDelegate.settingsInteractionSelfTest() else {
+        guard AnafiSelfTest.run() else { return 1 }
+        guard SC3MuxSelfTest.run() else { return 1 }
+        guard SC3RFSelfTest.run() else { return 1 }
+        guard SC3MaintenanceSelfTest.run(), MainViewController.sc3OwnerMaintenanceSelfTest() else { return 1 }
+        guard SC3SumoVideoInstallerSelfTest.run(), SC3SumoNativeSelfTest.run(), SC3SumoMappingSelfTest.run(),
+              SumoRelayDriveGate.selfTest(), SC3SumoRelaySelfTest.run(),
+              MainViewController.sc3SumoRouteInteractionSelfTest(), AppDelegate.sc3SumoMenuSelfTest() else {
+            fputs("Self-test failed: experimental SC3 Sumo relay\n", stderr)
+            return 1
+        }
+        guard SC2MuxSelfTest.run(), SC2MuxFileHandleLink.readLifecycleSelfTest(),
+              SC2TransportLifecycleSelfTest.run() else {
+            fputs("Self-test failed: SC2 libmux production transport\n", stderr)
+            return 1
+        }
+        guard AppDelegate.settingsInteractionSelfTest(), LabMotion.selfTest(), SumoSubjectTracker.selfTest(),
+              SumoFollowControl.selfTest(), SumoTrackingConfiguration.selfTest(), SumoTrackingTuningView.selfTest(),
+              SumoTrackingPresetView.selfTest(),
+              SumoVisionCompute.selfTest(),
+              HUDOverlayView.subjectSelectionSelfTest(), SumoAudioProtocol.selfTest(), SumoSoundView.selfTest(),
+              MainViewController.sumoFollowInteractionSelfTest() else {
             fputs("Self-test failed: settings interaction\n", stderr)
+            return 1
+        }
+        guard MainViewController.pendingSC2AttachmentSelfTest() else {
+            fputs("Self-test failed: SC2 mode switch during attachment\n", stderr)
+            return 1
+        }
+        guard MainViewController.videoStopRawArchiveSelfTest() else {
+            fputs("Self-test failed: video stop with raw archive active\n", stderr)
             return 1
         }
 

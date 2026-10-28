@@ -1,5 +1,56 @@
 # Parrot Lab release notes
 
+## V1.7 — 2026-10-28
+
+### Added
+
+- Mac-side Jumping Sumo subject following for people, legs, cats and manually
+  selected targets. Includes per-mode tuning and motion presets, appearance
+  matching, target recovery, blur handling and bounded anticipatory reverse.
+  Tracking uses Apple's on-device Vision compute devices; no downloaded model
+  is required. Following is experimental and has no obstacle avoidance.
+- Sumo built-in sound personalities and speaker volume with telemetry
+  confirmation. Custom voice uploads and automatic sound reactions are deferred.
+- Experimental ANAFI 4K workspace with Direct/SC3 network command sessions,
+  RTSP/H.264 preview, event-derived camera options, gimbal/zoom, aircraft SD
+  capture, Mac recording and explicit Mac co-piloting ownership. SC3 libmux
+  expects an external raw USB adapter; full FreeFlight 6 parity is not claimed.
+- SC2 mobile-link libmux framing/handshake, POMP discovery and ARSDK backend,
+  command/state and stream/RTP channels for BB1, BB2 and Sumo. A raw duplex
+  descriptor adapter is still required for the macOS AOA/iAP2 connection.
+- Separate experimental SC3 Sumo relay and native viewer routes. Relay uses
+  explicit discovery and a negotiated UDP socket for ARNetwork/MJPEG. Native
+  mode preserves physical SC3 control and disables Mac driving; mapping edits
+  remain local drafts with Apply disabled for the shared ANAFI mapping bank.
+- Opt-in native SC3 Sumo video startup installer with pinned resources,
+  status, restore and a controls-only fallback on the verified configuration.
+- SC3 RF Lab 0.2 with driver observations, five allowlisted staged settings,
+  exact previews, typed save consent, stale-hash checks and readback. Saving
+  settings neither reloads the driver nor measures actual RF output power.
+- Reversible, checksum-verified Sumo B29 Dragon replacement and stock restore,
+  separate from the existing temporary B29 launcher.
+- Copy Connection Diagnostics and organized, mode-aware menus and settings.
+
+### Fixed and improved
+
+- Hardened session ownership, reconnect/hot-plug handling, stale callback
+  rejection, input neutralization, ordered ACK/retry handling and BLE events.
+- Improved decoder, renderer, recording and media lifetime management with
+  bounded buffers and cleanup after cancellation or retired sessions.
+- Cancelled MP4 conversions now report cancellation even if FFmpeg exits
+  successfully after termination; partial output is removed.
+- Refined responsive layouts, mode transitions, settings and mapping input
+  isolation, plus additional deterministic protocol and lifecycle fixtures.
+- App identity is now 1.7.0, build 16. Public packaging includes the required
+  tools and pinned resources from a standalone repository checkout.
+
+### Current boundaries
+
+ANAFI/SC3 integrations and Sumo following remain experimental. Live reconnect,
+recording load, controller-input and aircraft camera/flight coverage are still
+incomplete. MiniDrone/Mambo control and cannon/grabber support shipped in 1.6;
+Flypad remains unsupported. The macOS app is ad-hoc signed and not notarized.
+
 ## V1.6 — 2026-09-12
 
 - Sumo gamepad steering now uses a cubic response after deadzone/range

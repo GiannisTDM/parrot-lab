@@ -19,11 +19,11 @@
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.6.0</string>
+	<string>1.7.0</string>
     <key>CFBundleVersion</key>
-    <string>15</string>
+	<string>16</string>
     <key>CFBundleGetInfoString</key>
-    <string>Parrot Lab 1.6.0</string>
+	<string>Parrot Lab 1.7.0</string>
     <key>NSHumanReadableCopyright</key>
     <string>Copyright © 2026 Parrot Lab contributors.</string>
     <key>LSMinimumSystemVersion</key>
@@ -33,7 +33,7 @@
     <key>NSBluetoothAlwaysUsageDescription</key>
     <string>Parrot Lab uses Bluetooth to discover and control your Mambo MiniDrone and its accessories.</string>
     <key>NSLocalNetworkUsageDescription</key>
-    <string>Parrot Lab connects to a Bebop Drone, Bebop 2, or Jumping Sumo for control, telemetry, media, and video.</string>
+    <string>Parrot Lab connects to a Bebop Drone, Bebop 2, Jumping Sumo, ANAFI 4K, or SkyController for control, telemetry, media, and video.</string>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
 </dict>

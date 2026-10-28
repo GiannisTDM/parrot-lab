@@ -3,6 +3,8 @@ import UniformTypeIdentifiers
 
 final class MainViewController: NSViewController {
     var onGroundModeChanged: ((Bool) -> Void)?
+    var onOwnerMaintenanceRequested: (() -> Void)?
+    private let maintenanceAccess = SC3MaintenanceAccess(address: "192.168.42.88")
 
     private enum SC2DriverInstallPhase {
         case idle
@@ -85,6 +87,45 @@ final class MainViewController: NSViewController {
     private let rawArchiveRecorder = H264StreamRecorder()
     private let mp4Converter = H264MP4Converter()
     private let arsdkClient = ARSDKCommandClient()
+    private let sc3SumoNative = SC3SumoNativeSession()
+    private var sc3SumoNativeState = SC3SumoNativeState()
+    private var sc3SumoMappingWindow: SC3SumoMappingWindowController?
+    private let sc3VideoInstaller = SC3SumoVideoInstaller()
+    private var sc3VideoMaintenanceInFlight = false
+    private var sc3RFWriteInFlight = false
+    private var sc3OwnerMaintenanceInFlight = false
+    func beginSC3OwnerMaintenance() -> Bool {
+        guard !miniDroneModeBlocked, !isTerminating, !isMiniDroneModeActive, !isAnafiModeActive,
+              !videoRunning, !arsdkSessionWanted, connectButton.title != "Disconnect", pendingSC2MobileLinkID == nil,
+              flightInputManager.hasNeutralOutput else { return false }
+        sc3OwnerMaintenanceInFlight = true; flightInputManager.setControlsAvailable(false); flightInputManager.neutralize()
+        updateInterface(); NSApp.mainMenu?.update(); return true
+    }
+    func endSC3OwnerMaintenance() { sc3OwnerMaintenanceInFlight = false; updateFlightControlAvailability(); updateInterface(); NSApp.mainMenu?.update() }
+    static func sc3OwnerMaintenanceSelfTest() -> Bool {
+        let controller = MainViewController(); _ = controller.view
+        defer { controller.prepareForTermination() }
+        guard controller.beginSC3OwnerMaintenance(), !controller.canChangeConnectionRoute,
+              !controller.connectButton.isEnabled, !controller.videoButton.isEnabled else { return false }
+        controller.toggleConnection(); controller.startVideo()
+        guard !controller.arsdkSessionWanted, !controller.videoRunning, controller.flightInputManager.hasNeutralOutput else { return false }
+        controller.endSC3OwnerMaintenance(); controller.arsdkSessionWanted = true
+        guard !controller.beginSC3OwnerMaintenance() else { return false }
+        controller.arsdkSessionWanted = false; controller.videoRunning = true
+        guard !controller.beginSC3OwnerMaintenance() else { return false }
+        controller.videoRunning = false; return true
+    }
+    func beginSC3RFWrite() -> Bool {
+        guard !miniDroneModeBlocked, !isTerminating else { return false }
+        sc3RFWriteInFlight = true; updateInterface(); NSApp.mainMenu?.update(); return true
+    }
+    func endSC3RFWrite() { sc3RFWriteInFlight = false; updateInterface(); NSApp.mainMenu?.update() }
+    private let sc3SumoNativeStatus = NSTextField(wrappingLabelWithString: "Native controller connection · physical SC3 controls")
+    private weak var sc3SumoNativeCard: NSView?
+    private lazy var sc2ProductionTransport = SC2ProductionTransport(arsdkClient: arsdkClient)
+    private var sc2ProductionTransportState = SC2ProductionTransportState.idle
+    private var pendingSC2MobileLinkID: UUID?
+    private var sc2MobileLinkStarted = false
     private let directProductDiscovery = DirectParrotProductDiscovery()
     private let flightInputManager = FlightInputManager()
     private var flightControlConfiguration = FlightControlConfiguration.load()
@@ -101,6 +142,13 @@ final class MainViewController: NSViewController {
     private var arsdkConnectionInFlight = false
     private var arsdkConnected = false
     private var activeARSDKRoute = ARSDKConnectionRoute.skyController
+    private lazy var sumoConnectionSelection = SumoConnectionSelection.load(standalone: flightControlConfiguration.standaloneBebopEnabled)
+    private let sumoRoutePopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let sumoRelayMovementButton = NSButton(checkboxWithTitle: "Enable movement for this session", target: nil, action: nil)
+    private let sumoRelayStatus = NSTextField(wrappingLabelWithString: "Movement off · waiting for a relay connection")
+    private weak var sumoRelayCard: NSView?
+    private var sumoRelayDriveGate = SumoRelayDriveGate()
+    private var sumoRelayConnectedAt: TimeInterval?
     private var flatTrimRequestPending = false
     private var magnetometerCalibrationRequestPending = false
     private var magnetometerCalibrationActive = false
@@ -213,6 +261,7 @@ final class MainViewController: NSViewController {
     private var rfPowerStepSucceeded = false
     private var rfPowerDiscoveryAttempted = false
     private var rfPowerTimeoutTimer: Timer?
+    private var rfPowerDelayedStopToken: UUID?
     private var dragonRuntimeStatus = "SC2 OFFLINE"
 
     private static let mediaDirectoryPreferenceKey = "ParrotLabMediaDirectory"
@@ -227,8 +276,11 @@ final class MainViewController: NSViewController {
     private let hudView = VideoHUDView(frame: .zero)
     private let workbenchSubtitle = NSTextField(labelWithString: "BEBOP VIDEO & RF WORKBENCH")
     private var miniDroneController: MiniDroneViewController?
+    private var anafiController: AnafiViewController?
+    var isAnafiModeActive: Bool { anafiController != nil }
     private weak var standardWorkspaceView: NSView?
     private let miniDroneModeButton = NSButton(title: "MiniDrone", target: nil, action: nil)
+    private let anafiModeButton = NSButton(title: "ANAFI 4K", target: nil, action: nil)
     var isMiniDroneModeActive: Bool { miniDroneController != nil }
 
     private let groundModeButton = NSButton(title: "GROUND MODE", target: nil, action: nil)
@@ -278,6 +330,7 @@ final class MainViewController: NSViewController {
     private var sc2Mappings = SC2MappingState()
     private var sc2MappingPending: (product: UInt16, change: SC2MappingChange)?
     private var sc2MappingTimeout: Timer?
+    private var isTerminating = false
     private var sc2MappingMessage = "Connect through SC2, then reload its mapping."
     private var sc2MappingReadRequired = false
     private var toolbarView: NSView?
@@ -289,6 +342,36 @@ final class MainViewController: NSViewController {
     private var navigationSidebarCard: NSView?
     private var healthSidebarCard: NSView?
     private weak var groundSpeedControlsRow: NSView?
+    private let sumoTracker = SumoSubjectTracker()
+    private var sumoTrackingActive = false
+    private var sumoFollowing = false
+    private var sumoObservation: SumoSubjectObservation?
+    private var sumoDesiredHeight: CGFloat = 0
+    private var sumoReferenceScale: CGFloat = 1
+    private var sumoFollowConfiguration = SumoTrackingConfiguration.load()
+    private var sumoFollowMotion = SumoFollowMotion()
+    private var sumoMeasurementFilter = SumoFollowMeasurementFilter()
+    private var sumoMeasurement: SumoFollowMeasurement?
+    private var sumoMeasurementAt: TimeInterval?
+    private var sumoTrackingPresentation: SumoTrackingPresentationState = .idle
+    private var sumoFollowPaused = false
+    private var sumoSelectingTarget = false
+    private var sumoManualTarget = false
+    private var sumoPointSelectionPending = false
+    private var sumoTrackingStartedAt: TimeInterval = 0
+    private var sumoTrackingTimer: Timer?
+    private var sumoTrackingObservers: [NSObjectProtocol] = []
+    private var sumoEscapeMonitor: Any?
+    private weak var sumoTrackingCard: NSView?
+    private let sumoTrackingStatus = NSTextField(wrappingLabelWithString: "Start the camera, then click a subject or choose Track.")
+    private let sumoTrackingBadge = NSTextField(labelWithString: "Idle")
+    private let sumoDetectButton = NSButton(title: "Track", target: nil, action: nil)
+    private let sumoFollowButton = NSButton(title: "Follow", target: nil, action: nil)
+    private let sumoSubjectMode = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let sumoSelectTargetButton = NSButton(title: "Select in video…", target: nil, action: nil)
+    private lazy var sumoTuningView = SumoTrackingTuningView(configuration: sumoFollowConfiguration)
+    private lazy var sumoPresetView = SumoTrackingPresetView(configuration: sumoFollowConfiguration)
+    private let sumoSoundView = SumoSoundView()
     private var groundSpeedLimit = 100
     private let sidebarNotice = NSTextField(wrappingLabelWithString: "Dragon video profiles change runtime options only. They never write the persistent Dragon property or replace the stock system binary.")
 
@@ -301,8 +384,7 @@ final class MainViewController: NSViewController {
             productModel = .jumpingSumo
             arsdkClient.setProductModel(.jumpingSumo)
         }
-        activeARSDKRoute = flightControlConfiguration.standaloneBebopEnabled
-            ? .directProduct : .skyController
+        activeARSDKRoute = selectedARSDKRoute
         if UserDefaults.standard.object(forKey: Self.jumpingSumoSpeedLimitPreferenceKey) != nil {
             groundSpeedLimit = min(100, max(0,
                 UserDefaults.standard.integer(forKey: Self.jumpingSumoSpeedLimitPreferenceKey)
@@ -313,7 +395,10 @@ final class MainViewController: NSViewController {
         let savedUSBHost = UserDefaults.standard.string(forKey: Self.cachedSC2USBHostPreferenceKey) ?? ""
         let savedBridgeHost = UserDefaults.standard.string(forKey: Self.cachedSC2HostPreferenceKey) ?? ""
         let savedSumoHost = UserDefaults.standard.string(forKey: Self.jumpingSumoHostPreferenceKey) ?? ""
-        if groundModeRequested, flightControlConfiguration.standaloneBebopEnabled {
+        if groundModeRequested, sumoConnectionSelection.route.isSC3Sumo {
+            let saved = UserDefaults.standard.string(forKey: sumoConnectionSelection == .sc3Native ? SumoConnectionSelection.nativeHostKey : SumoConnectionSelection.relayHostKey) ?? ""
+            hostField.stringValue = SC3SumoRelay.isValidHost(saved) ? saved : SC3SumoRelay.defaultHost
+        } else if groundModeRequested, sumoConnectionSelection == .direct {
             hostField.stringValue = Self.isValidIPv4Host(savedSumoHost)
                 ? savedSumoHost
                 : Self.defaultJumpingSumoHost
@@ -382,11 +467,11 @@ final class MainViewController: NSViewController {
 
     private func buildToolbar() -> NSView {
         let panel = LabPanelView(emphasized: true, cornerRadius: 16)
-        panel.heightAnchor.constraint(equalToConstant: 116).isActive = true
+        panel.heightAnchor.constraint(greaterThanOrEqualToConstant: 106).isActive = true
         let rows = NSStackView()
         rows.orientation = .vertical
         rows.alignment = .width
-        rows.spacing = 12
+        rows.spacing = 8
         rows.translatesAutoresizingMaskIntoConstraints = false
         panel.addSubview(rows)
         NSLayoutConstraint.activate([
@@ -416,7 +501,9 @@ final class MainViewController: NSViewController {
         let title = NSTextField(labelWithString: "Parrot Lab")
         title.font = .systemFont(ofSize: 21, weight: .semibold)
         title.textColor = .white
-        let version = sectionLabel("1.6")
+        let fullVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+        let displayVersion = fullVersion?.split(separator: ".").prefix(2).joined(separator: ".") ?? "1.7"
+        let version = sectionLabel(displayVersion)
         version.textColor = LabVisualStyle.accent
         titleRow.addArrangedSubview(title)
         titleRow.addArrangedSubview(version)
@@ -427,12 +514,15 @@ final class MainViewController: NSViewController {
         top.addArrangedSubview(identity)
         styleButton(groundModeButton, action: #selector(toggleGroundMode), symbol: "arrow.triangle.swap")
         groundModeButton.setButtonType(.pushOnPushOff)
-        groundModeButton.widthAnchor.constraint(equalToConstant: 136).isActive = true
+        groundModeButton.widthAnchor.constraint(equalToConstant: 110).isActive = true
         groundModeButton.toolTip = "Switch between the air and ground workspaces"
         top.addArrangedSubview(groundModeButton)
         styleButton(miniDroneModeButton, action: #selector(enterMiniDroneMode), symbol: "sparkles")
         miniDroneModeButton.toolTip = "Connect a Mambo over Bluetooth"
         top.addArrangedSubview(miniDroneModeButton)
+        styleButton(anafiModeButton, action: #selector(enterAnafiMode), symbol: "camera.aperture")
+        anafiModeButton.toolTip = "ANAFI 4K live video and camera controls · Direct or SC3"
+        top.addArrangedSubview(anafiModeButton)
         top.addArrangedSubview(toolbarSpacer())
         styleButton(focusButton, action: #selector(toggleFocus), symbol: "sidebar.right")
         focusButton.setButtonType(.pushOnPushOff)
@@ -440,14 +530,17 @@ final class MainViewController: NSViewController {
         top.addArrangedSubview(focusButton)
         configureStatusPill()
         top.addArrangedSubview(statusLabel)
+        let settings = NSButton(title: "Settings", target: nil, action: #selector(AppDelegate.showSettings(_:)))
+        settings.bezelStyle = .rounded
+        settings.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: nil)
+        top.addArrangedSubview(settings)
         hostSectionLabel.font = .systemFont(ofSize: 9, weight: .semibold)
         hostSectionLabel.textColor = LabVisualStyle.mutedText
-        top.addArrangedSubview(hostSectionLabel)
         styleTextField(hostField, width: 140)
         hostField.setAccessibilityLabel("Connection IP address")
-        top.addArrangedSubview(hostField)
+        hostField.delegate = maintenanceAccess
+        maintenanceAccess.onUnlock = { [weak self] in self?.onOwnerMaintenanceRequested?() }
         styleButton(connectButton, action: #selector(toggleConnection), symbol: "cable.connector")
-        top.addArrangedSubview(connectButton)
         rows.addArrangedSubview(top)
 
         let divider = NSBox()
@@ -456,6 +549,16 @@ final class MainViewController: NSViewController {
         let capture = NSStackView()
         capture.alignment = .centerY
         capture.spacing = 8
+        sumoRoutePopup.addItems(withTitles: SumoConnectionSelection.allCases.map(\.title))
+        sumoRoutePopup.font = .systemFont(ofSize: 10.5)
+        sumoRoutePopup.widthAnchor.constraint(equalToConstant: 205).isActive = true
+        sumoRoutePopup.setAccessibilityLabel("Sumo connection route")
+        sumoRoutePopup.target = self; sumoRoutePopup.action = #selector(sumoRouteChanged)
+        capture.addArrangedSubview(sumoRoutePopup)
+        capture.addArrangedSubview(hostSectionLabel)
+        capture.addArrangedSubview(hostField)
+        capture.addArrangedSubview(connectButton)
+        let options = NSStackView(); options.alignment = .centerY; options.spacing = 10
         for mode in VideoReceiveMode.allCases {
             videoModePopup.addItem(withTitle: mode.menuTitle)
             videoModePopup.lastItem?.tag = mode.rawValue
@@ -466,7 +569,7 @@ final class MainViewController: NSViewController {
         videoModePopup.font = .systemFont(ofSize: 11, weight: .medium)
         videoModePopup.widthAnchor.constraint(equalToConstant: 218).isActive = true
         videoModePopup.setAccessibilityLabel("Video receiver mode")
-        capture.addArrangedSubview(videoModePopup)
+        options.addArrangedSubview(videoModePopup)
         styleButton(videoButton, action: #selector(startVideo), symbol: "video")
         videoButton.bezelColor = LabVisualStyle.accent
         capture.addArrangedSubview(videoButton)
@@ -474,7 +577,7 @@ final class MainViewController: NSViewController {
         styleButton(browseMediaButton, action: #selector(browseMediaDirectory), symbol: "folder")
         browseMediaButton.title = "Save to…"
         browseMediaButton.toolTip = mediaDirectoryURL.path
-        capture.addArrangedSubview(browseMediaButton)
+        options.addArrangedSubview(browseMediaButton)
         styleButton(pictureButton, action: #selector(takePicture), symbol: "camera")
         pictureButton.toolTip = "Save the latest processed video frame without the HUD"
         capture.addArrangedSubview(pictureButton)
@@ -486,17 +589,20 @@ final class MainViewController: NSViewController {
         pictureFormatPopup.font = .systemFont(ofSize: 11, weight: .medium)
         pictureFormatPopup.widthAnchor.constraint(equalToConstant: 68).isActive = true
         pictureFormatPopup.setAccessibilityLabel("Picture format")
-        capture.addArrangedSubview(pictureFormatPopup)
+        options.addArrangedSubview(pictureFormatPopup)
         styleButton(droneFisheyeButton, action: #selector(captureDroneFisheye), symbol: "camera.aperture")
         droneFisheyeButton.widthAnchor.constraint(equalToConstant: 146).isActive = true
         droneFisheyeButton.toolTip = "Capture and download the drone's original full-sensor JPEG"
-        capture.addArrangedSubview(droneFisheyeButton)
+        options.addArrangedSubview(droneFisheyeButton)
         styleButton(recordingButton, action: #selector(toggleRecording), symbol: "record.circle")
         recordingButton.bezelColor = .systemRed
         recordingButton.widthAnchor.constraint(equalToConstant: 114).isActive = true
         recordingButton.toolTip = "Record the processed video to your selected media folder"
         capture.addArrangedSubview(recordingButton)
+        options.addArrangedSubview(toolbarSpacer())
+        capture.addArrangedSubview(LabDisclosureButton(title: "Camera options", views: [options]))
         rows.addArrangedSubview(capture)
+        rows.addArrangedSubview(options)
         return panel
     }
 
@@ -504,6 +610,12 @@ final class MainViewController: NSViewController {
         let spacer = NSView()
         spacer.setContentHuggingPriority(.init(1), for: .horizontal)
         return spacer
+    }
+
+    var isWorkspaceFocused: Bool { anafiController?.isWorkspaceFocused ?? (focusButton.state == .on) }
+    func toggleWorkspaceFocus() {
+        if let anafiController { anafiController.toggleWorkspaceFocus() }
+        else if !isMiniDroneModeActive { focusButton.performClick(nil) }
     }
 
     @objc private func toggleFocus() {
@@ -532,6 +644,61 @@ final class MainViewController: NSViewController {
         dragonSidebarCard = dragonCard
         let vehicleCard = card(title: "VEHICLE", body: NSTextField(labelWithString: ""), supplementalViews: [vehicleOverview])
         stack.addArrangedSubview(vehicleCard)
+        sumoRelayMovementButton.target = self; sumoRelayMovementButton.action = #selector(sumoRelayMovementChanged)
+        sumoRelayMovementButton.font = .systemFont(ofSize: 11)
+        sumoRelayStatus.font = .systemFont(ofSize: 10.5)
+        sumoRelayStatus.widthAnchor.constraint(equalToConstant: 274).isActive = true
+        let relayHint = NSTextField(wrappingLabelWithString: "Host-tested only. SC3 must already be on Sumo Wi-Fi, with its relay started separately and a working USB network link (RNDIS/ReRNDIS). Native SC3 HID mapping is unverified; use Mac keys or an identified external gamepad. First trial: wheels raised, movement off.")
+        relayHint.font = .systemFont(ofSize: 10); relayHint.textColor = LabVisualStyle.mutedText
+        relayHint.widthAnchor.constraint(equalToConstant: 274).isActive = true
+        let relayCard = card(title: "SC3 SUMO · EXPERIMENTAL", body: sumoRelayStatus,
+                             supplementalViews: [sumoRelayMovementButton, relayHint])
+        sumoRelayCard = relayCard; stack.addArrangedSubview(relayCard)
+        sc3SumoNativeStatus.font = .systemFont(ofSize: 10.5)
+        sc3SumoNativeStatus.widthAnchor.constraint(equalToConstant: 274).isActive = true
+        let nativeMappings = NSButton(title: "Native SC3 mappings…", target: self, action: #selector(showSC3SumoMappings))
+        nativeMappings.bezelStyle = .rounded
+        let nativeHint = NSTextField(wrappingLabelWithString: "Physical SC3 sticks retain control. Mac driving and following are off on this route. Video requires the separate native v2 observer; v1c alone provides no Mac video.")
+        nativeHint.font = .systemFont(ofSize: 10); nativeHint.textColor = LabVisualStyle.mutedText
+        nativeHint.widthAnchor.constraint(equalToConstant: 274).isActive = true
+        let nativeCard = card(title: "SC3 NATIVE · EXPERIMENTAL", body: sc3SumoNativeStatus,
+                              supplementalViews: [nativeMappings, nativeHint])
+        sc3SumoNativeCard = nativeCard; stack.addArrangedSubview(nativeCard)
+        for mode in SumoTrackingMode.allCases { sumoSubjectMode.addItem(withTitle: mode.title) }
+        sumoSubjectMode.selectItem(at: SumoTrackingMode.allCases.firstIndex(of: sumoFollowConfiguration.mode) ?? 0)
+        sumoSubjectMode.target = self; sumoSubjectMode.action = #selector(sumoSubjectModeChanged)
+        sumoSubjectMode.setAccessibilityLabel("Tracking subject")
+        let trackerButtons = NSStackView(views: [sumoDetectButton, sumoFollowButton])
+        trackerButtons.spacing = 8
+        sumoDetectButton.target = self; sumoDetectButton.action = #selector(toggleSumoTracking)
+        sumoFollowButton.target = self; sumoFollowButton.action = #selector(toggleSumoFollowing)
+        [sumoDetectButton, sumoFollowButton].forEach { $0.bezelStyle = .rounded }
+        sumoSelectTargetButton.target = self; sumoSelectTargetButton.action = #selector(selectSumoTarget)
+        sumoSelectTargetButton.bezelStyle = .rounded
+        sumoTrackingBadge.font = .systemFont(ofSize: 12, weight: .semibold)
+        sumoTrackingBadge.setAccessibilityLabel("Tracking state")
+        let trackingHint = NSTextField(wrappingLabelWithString: "Click a subject to track it, or drag around a partial view. Follow starts movement. Blur slows turning; recovery pauses movement. Escape or Mac input stops. Demo: no obstacle avoidance.")
+        trackingHint.font = .systemFont(ofSize: 10); trackingHint.textColor = LabVisualStyle.mutedText
+        trackingHint.widthAnchor.constraint(equalToConstant: 274).isActive = true
+        sumoTuningView.onChange = { [weak self] in self?.applySumoTrackingConfiguration($0) }
+        sumoPresetView.onChange = { [weak self] in self?.applySumoTrackingConfiguration($0) }
+        sumoTuningView.isHidden = true
+        let tuningDisclosure = LabDisclosureButton(title: "Advanced", views: [sumoTuningView])
+        sumoSoundView.onVolume = { [weak self] volume in
+            guard let self, self.isGroundModeActive, self.arsdkConnected else { return }
+            self.arsdkClient.setSumoVolume(volume)
+        }
+        sumoSoundView.onTheme = { [weak self] theme in
+            guard let self, self.isGroundModeActive, self.arsdkConnected else { return }
+            self.arsdkClient.setSumoAudioTheme(theme)
+        }
+        sumoSoundView.isHidden = true
+        let soundsDisclosure = LabDisclosureButton(title: "Sumo sounds", views: [sumoSoundView])
+        let trackingCard = card(title: "SUBJECT FOLLOW · DEMO", body: sumoTrackingStatus,
+                                supplementalViews: [sumoTrackingBadge, sumoSubjectMode, trackerButtons, sumoSelectTargetButton,
+                                                    sumoPresetView, trackingHint, tuningDisclosure, sumoTuningView,
+                                                    soundsDisclosure, sumoSoundView])
+        sumoTrackingCard = trackingCard; stack.addArrangedSubview(trackingCard)
         stack.addArrangedSubview(buildVideoOverviewCard())
         stack.addArrangedSubview(dragonCard)
         let rfCard = card(title: "RF LINK", body: rfLabel)
@@ -954,6 +1121,180 @@ final class MainViewController: NSViewController {
         groundModeRequested || productModel.isGroundProduct
     }
 
+    private var selectedARSDKRoute: ARSDKConnectionRoute {
+        groundModeActive ? sumoConnectionSelection.route :
+            (flightControlConfiguration.standaloneBebopEnabled ? .directProduct : .skyController)
+    }
+
+    var isSumoSC3RelaySelected: Bool {
+        !isMiniDroneModeActive && !isAnafiModeActive && groundModeActive && sumoConnectionSelection == .sc3Relay
+    }
+
+    var isSumoSC3NativeSelected: Bool {
+        !isMiniDroneModeActive && !isAnafiModeActive && groundModeActive && sumoConnectionSelection == .sc3Native
+    }
+
+    var isSumoSC3Selected: Bool { isSumoSC3RelaySelected || isSumoSC3NativeSelected }
+
+    private var relayMovementAllowed: Bool {
+        !isSumoSC3NativeSelected && (!isSumoSC3RelaySelected || (arsdkConnected && sumoRelayDriveGate.armed &&
+            sumoRelayDriveGate.isFresh(at: ProcessInfo.processInfo.systemUptime) &&
+            NSApp.isActive && view.window?.isKeyWindow == true && !(view.window?.firstResponder is NSTextView)))
+    }
+
+    private var connectionButtonTitle: String {
+        activeARSDKRoute == .sumoSC3Native ? "Connect native SC3" : activeARSDKRoute == .sumoSC3Relay ? "Connect SC3 relay" :
+            (activeARSDKRoute == .skyController ? "Connect SC2" : (groundModeActive ? "Connect Sumo" : "Connect Aircraft"))
+    }
+
+    @objc private func sumoRouteChanged() {
+        guard SumoConnectionSelection.allCases.indices.contains(sumoRoutePopup.indexOfSelectedItem), !miniDroneModeBlocked else { return }
+        selectSumoRoute(SumoConnectionSelection.allCases[sumoRoutePopup.indexOfSelectedItem], persist: true)
+    }
+
+    private func selectSumoRoute(_ selection: SumoConnectionSelection, persist: Bool) {
+        guard groundModeActive, selection != sumoConnectionSelection else { return }
+        flightInputManager.setControlsAvailable(false)
+        disarmSumoRelayMovement(reason: "Route changed", reset: true)
+        arsdkClient.neutralizePilotingInput()
+        if videoRunning { startVideo() }
+        directProductDiscovery.stop(); stopSC2MobileLink(); stopARSDKTelemetry(); telnet.stop()
+        sumoConnectionSelection = selection; activeARSDKRoute = selection.route
+        if persist { UserDefaults.standard.set(selection.rawValue, forKey: SumoConnectionSelection.preferenceKey) }
+        let key = selection == .sc3Native ? SumoConnectionSelection.nativeHostKey : selection == .sc3Relay ? SumoConnectionSelection.relayHostKey :
+            (selection == .direct ? Self.jumpingSumoHostPreferenceKey : Self.cachedSC2USBHostPreferenceKey)
+        let saved = UserDefaults.standard.string(forKey: key) ?? ""
+        let valid = selection.route.isSC3Sumo ? SC3SumoRelay.isValidHost(saved) : Self.isValidIPv4Host(saved)
+        hostField.stringValue = valid ? saved :
+            (selection == .direct ? Self.defaultJumpingSumoHost : SC3SumoRelay.defaultHost)
+        setDisconnectedInterface(); applyGroundModeAppearance(); updateWindowIdentity()
+    }
+
+    func setSumoSC3RelayForPreview() {
+        setGroundModeForPreview(true)
+        selectSumoRoute(.sc3Relay, persist: false)
+    }
+
+    func setSumoSC3NativeForPreview() {
+        setGroundModeForPreview(true)
+        selectSumoRoute(.sc3Native, persist: false)
+    }
+
+    static func sc3SumoRouteInteractionSelfTest() -> Bool {
+        _ = NSApplication.shared
+        let previousTheme = LabVisualStyle.themeMode
+        let previousGround = UserDefaults.standard.object(forKey: Self.groundModePreferenceKey)
+        let controller = MainViewController()
+        _ = controller.view
+        defer {
+            controller.prepareForTermination()
+            if let previousGround { UserDefaults.standard.set(previousGround, forKey: Self.groundModePreferenceKey) }
+            else { UserDefaults.standard.removeObject(forKey: Self.groundModePreferenceKey) }
+            LabVisualStyle.applyTheme(previousTheme, to: NSView())
+        }
+        controller.setSumoSC3RelayForPreview()
+        let cached = UserDefaults.standard.string(forKey: SumoConnectionSelection.relayHostKey) ?? ""
+        guard controller.isSumoSC3RelaySelected, controller.activeARSDKRoute == .sumoSC3Relay,
+              controller.hostField.stringValue == (SC3SumoRelay.isValidHost(cached) ? cached : SC3SumoRelay.defaultHost),
+              !controller.sumoRelayDriveGate.armed, controller.sumoRelayMovementButton.state == .off,
+              controller.flightInputManager.requiresVerifiedExternalGameController else { return false }
+        let inbound = Pipe(), outbound = Pipe()
+        controller.attachSC2MobileLink(readHandle: inbound.fileHandleForReading,
+            writeHandle: outbound.fileHandleForWriting, closesHandles: true)
+        defer { try? inbound.fileHandleForWriting.close(); try? outbound.fileHandleForReading.close() }
+        guard controller.pendingSC2MobileLinkID == nil, !controller.sc2MobileLinkStarted,
+              controller.activeARSDKRoute == .sumoSC3Relay else { return false }
+        let now = ProcessInfo.processInfo.systemUptime
+        controller.sumoRelayDriveGate.receivedState(at: now)
+        guard controller.sumoRelayDriveGate.arm(at: now, neutral: true, focused: true) else { return false }
+        controller.sumoRelayMovementButton.state = .on
+        controller.disarmSumoRelayMovement(reason: "fixture input loss")
+        guard !controller.sumoRelayDriveGate.armed, controller.sumoRelayMovementButton.state == .off,
+              controller.flightInputManager.hasNeutralOutput else { return false }
+        controller.sumoRelayDriveGate.receivedHeartbeat(at: now + 1)
+        guard !controller.sumoRelayDriveGate.armed else { return false }
+        controller.findSC2USBHost()
+        guard !controller.sc2DiscoveryInFlight else { return false }
+        controller.selectSumoRoute(.sc3Native, persist: false)
+        guard controller.isSumoSC3NativeSelected, controller.activeARSDKRoute == .sumoSC3Native,
+              !controller.relayMovementAllowed, controller.rejectSC3RelayDeviceTool(),
+              controller.sc3SumoNativeCard?.isHidden == false,
+              controller.sumoRelayCard?.isHidden == true else { return false }
+        guard controller.canManageSC3SumoVideo else { return false }
+        controller.sc3VideoMaintenanceInFlight = true
+        guard !controller.canManageSC3SumoVideo, !controller.canChangeConnectionRoute,
+              controller.miniDroneModeBlocked, !controller.beginSC3RFWrite() else { return false }
+        controller.sc3VideoMaintenanceInFlight = false
+        guard controller.beginSC3RFWrite(), !controller.beginSC3RFWrite(),
+              !controller.canManageSC3SumoVideo, !controller.canChangeConnectionRoute else { return false }
+        controller.endSC3RFWrite()
+        guard controller.canManageSC3SumoVideo else { return false }
+        controller.arsdkSessionWanted = true
+        var native = SC3SumoNativeState(); native.connected = true
+        controller.consumeSC3SumoNativeState(native)
+        native.videoRequested = true
+        controller.consumeSC3SumoNativeState(native)
+        controller.videoRunning = true
+        native.videoRequested = false
+        controller.consumeSC3SumoNativeState(native)
+        guard !controller.videoRunning, controller.arsdkConnected else { return false }
+        controller.videoRunning = true
+        controller.consumeSC3SumoNativeState(SC3SumoNativeState())
+        guard !controller.videoRunning, !controller.arsdkConnected,
+              controller.flightInputManager.hasNeutralOutput, !controller.relayMovementAllowed else { return false }
+        controller.stopARSDKTelemetry()
+        controller.groundModeButton.state = .off
+        controller.toggleGroundMode()
+        guard !controller.isSumoSC3RelaySelected,
+              controller.activeARSDKRoute == (controller.flightControlConfiguration.standaloneBebopEnabled ? .directProduct : .skyController),
+              !controller.flightInputManager.requiresVerifiedExternalGameController else { return false }
+        controller.setSumoSC3RelayForPreview()
+        controller.selectSumoRoute(.direct, persist: false)
+        return !controller.isSumoSC3RelaySelected && controller.activeARSDKRoute == .directProduct &&
+            !controller.flightInputManager.requiresVerifiedExternalGameController && !controller.sumoRelayDriveGate.armed
+    }
+
+    @objc private func sumoRelayMovementChanged() {
+        guard isSumoSC3RelaySelected else { return }
+        if sumoRelayMovementButton.state != .on {
+            disarmSumoRelayMovement(reason: "Movement disabled"); updateFlightControlAvailability(); updateInterface(); return
+        }
+        let focused = NSApp.isActive && view.window?.isKeyWindow == true &&
+            (view.window.map { Self.prepareSumoFollowFocus(in: $0) } ?? false)
+        guard arsdkConnected, flightControlsEnabled,
+              sumoRelayDriveGate.arm(at: ProcessInfo.processInfo.systemUptime,
+                  neutral: flightInputManager.hasNeutralInputsForArming, focused: focused) else {
+            sumoRelayMovementButton.state = .off
+            sumoRelayStatus.stringValue = "Wait for live Sumo state, focus this window and center all controls before enabling movement."
+            return
+        }
+        arsdkClient.setRelayMovementEnabled(true)
+        appendLog("Experimental SC3 Sumo movement enabled for this session")
+        updateFlightControlAvailability(); updateInterface()
+    }
+
+    private func disarmSumoRelayMovement(reason: String, reset: Bool = false) {
+        guard isSumoSC3RelaySelected || activeARSDKRoute == .sumoSC3Relay else { return }
+        let wasArmed = sumoRelayDriveGate.armed || sumoRelayMovementButton.state == .on || sumoFollowing
+        if reset { sumoRelayDriveGate.reset() } else { sumoRelayDriveGate.disarm() }
+        sumoRelayMovementButton.state = .off
+        guard wasArmed || reset else { return }
+        arsdkClient.setRelayMovementEnabled(false)
+        flightInputManager.setControlsAvailable(false)
+        arsdkClient.neutralizePilotingInput()
+        stopSumoFollowing(reason: reason)
+        groundDriveStatus = "SPEED 0 · TURN 0"
+        sumoRelayStatus.stringValue = "Movement off · \(reason)"
+        if wasArmed { appendLog("SC3 Sumo movement disabled · \(reason)") }
+    }
+
+    private func enforceSumoRelayMovementGate() {
+        if isSumoSC3RelaySelected, sumoRelayDriveGate.armed, !relayMovementAllowed {
+            disarmSumoRelayMovement(reason: "Stale state, focus or input loss")
+            updateFlightControlAvailability()
+        }
+    }
+
     /// Used only by the deterministic UI renderer. It exercises the same
     /// presentation path as the user-facing switch without persisting a test
     /// preference or attempting a network connection.
@@ -963,6 +1304,7 @@ final class MainViewController: NSViewController {
         productModel = enabled ? .jumpingSumo : .unknown
         arsdkClient.setProductModel(productModel)
         flightControlConfiguration.standaloneBebopEnabled = enabled
+        sumoConnectionSelection = enabled ? .direct : .sc2
         activeARSDKRoute = enabled ? .directProduct : .skyController
         if enabled {
             hostField.stringValue = Self.defaultJumpingSumoHost
@@ -974,15 +1316,44 @@ final class MainViewController: NSViewController {
         updateInterface()
     }
 
+    @objc func enterAnafiMode() {
+        guard !isAnafiModeActive, !isMiniDroneModeActive, !miniDroneModeBlocked else { return }
+        if videoRunning { startVideo() }
+        flightInputManager.neutralize()
+        directProductDiscovery.stop(); stopSC2MobileLink(); stopARSDKTelemetry(); telnet.stop()
+        setDisconnectedInterface()
+        let anafi = AnafiViewController(); anafiController = anafi
+        anafi.onOwnerMaintenanceRequested = { [weak self] in self?.onOwnerMaintenanceRequested?() }
+        addChild(anafi); anafi.view.translatesAutoresizingMaskIntoConstraints = false; view.addSubview(anafi.view)
+        NSLayoutConstraint.activate([anafi.view.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            anafi.view.trailingAnchor.constraint(equalTo: view.trailingAnchor), anafi.view.topAnchor.constraint(equalTo: view.topAnchor),
+            anafi.view.bottomAnchor.constraint(equalTo: view.bottomAnchor)])
+        standardWorkspaceView?.isHidden = true
+        flightInputManager.setGroundMode(false)
+        anafi.onNeutralize = { [weak self] in self?.flightInputManager.neutralize() }
+        anafi.onControlsChanged = { [weak self] in self?.updateFlightControlAvailability() }
+        anafi.onExit = { [weak self] in
+            guard let self else { return }
+            self.flightInputManager.setControlsAvailable(false)
+            self.anafiController?.view.removeFromSuperview(); self.anafiController?.removeFromParent()
+            self.anafiController = nil; self.standardWorkspaceView?.isHidden = false
+            self.applyGroundModeAppearance(); self.updateWindowIdentity(); self.updateInterface()
+            self.onGroundModeChanged?(self.groundModeActive)
+        }
+        updateFlightControlAvailability(); updateWindowIdentity(); onGroundModeChanged?(false)
+    }
+
     @objc func enterMiniDroneMode() {
-        guard !isMiniDroneModeActive, !miniDroneModeBlocked else { return }
+        guard !isMiniDroneModeActive, !isAnafiModeActive, !miniDroneModeBlocked else { return }
         if videoRunning { startVideo() }
         flightInputManager.neutralize()
         directProductDiscovery.stop()
+        stopSC2MobileLink()
         stopARSDKTelemetry()
         telnet.stop()
         setDisconnectedInterface()
         let mini = MiniDroneViewController()
+        mini.client.detailedDiagnosticsEnabled = developerVideoDiagnosticsEnabled
         miniDroneController = mini
         addChild(mini)
         mini.view.translatesAutoresizingMaskIntoConstraints = false
@@ -1005,7 +1376,7 @@ final class MainViewController: NSViewController {
     }
 
     private var miniDroneModeBlocked: Bool {
-        toolUploadInFlight || dragonCommandInFlight || dronePhotoInFlight ||
+        sc3OwnerMaintenanceInFlight || sc3RFWriteInFlight || sc3VideoMaintenanceInFlight || toolUploadInFlight || dragonCommandInFlight || dronePhotoInFlight ||
         persistentTelnetInstallInFlight || sc2DriverInstallInFlight ||
         rfPowerOperationInFlight || sc2DiscoveryInFlight || sumoToolToken != nil ||
         isMagnetometerCalibrationActive || (arsdkConnected && !groundModeActive && !hasFreshLandedTelemetry)
@@ -1034,6 +1405,7 @@ final class MainViewController: NSViewController {
     @objc private func toggleGroundMode() {
         let enable = groundModeButton.state == .on
         guard enable != groundModeRequested else { return }
+        stopSC2MobileLink()
 
         if connectButton.title == "Disconnect" {
             if videoRunning { startVideo() }
@@ -1047,7 +1419,10 @@ final class MainViewController: NSViewController {
         if enable {
             productModel = .jumpingSumo
             arsdkClient.setProductModel(.jumpingSumo)
-            if flightControlConfiguration.standaloneBebopEnabled {
+            if sumoConnectionSelection.route.isSC3Sumo {
+                let saved = UserDefaults.standard.string(forKey: sumoConnectionSelection == .sc3Native ? SumoConnectionSelection.nativeHostKey : SumoConnectionSelection.relayHostKey) ?? ""
+                hostField.stringValue = SC3SumoRelay.isValidHost(saved) ? saved : SC3SumoRelay.defaultHost
+            } else if sumoConnectionSelection == .direct {
                 let savedHost = UserDefaults.standard.string(forKey: Self.jumpingSumoHostPreferenceKey) ?? ""
                 hostField.stringValue = Self.isValidIPv4Host(savedHost)
                     ? savedHost : Self.defaultJumpingSumoHost
@@ -1067,6 +1442,7 @@ final class MainViewController: NSViewController {
             arsdkClient.setProductModel(.unknown)
             appendLog("Ground mode disabled · aircraft product detection restored")
         }
+        activeARSDKRoute = selectedARSDKRoute
         setDisconnectedInterface()
         applyGroundModeAppearance()
         updateWindowIdentity()
@@ -1076,7 +1452,7 @@ final class MainViewController: NSViewController {
     }
 
     private func applyGroundModeAppearance() {
-        guard !isMiniDroneModeActive else { return }
+        guard !isMiniDroneModeActive, !isAnafiModeActive else { return }
         let active = groundModeActive
         flightInputManager.setGroundMode(active)
         let modeChanged = presentedGroundMode != nil && presentedGroundMode != active
@@ -1093,6 +1469,7 @@ final class MainViewController: NSViewController {
 
     private func updateGroundModeAppearance() {
         let active = groundModeActive
+        if !active { stopSumoTracking(reason: "Mode changed") }
         applyTemporalReconstructionConfiguration()
         applyRollingShutterConfiguration()
         groundModeButton.state = active ? .on : .off
@@ -1101,20 +1478,26 @@ final class MainViewController: NSViewController {
         groundModeButton.title = active ? "Ground mode" : "Air mode"
         groundModeButton.toolTip = active ? "Switch to the aircraft workspace" : "Switch to the Jumping Sumo workspace"
         hudView.setGroundMode(active)
+        sumoRoutePopup.isHidden = !active
+        sumoRoutePopup.selectItem(at: SumoConnectionSelection.allCases.firstIndex(of: sumoConnectionSelection) ?? 0)
+        sumoRelayCard?.isHidden = !isSumoSC3RelaySelected
+        sc3SumoNativeCard?.isHidden = !isSumoSC3NativeSelected
+        flightInputManager.setRequiresVerifiedExternalGameController(isSumoSC3RelaySelected)
         droneFisheyeButton.isHidden = active
         dragonSidebarCard?.isHidden = active
         rfSidebarCard?.isHidden = false
         flightSidebarCard?.isHidden = active
         navigationSidebarCard?.isHidden = active
-        healthSidebarCard?.isHidden = activeARSDKRoute == .directProduct
+        healthSidebarCard?.isHidden = activeARSDKRoute != .skyController
         groundSpeedControlsRow?.isHidden = !active
+        sumoTrackingCard?.isHidden = !active
         sidebarNotice.isHidden = active
         videoModePopup.isHidden = active
         videoModePopup.isEnabled = !active && !videoRunning
         videoTransportLabel.isHidden = active
         rtpPortField.isHidden = active
         receiverHint.stringValue = active
-            ? (activeARSDKRoute == .directProduct
+            ? (activeARSDKRoute.usesDirectARNetworkVideo
                 ? "ARStream 1 MJPEG · bounded processing pipeline"
                 : "SC2 JPEG/RTP restream · bounded processing pipeline")
             : "Low-latency H.264 · bounded decode pipeline"
@@ -1125,8 +1508,78 @@ final class MainViewController: NSViewController {
 
     private func wireDataSources() {
         arsdkClient.onSC2MappingEvent = { [weak self] event in self?.consumeSC2Mapping(event) }
+        sc2ProductionTransport.onState = { [weak self] state in
+            guard let self else { return }
+            guard self.sc2MobileLinkStarted else { return }
+            self.sc2ProductionTransportState = state
+            switch state {
+            case .connected(let device):
+                self.activeARSDKRoute = .skyController
+                self.applyDetectedProduct(device.product, source: "SC2 libmux discovery")
+                self.arsdkSessionWanted = true
+                self.arsdkConnectionInFlight = false
+                self.arsdkConnected = true
+                self.lastARSDKTelemetryAt = Date()
+                self.snapshot.connectionLabel = "Live \(device.product.shortLabel) through SC2"
+                self.statusLabel.stringValue = "LIVE USB"
+                self.statusLabel.textColor = .systemGreen
+                self.connectButton.title = "Disconnect"
+                self.arsdkClient.sendRequestAllSettings()
+                self.arsdkClient.sendRequestAllStates()
+                self.arsdkClient.sendRequestSkyControllerAllStates()
+                self.startTelemetryFreshnessTimer()
+                self.updateFlightControlAvailability()
+                self.updateInterface()
+                if self.developerVideoDiagnosticsEnabled {
+                    self.appendLog(self.sc2ProductionTransport.diagnosticSummary)
+                }
+            case .opening, .discovering, .connecting:
+                let wasConnected = self.arsdkConnected
+                self.flightInputManager.setControlsAvailable(false)
+                self.arsdkClient.neutralizePilotingInput()
+                self.arsdkConnected = false
+                if wasConnected, self.videoRunning { self.startVideo() }
+                self.snapshot.connectionLabel = "SC2 mobile link discovering"
+                self.statusLabel.stringValue = "USB CONNECTING"
+                self.statusLabel.textColor = .systemYellow
+                self.updateFlightControlAvailability()
+                self.updateInterface()
+                if wasConnected, self.developerVideoDiagnosticsEnabled {
+                    self.appendLog("SC2 link lost · " + self.sc2ProductionTransport.diagnosticSummary)
+                }
+            case .failed(let detail):
+                self.flightInputManager.setControlsAvailable(false)
+                self.arsdkClient.neutralizePilotingInput()
+                if self.videoRunning { self.startVideo() }
+                self.stopARSDKTelemetry()
+                self.stopTelemetryFreshnessTimer()
+                self.sc2MobileLinkStarted = false
+                self.snapshot.connectionLabel = "SC2 mobile link failed"
+                self.statusLabel.stringValue = "FAILED USB"
+                self.statusLabel.textColor = .systemRed
+                self.connectButton.title = "Connect SC2"
+                self.appendLog("SC2 mobile link: \(detail)")
+                if self.developerVideoDiagnosticsEnabled {
+                    self.appendLog(self.sc2ProductionTransport.diagnosticSummary)
+                }
+                self.updateInterface()
+            case .idle: break
+            }
+        }
+        sc2ProductionTransport.onLog = { [weak self] message in self?.appendLog(message) }
+        sc2ProductionTransport.onStreamData = { [weak self] packet in
+            guard let self, self.videoRunning, self.activeARSDKRoute == .skyController else { return }
+            if self.productModel == .jumpingSumo { self.rtpJPEGReceiver.consumeMuxPacket(packet) }
+            else { self.rtpReceiver.consumeMuxPacket(packet) }
+        }
+        sc2ProductionTransport.onRTP = { [weak self] _, packet, isControl in
+            guard let self, !isControl, self.videoRunning,
+                  self.activeARSDKRoute == .skyController else { return }
+            if self.productModel == .jumpingSumo { self.rtpJPEGReceiver.consumeMuxPacket(packet) }
+            else { self.rtpReceiver.consumeMuxPacket(packet) }
+        }
         directProductDiscovery.onDetected = { [weak self] model, serviceName in
-            guard let self, self.standaloneBebopEnabled else { return }
+            guard let self, self.activeARSDKRoute == .directProduct else { return }
             if self.groundModeRequested, model != .jumpingSumo { return }
             self.appendLog("Direct product identified as \(model.displayName) by Bonjour service \(serviceName)")
             self.applyDetectedProduct(model, source: "direct Bonjour")
@@ -1135,7 +1588,7 @@ final class MainViewController: NSViewController {
             self?.appendLog(message)
         }
         telnet.onState = { [weak self] state in
-            guard let self else { return }
+            guard let self, !self.isSumoSC3Selected, !self.activeARSDKRoute.isSC3Sumo else { return }
             switch state {
             case .ready:
                 self.snapshot.connectionLabel = "Live SC2"
@@ -1153,6 +1606,9 @@ final class MainViewController: NSViewController {
                 self.statusLabel.stringValue = "CONNECTING"
                 self.statusLabel.textColor = .systemYellow
             case .failed(let message):
+                self.flightInputManager.setControlsAvailable(false)
+                self.arsdkClient.neutralizePilotingInput()
+                if self.videoRunning { self.startVideo() }
                 self.stopARSDKTelemetry()
                 self.stopTelemetryFreshnessTimer()
                 self.snapshot.connectionLabel = "Disconnected"
@@ -1162,6 +1618,9 @@ final class MainViewController: NSViewController {
                 self.dragonRuntimeStatus = "SC2 OFFLINE"
                 self.appendLog("Connection failed: \(message)")
             case .stopped, .idle:
+                self.flightInputManager.setControlsAvailable(false)
+                self.arsdkClient.neutralizePilotingInput()
+                if self.videoRunning { self.startVideo() }
                 self.stopARSDKTelemetry()
                 self.stopTelemetryFreshnessTimer()
                 self.snapshot.connectionLabel = "Disconnected"
@@ -1172,10 +1631,44 @@ final class MainViewController: NSViewController {
             }
             self.updateInterface()
         }
-        telnet.onLine = { [weak self] line in self?.consume(line: line) }
+        telnet.onLine = { [weak self] line in
+            guard let self, !self.activeARSDKRoute.isSC3Sumo else { return }
+            self.consume(line: line)
+        }
         telnet.onDebug = { [weak self] message in self?.appendLog(message) }
         arsdkClient.onTelemetryEvent = { [weak self] event in
-            self?.consumeARSDKTelemetry(event)
+            guard let self, self.activeARSDKRoute != .sumoSC3Native else { return }
+            self.consumeARSDKTelemetry(event)
+        }
+        sc3SumoNative.onChange = { [weak self] state in
+            self?.consumeSC3SumoNativeState(state)
+        }
+        sc3SumoNative.onTelemetryEvent = { [weak self] event in
+            guard let self, self.isSumoSC3NativeSelected, self.arsdkSessionWanted else { return }
+            self.consumeARSDKTelemetry(event)
+        }
+        sc3SumoNative.onMJPEGFrame = { [weak self] jpeg, number in
+            guard let self, self.isSumoSC3NativeSelected, self.arsdkSessionWanted, self.videoRunning else { return }
+            self.hudView.videoView.display(mjpegData: jpeg, frameNumber: number)
+        }
+        sc3SumoNative.onLog = { [weak self] message in
+            guard let self, self.isSumoSC3NativeSelected, self.arsdkSessionWanted else { return }
+            self.appendLog(message)
+        }
+        arsdkClient.onRelayState = { [weak self] at in
+            guard let self, self.isSumoSC3RelaySelected, self.arsdkSessionWanted else { return }
+            self.enforceSumoRelayMovementGate()
+            self.sumoRelayDriveGate.receivedState(at: at); self.updateInterface()
+        }
+        arsdkClient.onRelayHeartbeat = { [weak self] at in
+            guard let self, self.isSumoSC3RelaySelected, self.arsdkSessionWanted else { return }
+            self.enforceSumoRelayMovementGate()
+            self.sumoRelayDriveGate.receivedHeartbeat(at: at); self.updateInterface()
+        }
+        flightInputManager.onControlLoss = { [weak self] in
+            guard let self, self.isSumoSC3RelaySelected else { return }
+            self.disarmSumoRelayMovement(reason: "Focus or input device lost")
+            self.updateFlightControlAvailability(); self.updateInterface()
         }
         arsdkClient.onARStream1Diagnostics = { [weak self] diagnostics in
             guard let self else { return }
@@ -1192,17 +1685,25 @@ final class MainViewController: NSViewController {
         }
         arsdkClient.onMJPEGFrame = { [weak self] jpeg, frameNumber in
             guard let self, self.videoRunning,
-                  self.activeARSDKRoute == .directProduct,
+                  self.activeARSDKRoute.usesDirectARNetworkVideo,
                   self.aircraftCapabilities.videoCodec == .mjpeg else { return }
             self.hudView.videoView.display(mjpegData: jpeg, frameNumber: frameNumber)
         }
         flightInputManager.onPilotingInput = { [weak self] input in
             guard let self else { return }
+            if self.sumoFollowing {
+                if input == .neutral { return }
+                self.stopSumoFollowing(reason: "Manual control")
+            }
+            if let anafi = self.anafiController {
+                anafi.session.updateInput(self.flightControlsEnabled ? input : .neutral)
+                return
+            }
             if let mini = self.miniDroneController {
                 mini.client.input = self.flightControlsEnabled ? input : .neutral
                 return
             }
-            guard self.arsdkConnected, self.flightControlsEnabled else { return }
+            guard self.arsdkConnected, self.flightControlsEnabled, self.relayMovementAllowed else { return }
             var routedInput = input
             if self.groundModeActive {
                 routedInput.pitch = Int8(clamping: Int((
@@ -1312,16 +1813,22 @@ final class MainViewController: NSViewController {
         }
         hudView.videoView.onProcessedFrame = { [weak self] frame in
             self?.streamRecorder.observe(frame)
+            self?.sumoTracker.observe(frame)
         }
+        sumoTracker.onResult = { [weak self] observation in self?.consumeSumoSubject(observation) }
+        hudView.overlayView.onSelectSubject = { [weak self] box in self?.acceptSumoTargetSelection(box) }
+        hudView.overlayView.onClickSubject = { [weak self] point in self?.selectSumoSubject(at: point) }
+        hudView.overlayView.onBeginSubjectInteraction = { [weak self] in self?.stopSumoFollowing(reason: "Selecting target") }
         streamRecorder.onFinished = { [weak self] result in
             self?.recordingFinished(result)
         }
         streamRecorder.onStats = { [weak self] stats in
-            self?.processedRecordingStats = stats
-            self?.updateInterface()
+            guard let self, !self.isTerminating else { return }
+            self.processedRecordingStats = stats
+            self.updateInterface()
         }
         rawArchiveRecorder.onFinished = { [weak self] result in
-            guard let self else { return }
+            guard let self, !self.isTerminating else { return }
             let size = ByteCountFormatter.string(
                 fromByteCount: Int64(result.bytesWritten),
                 countStyle: .file
@@ -1399,22 +1906,38 @@ final class MainViewController: NSViewController {
     }
 
     @objc private func toggleConnection() {
+        guard !sc3OwnerMaintenanceInFlight else { return }
+        if pendingSC2MobileLinkID != nil {
+            stopSC2MobileLink()
+            setDisconnectedInterface()
+            return
+        }
         if connectButton.title == "Disconnect" {
+            flightInputManager.setControlsAvailable(false)
+            arsdkClient.neutralizePilotingInput()
+            if videoRunning { startVideo() }
             directProductDiscovery.stop()
+            stopSC2MobileLink()
             stopARSDKTelemetry()
             telnet.stop()
-            if flightControlConfiguration.standaloneBebopEnabled {
+            if activeARSDKRoute.usesDirectARNetworkVideo || activeARSDKRoute == .sumoSC3Native {
                 setDisconnectedInterface()
             }
             return
         }
-        let standalone = flightControlConfiguration.standaloneBebopEnabled
-        activeARSDKRoute = standalone ? .directProduct : .skyController
+        activeARSDKRoute = selectedARSDKRoute
+        let standalone = activeARSDKRoute.usesDirectARNetworkVideo || activeARSDKRoute == .sumoSC3Native
         let enteredHost = hostField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         let host = standalone && !groundModeActive ? "192.168.42.1" : enteredHost
         guard !host.isEmpty else { return }
-        if groundModeActive, standalone {
+        if groundModeActive, activeARSDKRoute == .directProduct {
             UserDefaults.standard.set(host, forKey: Self.jumpingSumoHostPreferenceKey)
+        } else if activeARSDKRoute.isSC3Sumo {
+            guard SC3SumoRelay.isValidHost(host) else {
+                appendLog("SC3 relay requires its numeric USB IPv4 address (default \(SC3SumoRelay.defaultHost))"); return
+            }
+            UserDefaults.standard.set(host, forKey: isSumoSC3NativeSelected ? SumoConnectionSelection.nativeHostKey : SumoConnectionSelection.relayHostKey)
+            disarmSumoRelayMovement(reason: "New connection", reset: true)
         }
         parser.reset()
         arsdkTelemetryReducer.reset()
@@ -1426,23 +1949,150 @@ final class MainViewController: NSViewController {
         updateInterface()
         if standalone {
             hostField.stringValue = host
-            snapshot.connectionLabel = groundModeActive ? "Connecting Sumo" : "Connecting Parrot"
+            snapshot.connectionLabel = isSumoSC3NativeSelected ? "Connecting native SC3 proxy" : isSumoSC3RelaySelected ? "Connecting SC3 Sumo relay" : (groundModeActive ? "Connecting Sumo" : "Connecting Parrot")
             statusLabel.stringValue = "CONNECTING"
             statusLabel.textColor = .systemYellow
             startTelemetryFreshnessTimer()
-            appendLog("Connecting directly to \(groundModeActive ? "Jumping Sumo" : "Parrot product") ARDiscovery at \(host):44444")
-            directProductDiscovery.start()
-            startARSDKTelemetry(host: host)
+            appendLog("Connecting to \(activeARSDKRoute.displayName) at \(host):\(activeARSDKRoute.discoveryPort)")
+            if activeARSDKRoute == .directProduct { directProductDiscovery.start() }
+            if isSumoSC3NativeSelected {
+                arsdkSessionWanted = true
+                sc3SumoNative.start(host: host)
+            } else { startARSDKTelemetry(host: host) }
         } else {
             appendLog("Connecting to SC2 Telnet at \(host):23")
             telnet.connect(host: host)
         }
     }
 
+    /// Entry point for the platform AOA/iAP2 adapter once it has opened the
+    /// SC2 mobile-link descriptor. The libmux and vehicle layers need no USB
+    /// implementation details.
+    func attachSC2MobileLink(
+        readHandle: FileHandle,
+        writeHandle: FileHandle? = nil,
+        closesHandles: Bool = false
+    ) {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in
+                if let self {
+                    self.attachSC2MobileLink(
+                        readHandle: readHandle,
+                        writeHandle: writeHandle,
+                        closesHandles: closesHandles
+                    )
+                } else if closesHandles {
+                    try? readHandle.close()
+                    if let writeHandle, writeHandle !== readHandle { try? writeHandle.close() }
+                }
+            }
+            return
+        }
+        let link = SC2MuxFileHandleLink(
+            readHandle: readHandle,
+            writeHandle: writeHandle,
+            closesHandles: closesHandles
+        )
+        guard !isMiniDroneModeActive, !isAnafiModeActive, !isTerminating, !isSumoSC3Selected else {
+            link.stop()
+            return
+        }
+        let attachmentID = UUID()
+        pendingSC2MobileLinkID = attachmentID
+        if videoRunning { startVideo() }
+        directProductDiscovery.stop()
+        stopARSDKTelemetry()
+        telnet.stop()
+
+        // Telnet.stop() reports its final state on the main queue. Start the
+        // mobile link on the following turn so that callback cannot tear down
+        // the newly attached ARSDK session.
+        DispatchQueue.main.async { [weak self, link] in
+            guard let self, self.pendingSC2MobileLinkID == attachmentID,
+                  !self.isMiniDroneModeActive, !self.isAnafiModeActive, !self.isTerminating, !self.isSumoSC3Selected else {
+                link.stop()
+                return
+            }
+            self.pendingSC2MobileLinkID = nil
+            self.activeARSDKRoute = .skyController
+            self.parser.reset()
+            self.arsdkTelemetryReducer.reset()
+            self.arsdkSessionWanted = true
+            self.arsdkConnectionInFlight = true
+            self.arsdkConnected = false
+            self.connectButton.title = "Disconnect"
+            self.snapshot.connectionLabel = "Opening SC2 USB mobile link"
+            self.statusLabel.stringValue = "USB CONNECTING"
+            self.statusLabel.textColor = .systemYellow
+            let preferred: ParrotProductModel? = self.groundModeRequested ? .jumpingSumo : nil
+            self.sc2MobileLinkStarted = true
+            self.sc2ProductionTransport.start(link: link, preferredProduct: preferred)
+        }
+    }
+
+    private func stopSC2MobileLink() {
+        pendingSC2MobileLinkID = nil
+        guard sc2MobileLinkStarted else { return }
+        sc2MobileLinkStarted = false
+        sc2ProductionTransport.stop()
+    }
+
+    static func pendingSC2AttachmentSelfTest() -> Bool {
+        _ = NSApplication.shared
+        let controller = MainViewController()
+        _ = controller.view
+        // This fixture exercises SC2 attachment; the user's saved native SC3
+        // route must correctly refuse that attachment in production.
+        controller.setGroundModeForPreview(false)
+        let inbound = Pipe()
+        let outbound = Pipe()
+        defer {
+            controller.prepareForTermination()
+            try? inbound.fileHandleForWriting.close()
+            try? outbound.fileHandleForReading.close()
+        }
+        controller.attachSC2MobileLink(
+            readHandle: inbound.fileHandleForReading,
+            writeHandle: outbound.fileHandleForWriting,
+            closesHandles: true
+        )
+        guard controller.pendingSC2MobileLinkID != nil else { return false }
+        controller.enterMiniDroneMode()
+        _ = RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
+        return controller.isMiniDroneModeActive && controller.pendingSC2MobileLinkID == nil &&
+            !controller.sc2MobileLinkStarted &&
+            controller.sc2ProductionTransport.diagnosticSummary.contains("state=idle")
+    }
+
+    static func videoStopRawArchiveSelfTest() -> Bool {
+        _ = NSApplication.shared
+        let controller = MainViewController()
+        _ = controller.view
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("parrotlab-video-stop-test-\(UUID().uuidString)", isDirectory: true)
+        defer {
+            controller.prepareForTermination()
+            try? FileManager.default.removeItem(at: directory)
+        }
+        do {
+            try controller.rawArchiveRecorder.start(directory: directory, rawArchive: true)
+            controller.videoRunning = true
+            controller.startVideo()
+            controller.rawArchiveRecorder.stopAndWait()
+            return !controller.videoRunning && !controller.rawArchiveRecorder.isActive
+        } catch {
+            return false
+        }
+    }
+
     private func startARSDKTelemetry(host: String, forceReconnect: Bool = false) {
-        guard !isMiniDroneModeActive, !host.isEmpty, connectButton.title == "Disconnect" else { return }
+        guard !isMiniDroneModeActive, !isAnafiModeActive, !isSumoSC3NativeSelected,
+              !host.isEmpty, connectButton.title == "Disconnect" else { return }
         arsdkSessionWanted = true
         if forceReconnect {
+            disarmSumoRelayMovement(reason: "Connection restarting", reset: true)
+            stopSumoTracking(reason: "Connection restarting")
+            sumoSoundView.setConnected(false)
             arsdkClient.stop()
             arsdkConnected = false
             arsdkConnectionInFlight = false
@@ -1451,10 +2101,11 @@ final class MainViewController: NSViewController {
 
         resetSC2MappingSession()
         arsdkConnectionInFlight = true
-        let standalone = flightControlConfiguration.standaloneBebopEnabled
-        let route: ARSDKConnectionRoute = standalone ? .directProduct : .skyController
+        let route = selectedARSDKRoute
+        let standalone = route.usesDirectARNetworkVideo
         activeARSDKRoute = route
-        appendLog("Opening persistent ARSDK session through \(route.displayName) \(host):44444")
+        if route == .sumoSC3Relay { disarmSumoRelayMovement(reason: "Connecting", reset: true) }
+        appendLog("Opening persistent ARSDK session through \(route.displayName) \(host):\(route.discoveryPort)")
         let directVideoPort = standalone && !aircraftCapabilities.usesARStream1Video
             ? UInt16(rtpPortField.stringValue)
             : nil
@@ -1463,7 +2114,7 @@ final class MainViewController: NSViewController {
             route: route,
             videoStreamPort: directVideoPort
         ) { [weak self] result in
-            guard let self else { return }
+            guard let self, self.activeARSDKRoute == route else { return }
             self.arsdkConnectionInFlight = false
             guard self.arsdkSessionWanted, self.connectButton.title == "Disconnect" else {
                 self.arsdkClient.stop()
@@ -1472,16 +2123,17 @@ final class MainViewController: NSViewController {
             switch result {
             case .success:
                 self.arsdkConnected = true
-                self.lastARSDKTelemetryAt = Date()
+                if route == .sumoSC3Relay { self.sumoRelayConnectedAt = ProcessInfo.processInfo.systemUptime }
+                self.lastARSDKTelemetryAt = route == .sumoSC3Relay ? nil : Date()
                 if standalone {
                     self.directVideoPortNegotiated = directVideoPort
-                    self.snapshot.connectionLabel = "Live \(self.productModel.shortLabel)"
-                    self.statusLabel.stringValue = "LIVE DIRECT"
+                    self.snapshot.connectionLabel = route == .sumoSC3Relay ? "Live Sumo through SC3 relay · experimental" : "Live \(self.productModel.shortLabel)"
+                    self.statusLabel.stringValue = route == .sumoSC3Relay ? "LIVE SC3 RELAY" : "LIVE DIRECT"
                     self.statusLabel.textColor = .systemGreen
                     if self.dragonRuntimeStatus == "SC2 OFFLINE" || self.dragonRuntimeStatus.hasSuffix("OFFLINE") {
                         self.dragonRuntimeStatus = "READY · LANDED ONLY"
                     }
-                    self.appendLog("Direct \(self.productModel.displayName) ARSDK connected; requesting settings/states and enabling video")
+                    self.appendLog("\(route.displayName) connected; requesting settings/states and enabling video")
                     self.arsdkClient.sendVideoEnable(true)
                 } else {
                     self.snapshot.connectionLabel = self.productModel == .jumpingSumo
@@ -1499,7 +2151,8 @@ final class MainViewController: NSViewController {
                 self.appendLog("ARSDK telemetry unavailable: \(error.localizedDescription)")
                 self.updateFlightControlAvailability()
                 if standalone {
-                    self.statusLabel.stringValue = "RECONNECTING"
+                    self.snapshot.connectionLabel = route == .sumoSC3Relay ? "SC3 relay unavailable · check USB link, relay and Sumo association" : "Reconnecting"
+                    self.statusLabel.stringValue = route == .sumoSC3Relay ? "RELAY UNAVAILABLE" : "RECONNECTING"
                     self.statusLabel.textColor = .systemYellow
                     self.updateInterface()
                 }
@@ -1513,6 +2166,16 @@ final class MainViewController: NSViewController {
         arsdkRefreshTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
             guard let self, self.arsdkSessionWanted,
                   self.connectButton.title == "Disconnect" else { return }
+            if self.isSumoSC3RelaySelected {
+                self.enforceSumoRelayMovementGate()
+                let now = ProcessInfo.processInfo.systemUptime
+                if let connectedAt = self.sumoRelayConnectedAt, now - connectedAt > 8,
+                   !self.sumoRelayDriveGate.isFresh(at: now) {
+                    self.appendLog("SC3 relay state/heartbeat lost; check USB link, relay and Sumo Wi-Fi association")
+                    self.startARSDKTelemetry(host: host, forceReconnect: true)
+                }
+                return
+            }
             let staleTimeout = self.productModel == .jumpingSumo ? 20.0 : 12.0
             if !self.dronePhotoInFlight,
                let last = self.lastARSDKTelemetryAt,
@@ -1543,7 +2206,294 @@ final class MainViewController: NSViewController {
         }
     }
 
+    @objc private func toggleSumoTracking() {
+        if sumoTrackingActive { stopSumoTracking(reason: "Tracking stopped"); return }
+        startSumoTracking()
+    }
+
+    private func applySumoTrackingConfiguration(_ configuration: SumoTrackingConfiguration) {
+        sumoFollowConfiguration = configuration.sanitized; sumoFollowConfiguration.save()
+        sumoTuningView.update(sumoFollowConfiguration); sumoPresetView.update(sumoFollowConfiguration)
+        sumoTracker.updatePersistence(sumoFollowConfiguration.persistence)
+        if sumoFollowing, let observation = sumoObservation, observation.box != nil,
+           ProcessInfo.processInfo.systemUptime - observation.sampledAt < 0.4 {
+            consumeSumoSubject(observation)
+        }
+    }
+
+    @objc private func sumoSubjectModeChanged() {
+        guard SumoTrackingMode.allCases.indices.contains(sumoSubjectMode.indexOfSelectedItem) else { return }
+        stopSumoTracking(reason: "Subject mode changed")
+        let mode = SumoTrackingMode.allCases[sumoSubjectMode.indexOfSelectedItem]
+        sumoFollowConfiguration = .load(mode: mode); sumoFollowConfiguration.save()
+        sumoTuningView.update(sumoFollowConfiguration); sumoPresetView.update(sumoFollowConfiguration)
+        sumoTrackingStatus.stringValue = "Click a \(mode.subject), drag a partial view, or choose Track."
+        refreshSumoTrackingUI()
+    }
+
+    @objc private func selectSumoTarget() {
+        if sumoSelectingTarget { stopSumoTracking(reason: "Selection cancelled"); return }
+        guard isGroundModeActive, videoRunning else { return }
+        let size = hudView.videoView.latestFrameSize
+        guard size.width > 0, size.height > 0 else { sumoTrackingStatus.stringValue = "Wait for a camera frame first."; return }
+        if !sumoTrackingActive { startSumoTracking() }
+        stopSumoFollowing(reason: "Selecting target")
+        sumoTracker.stop(); sumoObservation = nil
+        sumoSelectingTarget = true
+        sumoTrackingPresentation = .idle
+        hudView.overlayView.subjectObservation = nil
+        hudView.overlayView.selectionFrameSize = size
+        hudView.overlayView.selectingSubject = true
+        sumoTrackingStatus.stringValue = "Drag around the visible target, including just legs. Escape cancels."
+        refreshSumoTrackingUI()
+    }
+
+    private func acceptSumoTargetSelection(_ box: CGRect) {
+        guard isGroundModeActive, videoRunning, !isTerminating,
+              view.window?.isKeyWindow == true, NSApp.isActive else { return }
+        guard SumoSubjectTracker.isValidSelection(box) else {
+            hudView.overlayView.selectingSubject = true
+            sumoTrackingStatus.stringValue = "Select a larger part of the target."
+            return
+        }
+        startSumoTracking(seed: box)
+    }
+
+    private func selectSumoSubject(at point: CGPoint) {
+        guard isGroundModeActive, videoRunning, !isTerminating,
+              view.window?.isKeyWindow == true, NSApp.isActive,
+              point.x.isFinite, point.y.isFinite, (0...1).contains(point.x), (0...1).contains(point.y) else { return }
+        startSumoTracking(selectionPoint: point)
+    }
+
+    private func startSumoTracking(seed: CGRect? = nil, selectionPoint: CGPoint? = nil) {
+        guard isGroundModeActive, videoRunning else { return }
+        if sumoTrackingActive || sumoFollowing { stopSumoTracking(reason: "Selecting target") }
+        sumoTrackingActive = true; sumoObservation = nil
+        sumoTrackingPresentation = .idle
+        sumoManualTarget = seed != nil; sumoTrackingStartedAt = ProcessInfo.processInfo.systemUptime
+        sumoPointSelectionPending = selectionPoint != nil
+        resetSumoFollowMeasurement()
+        sumoTracker.start(mode: sumoFollowConfiguration.mode, persistence: sumoFollowConfiguration.persistence,
+                          seed: seed, selectionPoint: selectionPoint)
+        sumoTrackingStatus.stringValue = seed != nil ? "Selected target · establishing tracking…" :
+            selectionPoint != nil ? "Looking at your selection… Drag around it if recognition misses." :
+            "Looking for a \(sumoFollowConfiguration.mode.subject)…"
+        let center = NotificationCenter.default
+        sumoTrackingObservers.append(center.addObserver(forName: NSApplication.didResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.stopSumoTracking(reason: "App inactive")
+        })
+        sumoTrackingObservers.append(center.addObserver(forName: NSWindow.didResignKeyNotification, object: nil, queue: .main) { [weak self] note in
+            guard let self, let window = note.object as? NSWindow, window === self.view.window else { return }
+            self.stopSumoTracking(reason: "Controls paused")
+        })
+        sumoEscapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            if event.keyCode == 53 { self?.stopSumoTracking(reason: "Stopped with Escape"); return nil }
+            return event
+        }
+        let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            if !self.isGroundModeActive || !self.videoRunning { self.stopSumoTracking(reason: "Video unavailable"); return }
+            self.refreshSumoTrackingUI()
+            if self.sumoSelectingTarget { return }
+            if self.sumoFollowing, self.view.window?.firstResponder is NSTextView {
+                self.stopSumoFollowing(reason: "Editing controls"); return
+            }
+            let now = ProcessInfo.processInfo.systemUptime
+            // Camera health is independent of a slow Vision recovery request.
+            if now - (self.sumoTracker.latestFrameAt ?? self.sumoTrackingStartedAt) > 0.65 {
+                self.stopSumoTracking(reason: "Camera stalled"); return
+            }
+            let resultAge = now - (self.sumoObservation?.sampledAt ?? self.sumoTrackingStartedAt)
+            if resultAge > 0.45, self.sumoObservation != nil || self.sumoFollowing {
+                self.pauseSumoFollowingForRecovery()
+                self.sumoTrackingPresentation = .recovering
+                self.hudView.overlayView.subjectObservation = nil
+                self.sumoTrackingStatus.stringValue = "Waiting for tracking · movement paused"
+                self.refreshSumoTrackingUI()
+            }
+            if resultAge > 4 { self.stopSumoTracking(reason: "Tracking stalled"); return }
+            if self.sumoFollowing && !self.arsdkConnected { self.stopSumoTracking(reason: "Disconnected") }
+        }
+        sumoTrackingTimer = timer; RunLoop.main.add(timer, forMode: .common)
+        refreshSumoTrackingUI()
+    }
+
+    @objc private func toggleSumoFollowing() {
+        if sumoFollowing { stopSumoFollowing(reason: "Following stopped"); return }
+        guard isGroundModeActive, arsdkConnected, relayMovementAllowed, productModel == .jumpingSumo, videoRunning,
+              let window = view.window, window.isKeyWindow, NSApp.isActive, flightInputManager.hasNeutralOutput,
+              let observation = sumoObservation, let box = observation.box,
+              observation.referenceScale.isFinite, observation.referenceScale > 0,
+              ProcessInfo.processInfo.systemUptime - observation.sampledAt < 0.4 else { return }
+        // Clicking a button can leave a previously edited host/port field's
+        // NSTextView as first responder. End that edit before arming, or the
+        // watchdog mistakes it for a new edit and cancels Follow on its next tick.
+        guard Self.prepareSumoFollowFocus(in: window) else { return }
+        resetSumoFollowMeasurement(); sumoFollowPaused = false
+        sumoDesiredHeight = box.height; sumoReferenceScale = observation.referenceScale; sumoFollowing = true
+        updateFlightControlAvailability(); consumeSumoSubject(observation)
+        appendLog(String(format: "Subject following enabled · hold height %.0f%%", box.height * 100) +
+                  String(format: " · drive ±%.0f%% / turn ±%.0f%% caps", sumoFollowConfiguration.maximumDrive, sumoFollowConfiguration.maximumTurn))
+    }
+
+    private static func prepareSumoFollowFocus(in window: NSWindow) -> Bool {
+        window.makeFirstResponder(nil) && !(window.firstResponder is NSTextView)
+    }
+
+    /// Hidden AppKit fixture: an old field editor must not cancel a new Follow,
+    /// while entering a text field afterwards still trips the editing guard.
+    static func sumoFollowInteractionSelfTest() -> Bool {
+        _ = NSApplication.shared
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 300, height: 100),
+                              styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        defer { window.close() }
+        let field = NSTextField(frame: NSRect(x: 10, y: 50, width: 200, height: 24))
+        let button = NSButton(title: "Follow person", target: nil, action: nil)
+        window.contentView?.addSubview(field); window.contentView?.addSubview(button)
+        field.selectText(nil)
+        guard window.firstResponder is NSTextView else { return false }
+        button.performClick(nil)
+        guard window.firstResponder is NSTextView, prepareSumoFollowFocus(in: window),
+              !(window.firstResponder is NSTextView) else { return false }
+        field.selectText(nil)
+        return window.firstResponder is NSTextView
+    }
+
+    private func consumeSumoSubject(_ observation: SumoSubjectObservation) {
+        guard sumoTrackingActive, !sumoSelectingTarget, !isTerminating, isGroundModeActive, videoRunning else { return }
+        enforceSumoRelayMovementGate()
+        if observation.lost { stopSumoTracking(reason: "Target lost · click or Track again", state: .lost); return }
+        let age = ProcessInfo.processInfo.systemUptime - observation.sampledAt
+        guard age.isFinite, age >= 0, age <= 0.4 else {
+            pauseSumoFollowingForRecovery(); sumoTrackingPresentation = .recovering
+            hudView.overlayView.subjectObservation = nil
+            refreshSumoTrackingUI(); return
+        }
+        sumoObservation = observation
+        sumoTrackingStatus.toolTip = sumoTracker.diagnosticSummary
+        hudView.overlayView.subjectObservation = observation.box == nil ? nil : observation
+        hudView.overlayView.subjectLabel = sumoManualTarget ? "Target" : (sumoFollowConfiguration.mode == .cat ? "Cat" : "Person")
+        if let box = observation.box {
+            sumoPointSelectionPending = false
+            sumoTrackingPresentation = sumoFollowing ? .following : .tracking
+            let reference = SumoFollowControl.referenceHeight(capturedHeight: sumoDesiredHeight,
+                capturedScale: sumoReferenceScale, currentScale: observation.referenceScale, targetScale: sumoFollowConfiguration.targetScale)
+            let mode = sumoFollowing ? String(format: "Following · hold %.0f%%", (reference ?? sumoDesiredHeight) * 100) : "Tracking only"
+            let subject = hudView.overlayView.subjectLabel
+            sumoTrackingStatus.stringValue = String(format: "\(subject) · %.0f%% · %.0f ms\nHeight %.0f%% · %@", Double(observation.confidence) * 100,
+                observation.latency * 1000, box.height * 100, mode)
+            if sumoFollowing {
+                guard arsdkConnected, relayMovementAllowed, productModel == .jumpingSumo else { stopSumoFollowing(reason: "Movement unavailable"); return }
+                guard reference != nil else { pauseSumoFollowingForRecovery(); return }
+                sumoFollowPaused = false
+                // Slider/preset changes may reapply this observation. They must
+                // not count as extra image samples or reset size filtering.
+                if sumoMeasurementAt != observation.sampledAt {
+                    sumoMeasurement = sumoMeasurementFilter.update(box: box, referenceScale: observation.referenceScale,
+                                                                  at: observation.sampledAt)
+                    sumoMeasurementAt = observation.sampledAt
+                }
+                guard let measurement = sumoMeasurement else { pauseSumoFollowingForRecovery(); return }
+                let target = SumoFollowControl.input(measurement: measurement, confidence: observation.confidence,
+                    desiredHeight: sumoDesiredHeight, configuration: sumoFollowConfiguration,
+                    referenceScaleRatio: observation.referenceScale / sumoReferenceScale)
+                var input = sumoFollowMotion.update(target, configuration: sumoFollowConfiguration,
+                    at: ProcessInfo.processInfo.systemUptime, turnFactor: observation.quality.turnFactor)
+                input.pitch = Int8(clamping: Int(Double(input.pitch) * Double(groundSpeedLimit) / 100))
+                arsdkClient.updateSumoFollowInput(.init(input: input, expiresAt: observation.sampledAt + 0.45))
+                groundDriveStatus = "FOLLOW · SPEED \(input.pitch) · TURN \(input.roll)"
+                if observation.quality.isBlurred { sumoTrackingStatus.stringValue += "\nBlur · turning eased" }
+                if !measurement.distanceReliable {
+                    sumoTrackingStatus.stringValue += input.pitch < 0 ? "\nClose target · backing away" : "\nSize uncertain · drive paused"
+                }
+            }
+        } else {
+            if observation.recovering {
+                sumoTrackingPresentation = .recovering
+                sumoTrackingStatus.stringValue = sumoFollowing ? "Target obscured · recovering\nFollowing armed · movement paused" : "Target obscured · recovering…"
+                pauseSumoFollowingForRecovery()
+            } else {
+                sumoTrackingPresentation = .idle
+                sumoTrackingStatus.stringValue = sumoPointSelectionPending ?
+                    "No recognized subject at that point yet. Drag around it, or click again." :
+                    "Looking for a \(sumoFollowConfiguration.mode.subject)…"
+                if sumoFollowing { stopSumoFollowing(reason: "Target unavailable") }
+            }
+        }
+        refreshSumoTrackingUI()
+    }
+
+    private func stopSumoFollowing(reason: String) {
+        guard sumoFollowing else { return }
+        sumoFollowing = false; arsdkClient.neutralizePilotingInput()
+        if isSumoSC3RelaySelected {
+            sumoRelayDriveGate.disarm(); sumoRelayMovementButton.state = .off
+            arsdkClient.setRelayMovementEnabled(false)
+        }
+        resetSumoFollowMeasurement(); sumoFollowPaused = false
+        sumoTrackingPresentation = sumoObservation?.box == nil ? .idle : .tracking
+        groundDriveStatus = "SPEED 0 · TURN 0"
+        sumoTrackingStatus.stringValue = reason
+        updateFlightControlAvailability(); refreshSumoTrackingUI()
+        appendLog("Subject following stopped · \(reason)")
+    }
+
+    private func pauseSumoFollowingForRecovery() {
+        guard sumoFollowing, !sumoFollowPaused else { return }
+        if isSumoSC3RelaySelected {
+            disarmSumoRelayMovement(reason: "Target uncertain · re-enable movement before following again")
+            return
+        }
+        sumoFollowPaused = true; sumoFollowMotion.reset(); sumoMeasurementFilter.pause()
+        sumoMeasurement = nil; sumoMeasurementAt = nil
+        arsdkClient.neutralizePilotingInput()
+        groundDriveStatus = "FOLLOW PAUSED · SPEED 0 · TURN 0"
+    }
+
+    private func resetSumoFollowMeasurement() {
+        sumoFollowMotion.reset(); sumoMeasurementFilter.reset(); sumoMeasurement = nil; sumoMeasurementAt = nil
+    }
+
+    private func stopSumoTracking(reason: String, state: SumoTrackingPresentationState = .idle) {
+        guard sumoTrackingActive || sumoFollowing else { return }
+        sumoTrackingActive = false; sumoTracker.stop(); stopSumoFollowing(reason: reason)
+        sumoTrackingPresentation = state; resetSumoFollowMeasurement()
+        sumoSelectingTarget = false; hudView.overlayView.selectingSubject = false
+        hudView.overlayView.clickSelectionEnabled = false
+        sumoManualTarget = false; sumoPointSelectionPending = false
+        sumoReferenceScale = 1
+        sumoObservation = nil; hudView.overlayView.subjectObservation = nil
+        sumoTrackingTimer?.invalidate(); sumoTrackingTimer = nil
+        sumoTrackingObservers.forEach(NotificationCenter.default.removeObserver); sumoTrackingObservers.removeAll()
+        if let monitor = sumoEscapeMonitor { NSEvent.removeMonitor(monitor) }; sumoEscapeMonitor = nil
+        sumoTrackingStatus.stringValue = reason; refreshSumoTrackingUI()
+    }
+
+    private func refreshSumoTrackingUI() {
+        sumoTrackingBadge.stringValue = sumoTrackingPresentation.title
+        sumoTrackingBadge.textColor = sumoTrackingPresentation.color
+        hudView.overlayView.trackingPresentationState = sumoTrackingPresentation
+        hudView.overlayView.clickSelectionEnabled = isGroundModeActive && videoRunning && !isTerminating
+        hudView.overlayView.selectionFrameSize = hudView.videoView.latestFrameSize
+        sumoDetectButton.title = sumoTrackingActive ? "Stop tracking" : "Track"
+        sumoDetectButton.isEnabled = isGroundModeActive && (videoRunning || sumoTrackingActive)
+        sumoFollowButton.title = sumoFollowing ? "Stop following" : "Follow"
+        sumoSelectTargetButton.title = sumoSelectingTarget ? "Cancel selection" : "Draw target…"
+        sumoSelectTargetButton.isEnabled = isGroundModeActive && videoRunning
+        sumoSoundView.setConnected(isGroundModeActive && arsdkConnected && !isSumoSC3NativeSelected && productModel == .jumpingSumo)
+        let fresh = sumoObservation.map { $0.box != nil && ProcessInfo.processInfo.systemUptime - $0.sampledAt < 0.4 } ?? false
+        sumoFollowButton.isEnabled = sumoFollowing || (isGroundModeActive && arsdkConnected && relayMovementAllowed && productModel == .jumpingSumo && videoRunning && fresh && flightInputManager.hasNeutralOutput)
+    }
+
     private func stopARSDKTelemetry() {
+        sc3SumoNative.stop()
+        sc3SumoNativeState = SC3SumoNativeState()
+        disarmSumoRelayMovement(reason: "Disconnected", reset: true)
+        sumoRelayConnectedAt = nil
+        stopSumoTracking(reason: "Disconnected")
+        sumoSoundView.setConnected(false)
         resetSC2MappingSession()
         arsdkClient.neutralizePilotingInput()
         arsdkClient.stopPiloting()
@@ -1564,8 +2514,81 @@ final class MainViewController: NSViewController {
         arsdkClient.stop()
     }
 
+    private func consumeSC3SumoNativeState(_ state: SC3SumoNativeState) {
+        guard isSumoSC3NativeSelected, arsdkSessionWanted else { return }
+        if videoRunning, (sc3SumoNativeState.connected && !state.connected) ||
+            (sc3SumoNativeState.videoRequested && !state.videoRequested) { startVideo() }
+        if sc3SumoNativeState.linkedSumo && !state.linkedSumo {
+            snapshot = TelemetrySnapshot(); lastARSDKTelemetryAt = nil
+            hudView.videoView.reset()
+        }
+        sc3SumoNativeState = state; arsdkConnected = state.connected
+        snapshot.connectionLabel = state.message; snapshot.droneBatteryPercent = state.battery
+        statusLabel.stringValue = state.connected ? (state.linkedSumo ? "NATIVE SC3" : "SC3 · NO SUMO") : "SC3 UNAVAILABLE"
+        statusLabel.textColor = state.linkedSumo ? .systemGreen : .systemYellow
+        if videoRunning { videoStatus = state.videoMessage }
+        updateFlightControlAvailability(); updateInterface()
+    }
+
+    @objc func showSC3SumoMappings() {
+        guard isSumoSC3NativeSelected else { return }
+        if sc3SumoMappingWindow == nil { sc3SumoMappingWindow = SC3SumoMappingWindowController() }
+        sc3SumoMappingWindow?.refresh(SC3SumoMappingSnapshot(generation: 0, appliedProfile: nil,
+            canApply: false, message: "v1c uses the shared ANAFI mapper. Displayed defaults are verified; edits are local v2 drafts only. Native apply/readback and button-release validation are not implemented."))
+        sc3SumoMappingWindow?.showWindow(nil)
+    }
+
+    var canManageSC3SumoVideo: Bool { isSumoSC3NativeSelected && !miniDroneModeBlocked && !isTerminating }
+
+    func manageSC3SumoVideo(_ operation: SC3SumoVideoOperation) {
+        guard canManageSC3SumoVideo else { return }
+        let host = hostField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard SC3SumoRelay.isValidHost(host) else {
+            showToolAlert(title: "SC3 address required", message: "Enter the SC3 USB address in the connection bar first."); return
+        }
+        if operation == .install || operation == .restore {
+            let alert = NSAlert()
+            alert.messageText = operation == .install ? "Enable Sumo video at SC3 startup?" : "Restore SC3 startup without Sumo video?"
+            alert.informativeText = operation == .install
+                ? "Installs the verified video helper on SC3 \(host), with an original-selector backup and controls-only fallback. Takes effect at the next controller restart. The current session continues. Requires the existing native Sumo setup on SC3 1.8.1 and its open maintenance connection."
+                : "Removes video from future SC3 starts and restores the original native selector. Native Sumo controls are kept. The current session continues until the controller restarts."
+            alert.addButton(withTitle: operation == .install ? "Enable at startup" : "Restore startup")
+            alert.addButton(withTitle: "Cancel")
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+        }
+        guard let maintenanceLease = SC3MaintenanceCoordinator.shared.acquire("video startup", critical: operation == .install || operation == .restore) else { showToolAlert(title: "SC3 busy", message: "Wait for the current SC3 maintenance operation to finish."); return }
+        sc3VideoMaintenanceInFlight = true
+        appendLog("SC3 video startup: \(operation.rawValue) on \(host) · current session continues")
+        updateInterface(); NSApp.mainMenu?.update()
+        let started = sc3VideoInstaller.perform(operation, host: host) { [weak self] result in
+            SC3MaintenanceCoordinator.shared.release(maintenanceLease)
+            guard let self, !self.isTerminating else { return }
+            self.sc3VideoMaintenanceInFlight = false
+            self.updateInterface(); NSApp.mainMenu?.update()
+            switch result {
+            case .success(let output):
+                self.appendLog("SC3 video startup: \(output)")
+                var fields: [String: String] = [:]
+                for line in output.split(separator: "\n") {
+                    let pair = line.split(separator: "=", maxSplits: 1)
+                    if pair.count == 2 { fields[String(pair[0])] = String(pair[1]) }
+                }
+                let title = operation == .install ? "SC3 video startup enabled" : operation == .restore ? "Native startup restored" : "SC3 video status"
+                let summary = operation == .status
+                    ? "Video at startup: \(fields["video_startup"] ?? "unknown")\nNative controls at startup: \(fields["native_startup"] ?? "unknown")\nVideo helper running: \(fields["video_active"] == "yes" ? "Yes" : "No")"
+                    : "Saved on the SC3. Takes effect at its next restart; native control fallback is preserved. The current session continues."
+                self.showToolAlert(title: title, message: summary, style: .informational)
+            case .failure(let error):
+                self.appendLog("SC3 video maintenance: \(error.localizedDescription)")
+                self.showToolAlert(title: "SC3 video operation did not complete", message: error.localizedDescription)
+            }
+        }
+        if !started { SC3MaintenanceCoordinator.shared.release(maintenanceLease); sc3VideoMaintenanceInFlight = false; updateInterface(); NSApp.mainMenu?.update() }
+    }
+
     func showSC2Mappings() {
-        guard !isMiniDroneModeActive else { return }
+        guard !rejectSC3RelayDeviceTool() else { return }
+        guard !isMiniDroneModeActive, !isAnafiModeActive else { return }
         if sc2MappingWindow == nil {
             let panel = SC2MappingWindowController()
             panel.onReload = { [weak self] in self?.reloadSC2Mappings() }
@@ -1686,10 +2709,9 @@ final class MainViewController: NSViewController {
         snapshot.connectionLabel = "Disconnected"
         statusLabel.stringValue = "DISCONNECTED"
         statusLabel.textColor = .systemOrange
-        connectButton.title = groundModeActive
-            ? (activeARSDKRoute == .directProduct ? "Connect Sumo" : "Connect SC2")
-            : (activeARSDKRoute == .directProduct ? "Connect Aircraft" : "Connect SC2")
-        dragonRuntimeStatus = activeARSDKRoute == .directProduct ? "DIRECT OFFLINE" : "SC2 OFFLINE"
+        connectButton.title = connectionButtonTitle
+        dragonRuntimeStatus = activeARSDKRoute == .sumoSC3Relay ? "SC3 RELAY OFFLINE" :
+            (activeARSDKRoute == .directProduct ? "DIRECT OFFLINE" : "SC2 OFFLINE")
         if groundModeActive { videoStatus = "Sumo stream idle" }
         updateInterface()
     }
@@ -1699,6 +2721,17 @@ final class MainViewController: NSViewController {
     }
 
     private func updateFlightControlAvailability() {
+        if sc3OwnerMaintenanceInFlight { flightInputManager.setControlsAvailable(false); return }
+        flightInputManager.setRequiresVerifiedExternalGameController(isSumoSC3RelaySelected)
+        if sumoFollowing && (!arsdkConnected || !isGroundModeActive || productModel != .jumpingSumo) {
+            stopSumoFollowing(reason: "Connection unavailable")
+        }
+        if let anafi = anafiController {
+            if !flightControlsEnabled { anafi.disableMacInputs() }
+            flightInputManager.setControlsAvailable(anafi.controlsAvailable && flightControlsEnabled)
+            anafi.refreshInputs(flightControlStatus)
+            return
+        }
         if let mini = miniDroneController {
             let available = mini.client.ready && flightControlsEnabled
             flightInputManager.setControlsAvailable(available)
@@ -1706,9 +2739,9 @@ final class MainViewController: NSViewController {
             mini.refreshInputs(flightControlsEnabled ? flightControlStatus : "Keyboard and gamepad are off. Enable them in Configure controls.")
             return
         }
-        let available = arsdkConnected && flightControlsEnabled && !isMagnetometerCalibrationActive
+        let available = arsdkConnected && flightControlsEnabled && relayMovementAllowed && !isMagnetometerCalibrationActive
         flightInputManager.setControlsAvailable(available)
-        if available {
+        if available || sumoFollowing {
             arsdkClient.startPiloting()
         } else {
             arsdkClient.stopPiloting()
@@ -1716,11 +2749,19 @@ final class MainViewController: NSViewController {
     }
 
     private func performFlightControlAction(_ action: FlightControlAction) {
+        if isSumoSC3RelaySelected, action == .emergency {
+            disarmSumoRelayMovement(reason: "Emergency stop"); arsdkClient.neutralizePilotingInput(); return
+        }
+        if sumoFollowing { stopSumoFollowing(reason: "Manual control") }
+        if let anafi = anafiController {
+            if flightControlsEnabled { anafi.perform(action) }
+            return
+        }
         if let mini = miniDroneController {
             if flightControlsEnabled { mini.perform(action) }
             return
         }
-        guard arsdkConnected, flightControlsEnabled else { return }
+        guard arsdkConnected, flightControlsEnabled, relayMovementAllowed else { return }
         if groundModeActive {
             if let jumpType = action.jumpingSumoJumpType {
                 appendLog("Ground control: \(action.groundTitle.lowercased()) requested")
@@ -1775,8 +2816,18 @@ final class MainViewController: NSViewController {
     }
 
     private func consumeARSDKTelemetry(_ event: ARSDKTelemetryEvent) {
-        guard !isMiniDroneModeActive else { return }
+        guard !isMiniDroneModeActive, !isAnafiModeActive else { return }
         switch event {
+        case .sumoAudioVolume(let volume):
+            guard isGroundModeActive, arsdkConnected, productModel == .jumpingSumo else { return }
+            sumoSoundView.setConnected(true); sumoSoundView.apply(volume: volume)
+            lastARSDKTelemetryAt = Date()
+            return
+        case .sumoAudioTheme(let theme):
+            guard isGroundModeActive, arsdkConnected, productModel == .jumpingSumo else { return }
+            sumoSoundView.setConnected(true); sumoSoundView.apply(theme: theme)
+            lastARSDKTelemetryAt = Date()
+            return
         case .aircraftConnection(let status, let deviceName, let productID):
             lastARSDKTelemetryAt = Date()
             let model = ParrotProductModel(productID: productID)
@@ -1897,7 +2948,7 @@ final class MainViewController: NSViewController {
     }
 
     private func applyDetectedProduct(_ model: ParrotProductModel, source: String) {
-        guard !isMiniDroneModeActive else { return }
+        guard !isMiniDroneModeActive, !isAnafiModeActive else { return }
         let wasGroundModeActive = groundModeActive
         if groundModeRequested, model != .jumpingSumo {
             appendLog("Ignored \(model.displayName) while the Jumping Sumo ground backend is selected")
@@ -1911,7 +2962,7 @@ final class MainViewController: NSViewController {
             UserDefaults.standard.set(true, forKey: Self.groundModePreferenceKey)
         }
         if arsdkConnected {
-            snapshot.connectionLabel = activeARSDKRoute == .directProduct
+            snapshot.connectionLabel = activeARSDKRoute == .sumoSC3Relay ? "Live Sumo through SC3 relay · experimental" : activeARSDKRoute == .directProduct
                 ? "Live \(model.shortLabel)"
                 : (model == .jumpingSumo ? "Live Sumo through SC2" : "Live SC2")
         }
@@ -1920,7 +2971,7 @@ final class MainViewController: NSViewController {
             setVideoMode(.compatibility)
             appendLog("Switched to stock Compatibility video because \(model.displayName) has no validated BB2 Dragon profile")
         }
-        if activeARSDKRoute == .directProduct,
+        if activeARSDKRoute.usesDirectARNetworkVideo,
            model.capabilities.usesARStream1Video, videoRunning {
             rtpReceiver.stop()
             videoStatus = model == .jumpingSumo
@@ -1945,8 +2996,9 @@ final class MainViewController: NSViewController {
     }
 
     private func updateWindowIdentity() {
+        if isAnafiModeActive { view.window?.title = "Parrot Lab — ANAFI 4K"; return }
         if isMiniDroneModeActive { view.window?.title = "Parrot Lab — MiniDrone / Bluetooth"; return }
-        let route = activeARSDKRoute == .directProduct ? "Standalone" : "SkyController 2"
+        let route = activeARSDKRoute.displayName
         view.window?.title = "Parrot Lab — \(productModel.displayName) / \(route)"
         workbenchSubtitle.stringValue = groundModeActive
             ? "GROUND CONTROL / JUMPING SUMO"
@@ -2115,6 +3167,7 @@ final class MainViewController: NSViewController {
     }
 
     func installDragonLabOnBebop2() {
+        guard !rejectSC3RelayDeviceTool() else { return }
         guard aircraftCapabilities.supportsBB2DragonLab else {
             showToolAlert(
                 title: "Bebop 2 required",
@@ -2172,6 +3225,7 @@ final class MainViewController: NSViewController {
     }
 
     func enablePersistentTelnetOnBebop2() {
+        guard !rejectSC3RelayDeviceTool() else { return }
         guard aircraftCapabilities.supportsBB2PersistentTelnetInstall else {
             showToolAlert(
                 title: "Bebop 2 required",
@@ -2238,6 +3292,7 @@ final class MainViewController: NSViewController {
     }
 
     func uploadRFModSuiteToBebop2() {
+        guard !rejectSC3RelayDeviceTool() else { return }
         guard aircraftCapabilities.supportsValidatedRFMod else {
             showToolAlert(
                 title: "Bebop 2 required",
@@ -2253,6 +3308,7 @@ final class MainViewController: NSViewController {
     }
 
     func uploadRFModSuiteToSkyController2() {
+        guard !rejectSC3RelayDeviceTool() else { return }
         guard let host = requestToolHost(sumo: false, title: "SkyController 2 RF Lab upload") else { return }
         uploadRFModSuite(
             host: host,
@@ -2262,6 +3318,7 @@ final class MainViewController: NSViewController {
     }
 
     func configureRFPowerMod(sc2Only: Bool = false) {
+        guard !rejectSC3RelayDeviceTool() else { return }
         guard sc2Only || (!groundModeActive && aircraftCapabilities.supportsValidatedRFMod) else {
             showToolAlert(
                 title: "Validated Bebop 2 required",
@@ -2325,6 +3382,7 @@ final class MainViewController: NSViewController {
         }
 
         toolUploadInFlight = true
+        rfPowerDelayedStopToken = nil
         rfPowerOperationInFlight = true
         rfPowerSC2Only = sc2Only
         rfPowerMode = mode
@@ -2362,6 +3420,11 @@ final class MainViewController: NSViewController {
         updateInterface()
         return true
     }
+
+    var currentVideoEnhancement: VideoEnhancementPreset { hudView.videoView.enhancementPreset }
+    var currentSpatialScaling: VideoSpatialScalingMode { hudView.videoView.spatialScalingMode }
+    var isMetalFXSpatialScalingSupported: Bool { hudView.videoView.isMetalFXSpatialScalingSupported }
+    var canAdjustVideoProcessing: Bool { !streamRecorder.isActive }
 
     @discardableResult
     func setMetalFXSpatialScaling(rawValue: Int) -> Bool {
@@ -2416,6 +3479,7 @@ final class MainViewController: NSViewController {
 
     func setDeveloperVideoDiagnosticsEnabled(_ enabled: Bool) {
         developerVideoDiagnosticsEnabled = enabled
+        miniDroneController?.client.detailedDiagnosticsEnabled = enabled
         UserDefaults.standard.set(enabled, forKey: "ParrotLab.DeveloperVideoDiagnostics")
         appendLog(enabled
             ? "Detailed developer video diagnostics enabled"
@@ -2425,6 +3489,65 @@ final class MainViewController: NSViewController {
 
     var isDeveloperVideoDiagnosticsEnabled: Bool { developerVideoDiagnosticsEnabled }
 
+    func copyConnectionDiagnostics() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        if let anafi = anafiController {
+            let summary = anafi.diagnosticSummary + "\n" + flightInputManager.diagnosticSummary
+            anafi.session.diagnostics { details in
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(summary + "\n" + details, forType: .string)
+            }
+            return
+        }
+        let helpers: [(String, Bool)] = [
+            ("conversion", videoConversionInFlight || mp4Converter.isConverting),
+            ("picture-write", pictureWriteInFlight),
+            ("drone-photo", dronePhotoInFlight),
+            ("dragon-command", dragonCommandInFlight),
+            ("tool-upload", toolUploadInFlight),
+            ("telnet-install", persistentTelnetInstallInFlight),
+            ("sc2-driver", sc2DriverInstallInFlight),
+            ("sc2-discovery", sc2DiscoveryInFlight),
+            ("rf-power", rfPowerOperationInFlight),
+            ("sumo-tool", sumoToolToken != nil),
+            ("sc3-video-startup", sc3VideoMaintenanceInFlight),
+            ("sc3-rf-save", sc3RFWriteInFlight), ("sc3-owner-maintenance", sc3OwnerMaintenanceInFlight)
+        ]
+        let activeHelpers = helpers.filter { $0.1 }.map { $0.0 }
+        var violations: [String] = []
+        if miniDroneController == nil, !arsdkConnected, !flightInputManager.hasNeutralOutput {
+            violations.append("disconnected input is non-neutral")
+        }
+        if miniDroneController != nil, pendingSC2MobileLinkID != nil || sc2MobileLinkStarted {
+            violations.append("SC2 attachment active in MiniDrone mode")
+        }
+        if !videoRunning, streamRecorder.isRecording || rawArchiveRecorder.isRecording {
+            violations.append("recorder active without video")
+        }
+        let lines = [
+            "Parrot Lab 1.7 diagnostics · \(Date())",
+            "mode=\(isMiniDroneModeActive ? "MiniDrone" : groundModeActive ? "Ground" : "Air") " +
+                "route=\(activeARSDKRoute.displayName) connected=\(arsdkConnected) " +
+                "sc2-pending=\(pendingSC2MobileLinkID != nil) sc2-started=\(sc2MobileLinkStarted)",
+            flightInputManager.diagnosticSummary,
+            sumoTracker.diagnosticSummary,
+            arsdkClient.diagnosticSummary,
+            sc3SumoNative.diagnosticSummary,
+            "SC3-Sumo selected=\(isSumoSC3RelaySelected) uiArmed=\(sumoRelayDriveGate.armed) " +
+                "stateFresh=\(sumoRelayDriveGate.isFresh(at: ProcessInfo.processInfo.systemUptime))",
+            sc2ProductionTransport.diagnosticSummary,
+            miniDroneController?.client.diagnosticSummary ?? "MiniDrone inactive",
+            "video-running=\(videoRunning) " + hudView.videoView.diagnosticSummary,
+            streamRecorder.diagnosticSummary,
+            rawArchiveRecorder.diagnosticSummary,
+            "helpers=\(activeHelpers.isEmpty ? "none" : activeHelpers.joined(separator: ","))",
+            "invariants=\(violations.isEmpty ? "OK" : violations.joined(separator: "; "))"
+        ]
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(lines.joined(separator: "\n"), forType: .string)
+        appendLog("Connection diagnostics copied · invariants \(violations.isEmpty ? "OK" : "VIOLATED")")
+    }
+
     var currentFlightControlConfiguration: FlightControlConfiguration {
         flightControlConfiguration
     }
@@ -2433,7 +3556,11 @@ final class MainViewController: NSViewController {
         flightControlConfiguration.standaloneBebopEnabled
     }
 
-    var isGroundModeActive: Bool { !isMiniDroneModeActive && groundModeActive }
+    var canChangeConnectionRoute: Bool {
+        !sc3OwnerMaintenanceInFlight && !sc3RFWriteInFlight && !sc3VideoMaintenanceInFlight && !isAnafiModeActive && connectButton.title != "Disconnect" && pendingSC2MobileLinkID == nil
+    }
+
+    var isGroundModeActive: Bool { !isMiniDroneModeActive && !isAnafiModeActive && groundModeActive }
 
     var aircraftCapabilities: ParrotProductCapabilities { productModel.capabilities }
     var canUseBebopCalibrationTools: Bool {
@@ -2444,6 +3571,7 @@ final class MainViewController: NSViewController {
     }
 
     func performBebopFlatTrim() {
+        guard !rejectSC3RelayDeviceTool() else { return }
         guard canUseBebopCalibrationTools else {
             showToolAlert(
                 title: "Bebop connection required",
@@ -2466,6 +3594,7 @@ final class MainViewController: NSViewController {
     }
 
     func toggleBebopMagnetometerCalibration() {
+        guard !rejectSC3RelayDeviceTool() else { return }
         guard canUseBebopCalibrationTools else {
             showToolAlert(
                 title: "Bebop connection required",
@@ -2505,7 +3634,20 @@ final class MainViewController: NSViewController {
     }
 
     func setFlightControlConfiguration(_ value: FlightControlConfiguration) {
+        stopSumoFollowing(reason: "Input settings changed")
         var sanitized = value.clampedControllerTuning
+        if isSumoSC3Selected {
+            sanitized.standaloneBebopEnabled = flightControlConfiguration.standaloneBebopEnabled
+            disarmSumoRelayMovement(reason: "Input settings changed")
+            flightControlConfiguration = sanitized; flightInputManager.apply(sanitized)
+            updateFlightControlAvailability(); updateInterface(); return
+        }
+        if let anafi = anafiController {
+            sanitized.standaloneBebopEnabled = flightControlConfiguration.standaloneBebopEnabled
+            flightControlConfiguration = sanitized; flightInputManager.apply(sanitized)
+            anafi.session.updateInput(.neutral); updateFlightControlAvailability()
+            return
+        }
         if let mini = miniDroneController {
             sanitized.standaloneBebopEnabled = flightControlConfiguration.standaloneBebopEnabled
             flightControlConfiguration = sanitized
@@ -2515,15 +3657,24 @@ final class MainViewController: NSViewController {
             return
         }
         let routeChanged = sanitized.standaloneBebopEnabled != flightControlConfiguration.standaloneBebopEnabled
+        if routeChanged { stopSC2MobileLink() }
         if routeChanged, connectButton.title == "Disconnect" {
+            if videoRunning { startVideo() }
             directProductDiscovery.stop()
             stopARSDKTelemetry()
             telnet.stop()
         }
         flightControlConfiguration = sanitized
-        activeARSDKRoute = sanitized.standaloneBebopEnabled ? .directProduct : .skyController
+        if routeChanged, groundModeActive {
+            sumoConnectionSelection = sanitized.standaloneBebopEnabled ? .direct : .sc2
+            UserDefaults.standard.set(sumoConnectionSelection.rawValue, forKey: SumoConnectionSelection.preferenceKey)
+        }
+        activeARSDKRoute = selectedARSDKRoute
         flightInputManager.apply(sanitized)
-        if groundModeActive, sanitized.standaloneBebopEnabled {
+        if groundModeActive, !routeChanged {
+            // The Ground route picker owns this host independently of Air's
+            // legacy Standalone preference. Input tuning cannot switch it.
+        } else if groundModeActive, activeARSDKRoute == .directProduct {
             let saved = UserDefaults.standard.string(forKey: Self.jumpingSumoHostPreferenceKey) ?? ""
             hostField.stringValue = Self.isValidIPv4Host(saved) ? saved : Self.defaultJumpingSumoHost
         } else if sanitized.standaloneBebopEnabled {
@@ -2856,9 +4007,13 @@ final class MainViewController: NSViewController {
             statusLabel.textColor = .systemCyan
             updateInterface()
             // Leave both command sessions alive while their ordered sleeps run.
+            let delayedStopToken = UUID()
+            rfPowerDelayedStopToken = delayedStopToken
             DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in
-                self?.rfPowerSC2Telnet.stop()
-                self?.rfPowerBebopTelnet.stop()
+                guard let self, self.rfPowerDelayedStopToken == delayedStopToken else { return }
+                self.rfPowerDelayedStopToken = nil
+                self.rfPowerSC2Telnet.stop()
+                self.rfPowerBebopTelnet.stop()
             }
             let title = completedMode?.completionTitle ?? "RF power profile updated"
             appendLog(sc2Only ? "SC2 RF profile verified; controller reboot queued. Vehicle unchanged." : "RF power workflow complete; SC2 reboot is scheduled before Bebop 2")
@@ -2868,6 +4023,7 @@ final class MainViewController: NSViewController {
                 style: .informational
             )
         } else {
+            rfPowerDelayedStopToken = nil
             rfPowerSC2Telnet.stop()
             rfPowerBebopTelnet.stop()
             statusLabel.stringValue = connectButton.title == "Disconnect" ? "LIVE" : "DISCONNECTED"
@@ -2881,6 +4037,7 @@ final class MainViewController: NSViewController {
     }
 
     func findSC2HostThroughBebop() {
+        guard !rejectSC3RelayDeviceTool() else { return }
         guard !toolUploadInFlight, !dragonCommandInFlight,
               !persistentTelnetInstallInFlight, !sc2DriverInstallInFlight,
               !sc2DiscoveryInFlight else {
@@ -2897,6 +4054,7 @@ final class MainViewController: NSViewController {
     }
 
     func findSC2USBHost() {
+        guard !rejectSC3RelayDeviceTool() else { return }
         guard !toolUploadInFlight, !dragonCommandInFlight,
               !persistentTelnetInstallInFlight, !sc2DriverInstallInFlight,
               !sc2DiscoveryInFlight, !rfPowerOperationInFlight else {
@@ -2936,6 +4094,7 @@ final class MainViewController: NSViewController {
     }
 
     func installSC2DriverPatch() {
+        guard !rejectSC3RelayDeviceTool() else { return }
         guard !toolUploadInFlight, !dragonCommandInFlight,
               !persistentTelnetInstallInFlight, !sc2DriverInstallInFlight else {
             showToolAlert(title: "Tool operation already running", message: "Wait for the current transfer or device operation to finish.")
@@ -3258,6 +4417,12 @@ final class MainViewController: NSViewController {
     }
 
     /// A direct Sumo address must never become the target of an SC2 installer.
+    private func rejectSC3RelayDeviceTool() -> Bool {
+        guard isSumoSC3Selected else { return false }
+        appendLog("Device tools are unavailable on the experimental SC3 Sumo routes. No controller setup or device changes were attempted.")
+        return true
+    }
+
     private var preferredSC2ToolHost: String {
         let entered = hostField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         if activeARSDKRoute == .skyController, Self.isValidIPv4Host(entered) { return entered }
@@ -3268,6 +4433,7 @@ final class MainViewController: NSViewController {
     }
 
     private func requestToolHost(sumo: Bool, title: String) -> String? {
+        guard !rejectSC3RelayDeviceTool() else { return nil }
         if sumo && toolUploadInFlight {
             showToolAlert(title: "Tool operation already running", message: "Wait for the current device operation to finish.")
             return nil
@@ -3299,7 +4465,7 @@ final class MainViewController: NSViewController {
 
     private func installDeviceTool(_ package: BebopToolPackage, host: String,
                                    completion: @escaping (Result<BebopToolInstallResult, Error>) -> Void) {
-        if (package == .sumoB29Launcher || package == .sumoRFModSuite), let bridge = sumoToolBridgeHost {
+        if [.sumoB29Launcher, .sumoRFModSuite, .sumoB29Install, .sumoB29Replacement].contains(package), let bridge = sumoToolBridgeHost {
             sumoBridgeUploader.onProgress = { [weak self] message in self?.appendLog(message) }
             sumoBridgeUploader.install(package, bridgeHost: bridge, sumoHost: host, completion: completion)
         } else {
@@ -3308,6 +4474,7 @@ final class MainViewController: NSViewController {
     }
 
     func uploadSumoRFModSuite() {
+        guard !rejectSC3RelayDeviceTool() else { return }
         guard groundModeActive,
               let host = requestToolHost(sumo: true, title: "Upload Sumo RF Lab") else { return }
         uploadRFModSuite(host: host, targetName: "Jumping Sumo",
@@ -3315,6 +4482,7 @@ final class MainViewController: NSViewController {
     }
 
     func configureSumoRFPowerMod() {
+        guard !rejectSC3RelayDeviceTool() else { return }
         guard groundModeActive else { return }
         guard !toolUploadInFlight, !dragonCommandInFlight, !rfPowerOperationInFlight,
               !sc2DiscoveryInFlight, !sc2DriverInstallInFlight, !persistentTelnetInstallInFlight else {
@@ -3376,6 +4544,7 @@ final class MainViewController: NSViewController {
     }
 
     func startSumoB29() {
+        guard !rejectSC3RelayDeviceTool() else { return }
         guard groundModeActive else { return }
         guard !toolUploadInFlight, !dragonCommandInFlight, !rfPowerOperationInFlight,
               !sc2DiscoveryInFlight, !sc2DriverInstallInFlight, !persistentTelnetInstallInFlight else {
@@ -3427,6 +4596,66 @@ final class MainViewController: NSViewController {
                 self.sumoToolTimeout = Timer.scheduledTimer(withTimeInterval: 20, repeats: false) { [weak self] _ in
                     guard self?.sumoToolToken == token else { return }
                     self?.finishSumoTool(error: "No launch confirmation within 20 seconds. Check Sumo Telnet and /tmp/parrotlab-b29-launch.log before retrying; the launch may already have started.")
+                }
+                self.sumoToolTelnet.connect(host: host, startupCommand: command, viaSC2: self.sumoToolBridgeHost)
+            }
+        }
+    }
+
+    func replaceSumoStartupDragon(restore: Bool) {
+        guard !rejectSC3RelayDeviceTool() else { return }
+        guard isGroundModeActive else { return }
+        guard !toolUploadInFlight, !dragonCommandInFlight, !rfPowerOperationInFlight,
+              !sc2DiscoveryInFlight, !sc2DriverInstallInFlight, !persistentTelnetInstallInFlight else {
+            showToolAlert(title: "Tool operation already running", message: "Wait for the current device operation to finish.")
+            return
+        }
+        let title = restore ? "Restore Original Sumo Dragon" : "Install B29 as Default Dragon"
+        guard let host = requestToolHost(sumo: true, title: title) else { return }
+        let alert = NSAlert()
+        alert.messageText = "\(title) on \(host)?"
+        alert.informativeText = restore
+            ? "Puts the saved original back at /usr/bin/dragon-prog and preserves B29 as /usr/bin/B29. The original backup and active files must match the saved checksums.\n\nKeep Sumo stationary. No process is stopped and no reboot is issued. Restart Sumo yourself when ready for the original to take effect."
+            : "Uploads the supplied B29 build, verifies it, and preserves the original as /usr/bin/dragon-prog.parrotlab-original before making B29 the default /usr/bin/dragon-prog. The existing startup wrapper stays in place.\n\nThis persists across reboots. Keep Sumo stationary; restart it yourself when ready. Restore Original Dragon reverses the change. Upload through SC2 may take several minutes."
+        alert.addButton(withTitle: restore ? "Restore Original" : "Upload and Install B29")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let token = UUID().uuidString
+        sumoToolToken = token; toolUploadInFlight = true; updateInterface()
+        sumoToolSuccessTitle = restore ? "Original Dragon restored" : "B29 installed as default"
+        sumoToolSuccessMessage = restore
+            ? "Original Dragon verified at its original path; B29 is preserved under its own name. Restart Sumo when ready."
+            : "B29 verified at /usr/bin/dragon-prog; the original is preserved as dragon-prog.parrotlab-original. Restart Sumo when ready."
+        installDeviceTool(restore ? .sumoB29Replacement : .sumoB29Install, host: host) { [weak self] result in
+            guard let self, self.sumoToolToken == token else { return }
+            switch result {
+            case .failure(let error): self.finishSumoTool(error: error.localizedDescription)
+            case .success(let install):
+                self.appendVerifiedAssets(install)
+                guard let script = install.assets.first(where: { $0.remoteName == "parrotlab_sumo_dragon_swap.sh" }),
+                      let command = SumoDeviceTools.replacementCommand(md5: script.md5,
+                        b29MD5: install.assets.first(where: { $0.remoteName == "parrotlab-sumo-B29.upload" })?.md5,
+                        token: token, restore: restore) else {
+                    self.finishSumoTool(error: "Invalid Sumo replacement manifest."); return
+                }
+                var scriptError: String?
+                self.sumoToolTelnet.onLine = { [weak self] line in
+                    guard let self, self.sumoToolToken == token else { return }
+                    if let detail = SC2TelemetryParser.deviceMarkerPayload("__PARROTLAB_SUMO_SWAP__=", in: line) {
+                        self.appendLog("Sumo Dragon: \(detail)")
+                        if detail.hasPrefix("ERROR:") { scriptError = detail }
+                    }
+                    guard let event = SC2TelemetryParser.deviceMarkerPayload("__PARROTLAB_SUMO_\(token)__=", in: line) else { return }
+                    if event == "SWAP_OK" { self.finishSumoTool(error: nil) }
+                    else if event.hasPrefix("ERROR_") { self.finishSumoTool(error: scriptError ?? "Sumo replacement failed: \(event). Check Activity; no reboot was issued.") }
+                }
+                self.sumoToolTelnet.onState = { [weak self] state in
+                    guard let self, self.sumoToolToken == token else { return }
+                    if case .failed(let message) = state { self.finishSumoTool(error: message) }
+                }
+                self.sumoToolTimeout = Timer.scheduledTimer(withTimeInterval: 45, repeats: false) { [weak self] _ in
+                    guard self?.sumoToolToken == token else { return }
+                    self?.finishSumoTool(error: "No replacement confirmation received. The result is uncertain; inspect Activity and Sumo before restarting. No reboot was issued.")
                 }
                 self.sumoToolTelnet.connect(host: host, startupCommand: command, viaSC2: self.sumoToolBridgeHost)
             }
@@ -4011,13 +5240,17 @@ final class MainViewController: NSViewController {
     }
 
     @objc private func startVideo() {
-        guard !isMiniDroneModeActive else { return }
+        guard !sc3OwnerMaintenanceInFlight else { return }
+        guard !isMiniDroneModeActive, !isAnafiModeActive else { return }
         if videoRunning {
+            stopSumoTracking(reason: "Video stopped")
             if streamRecorder.isRecording { stopRecording() }
+            else { rawArchiveRecorder.stop() }
             restreamProbe.cancel()
             rtpReceiver.stop()
             rtpJPEGReceiver.stop()
-            if aircraftCapabilities.usesARStream1Video { arsdkClient.sendVideoEnable(false) }
+            if isSumoSC3NativeSelected { sc3SumoNative.stopVideo() }
+            else if aircraftCapabilities.usesARStream1Video { arsdkClient.sendVideoEnable(false) }
             hudView.videoView.reset()
             videoRunning = false
             videoButton.title = "Start video"
@@ -4058,6 +5291,12 @@ final class MainViewController: NSViewController {
             appendLog("Video receiver stopped")
             return
         }
+        if isSumoSC3NativeSelected {
+            guard arsdkConnected else { appendLog("Connect to the native SC3 mobile proxy first"); return }
+            videoRunning = true; videoButton.title = "Stop video"; videoModePopup.isEnabled = false
+            videoStatus = "Checking native ARStream-1 forwarding…"
+            sc3SumoNative.startVideo(); updateInterface(); return
+        }
         let mode = selectedVideoMode
         hudView.videoView.receiveMode = mode
         rawArchiveRecorder.resetParameterSets()
@@ -4073,7 +5312,7 @@ final class MainViewController: NSViewController {
                 ? "SUMO ARStream 1 · MJPEG · buffer 125"
                 : "BB1 ARStream 1 · H.264 · buffer 125"
             arsdkClient.sendVideoEnable(true)
-            appendLog("Starting \(productModel.shortLabel) ARStream 1 \(codec == .mjpeg ? "MJPEG" : "H.264") video on the direct ARSDK connection")
+            appendLog("Starting \(productModel.shortLabel) ARStream 1 \(codec == .mjpeg ? "MJPEG" : "H.264") video · \(activeARSDKRoute.displayName)")
             updateInterface()
             return
         }
@@ -4085,6 +5324,19 @@ final class MainViewController: NSViewController {
             videoRunning = true
             videoButton.title = "Stop video"
             videoModePopup.isEnabled = false
+            if case .connected = sc2ProductionTransportState {
+                if productModel == .jumpingSumo {
+                    rtpJPEGReceiver.startMux()
+                    videoStatus = "SUMO THROUGH SC2 · USB LIBMUX · JPEG/RTP"
+                } else {
+                    rtpReceiver.startMux()
+                    videoStatus = "\(productModel.shortLabel) THROUGH SC2 · USB LIBMUX · H.264/RTP"
+                }
+                arsdkClient.sendVideoEnable(true)
+                appendLog("Starting SC2 production video on libmux stream-data channel 4")
+                updateInterface()
+                return
+            }
             videoStatus = "Probing SC2 /video · codec waiting"
             if productModel == .jumpingSumo { arsdkClient.sendVideoEnable(true) }
             updateInterface()
@@ -4180,6 +5432,12 @@ final class MainViewController: NSViewController {
     }
 
     private func updateInterface() {
+        enforceSumoRelayMovementGate()
+        refreshSumoTrackingUI()
+        if let anafi = anafiController {
+            anafi.refreshInputs(flightControlsEnabled ? flightControlStatus : "Keyboard and gamepad are off. Enable them in Input settings.")
+            return
+        }
         if let mini = miniDroneController {
             mini.refreshInputs(flightControlsEnabled ? flightControlStatus : "Keyboard and gamepad are off. Enable them in Configure controls.")
             return
@@ -4191,7 +5449,7 @@ final class MainViewController: NSViewController {
             value: battery.map { "\($0)%" } ?? "—",
             right: "SIGNAL",
             otherValue: (snapshot.chainAverage ?? snapshot.reportedRSSI).map { "\($0) dBm" } ?? "—",
-            detail: arsdkConnected ? (groundModeActive ? "Jumping Sumo" : productModel.displayName) + " · " + (activeARSDKRoute == .skyController ? "via SkyController 2" : "Direct Wi-Fi") : "Connect your vehicle to begin",
+            detail: isSumoSC3NativeSelected ? sc3SumoNativeState.message : arsdkConnected ? (groundModeActive ? "Jumping Sumo" : productModel.displayName) + " · " + (activeARSDKRoute == .skyController ? "via SkyController 2" : (isSumoSC3RelaySelected ? "SC3 relay · experimental" : "Direct Wi-Fi")) : "Connect your vehicle to begin",
             color: battery.map { $0 <= 15 ? .systemRed : ($0 <= 25 ? .systemYellow : .white) } ?? .white
         )
         videoOverview.update(
@@ -4202,10 +5460,10 @@ final class MainViewController: NSViewController {
             detail: videoRunning ? (snapshot.videoDecodedFPS == nil ? "Waiting for video · receiver ready" : "\(hudView.videoView.enhancementPreset.statusLabel) · \(hudView.videoView.spatialScalingMode.statusLabel)") : "Start live view to see your camera",
             color: snapshot.videoDisplayRefreshFPS == nil ? .white : LabVisualStyle.accent
         )
-        snapshot.connectionRouteLabel = activeARSDKRoute == .directProduct
+        snapshot.connectionRouteLabel = activeARSDKRoute == .sumoSC3Native ? "SUMO SC3 NATIVE · EXPERIMENTAL" : activeARSDKRoute == .sumoSC3Relay ? "SUMO SC3 RELAY · EXPERIMENTAL" : activeARSDKRoute == .directProduct
             ? "\(productModel.shortLabel) DIRECT"
             : (productModel == .jumpingSumo ? "SUMO THROUGH SC2" : "SC2 · \(productModel.shortLabel)")
-        hostSectionLabel.stringValue = groundModeActive
+        hostSectionLabel.stringValue = isSumoSC3Selected ? "SC3 USB IP" : groundModeActive
             ? (activeARSDKRoute == .directProduct ? "SUMO HOST" : "SC2 HOST")
             : (activeARSDKRoute == .directProduct ? "AIRCRAFT HOST" : "SC2 HOST")
         if activeARSDKRoute == .directProduct && !groundModeActive { hostField.stringValue = "192.168.42.1" }
@@ -4277,7 +5535,7 @@ final class MainViewController: NSViewController {
             ].compactMap { $0 }.joined(separator: "\n")
         }
 
-        let groundTransportLines: [String] = activeARSDKRoute == .directProduct
+        let groundTransportLines: [String] = activeARSDKRoute.usesDirectARNetworkVideo
             ? [
                 "MODE GROUND · MJPEG · ENH \(hudView.videoView.enhancementPreset.statusLabel)",
                 "\(videoFormatStatus) · OUT \(processedOutputStatus)",
@@ -4339,15 +5597,28 @@ final class MainViewController: NSViewController {
         let connected = connectButton.title == "Disconnect"
         let landed = hasFreshLandedTelemetry
         let deviceOperationActive = toolUploadInFlight || dragonCommandInFlight || dronePhotoInFlight ||
-            persistentTelnetInstallInFlight || sc2DriverInstallInFlight
-        hostField.isEnabled = !deviceOperationActive && (!standaloneBebopEnabled || groundModeActive)
+            persistentTelnetInstallInFlight || sc2DriverInstallInFlight || sc3VideoMaintenanceInFlight || sc3RFWriteInFlight || sc3OwnerMaintenanceInFlight
+        hostField.isEnabled = !deviceOperationActive && (!standaloneBebopEnabled || groundModeActive) && !(isSumoSC3Selected && connected)
+        if isSumoSC3NativeSelected {
+            let model = sc3SumoNativeState.linkedProductID.map { String(format: "0x%04X", $0) } ?? "none"
+            sc3SumoNativeStatus.stringValue = "\(sc3SumoNativeState.message)\nLinked model \(model) · state \(sc3SumoNativeState.telemetryReady ? "ready" : "waiting")\n\(sc3SumoNativeState.videoMessage)"
+        }
+        sumoRoutePopup.isEnabled = !deviceOperationActive && !miniDroneModeBlocked
+        if isSumoSC3RelaySelected {
+            let fresh = sumoRelayDriveGate.isFresh(at: ProcessInfo.processInfo.systemUptime)
+            sumoRelayMovementButton.state = sumoRelayDriveGate.armed ? .on : .off
+            sumoRelayMovementButton.isEnabled = arsdkConnected && fresh && flightControlsEnabled
+            sumoRelayStatus.stringValue = sumoRelayDriveGate.armed ? "Movement enabled · fresh Sumo state/heartbeat" :
+                (arsdkConnected ? (fresh ? "Movement off · center controls before enabling" : "Movement off · waiting for Sumo state/heartbeat. Check relay and Wi-Fi association.") :
+                    "Movement off · requires relay TCP 44446, negotiated UDP and a working SC3 USB link.")
+        }
         connectButton.isEnabled = !deviceOperationActive
+        videoButton.isEnabled = !sc3OwnerMaintenanceInFlight
         groundModeButton.isEnabled = !deviceOperationActive
         miniDroneModeButton.isEnabled = !miniDroneModeBlocked
+        anafiModeButton.isEnabled = !miniDroneModeBlocked
         if connectButton.title != "Disconnect" {
-            connectButton.title = groundModeActive
-                ? (activeARSDKRoute == .directProduct ? "Connect Sumo" : "Connect SC2")
-                : (activeARSDKRoute == .directProduct ? "Connect Aircraft" : "Connect SC2")
+            connectButton.title = connectionButtonTitle
         }
         for item in videoModePopup.itemArray {
             item.isEnabled = item.tag == VideoReceiveMode.compatibility.rawValue ||
@@ -4513,6 +5784,7 @@ final class MainViewController: NSViewController {
     }
 
     private func recordingFinished(_ result: H264RecordingResult) {
+        guard !isTerminating else { return }
         rawArchiveRecorder.stop()
         recordingTimer?.invalidate()
         recordingTimer = nil
@@ -4605,6 +5877,7 @@ final class MainViewController: NSViewController {
 
     private func mp4ConversionFinished(_ result: Result<H264MP4ConversionResult, Error>) {
         videoConversionInFlight = false
+        guard !isTerminating else { return }
         if let alert = videoConversionProgressAlert {
             if let parent = alert.window.sheetParent {
                 parent.endSheet(alert.window)
@@ -4658,7 +5931,7 @@ final class MainViewController: NSViewController {
             defer { writeGroup.leave() }
             let result = Result { try StillImageWriter.write(image, to: url, format: format) }
             DispatchQueue.main.async {
-                guard let self else { return }
+                guard let self, !self.isTerminating else { return }
                 self.pictureWriteInFlight = false
                 self.pictureButton.title = "Picture"
                 self.updateInterface()
@@ -4753,18 +6026,41 @@ final class MainViewController: NSViewController {
     }
 
     func prepareForTermination() {
+        guard !isTerminating else { return }
+        isTerminating = true
+        sc3VideoInstaller.cancel()
+        stopSumoTracking(reason: "Closing")
+        anafiController?.shutdown()
+        flightInputManager.neutralize()
         miniDroneController?.client.onChange = nil
         miniDroneController?.client.disconnect()
+        restreamProbe.cancel()
+        rtpReceiver.stop()
+        rtpJPEGReceiver.stop()
+        hudView.videoView.reset()
+        videoRunning = false
+        stopTelemetryFreshnessTimer()
+        persistentTelnetTimeoutTimer?.invalidate()
+        persistentTelnetTimeoutTimer = nil
+        sc2DriverPreparationTimeoutTimer?.invalidate()
+        sc2DriverPreparationTimeoutTimer = nil
+        rfPowerDelayedStopToken = nil
+        dragonCommandTimeoutTimer?.invalidate()
+        dragonCommandTimeoutTimer = nil
         sumoToolToken = nil
         sumoToolTimeout?.invalidate()
+        sumoToolTimeout = nil
         sumoToolTelnet.stop()
         sumoBridgeUploader.cancel()
         directProductDiscovery.stop()
-        mp4Converter.cancel()
+        droneMediaFTP.cancel()
+        _ = mp4Converter.cancelAndWait()
         toolInstaller.cancel()
         sc2USBDiscovery.cancel()
         droneFisheyeCapture.cancel()
         stopARSDKTelemetry()
+        telnet.stop()
+        dragonControlTelnet.stop()
         bebopSystemTelnet.stop()
         sc2DiscoveryTimeoutTimer?.invalidate()
         sc2DiscoveryTimeoutTimer = nil
@@ -4774,6 +6070,7 @@ final class MainViewController: NSViewController {
         rfPowerTimeoutTimer = nil
         rfPowerSC2Telnet.stop()
         rfPowerBebopTelnet.stop()
+        stopSC2MobileLink()
         recordingTimer?.invalidate()
         recordingTimer = nil
         streamRecorder.stopAndWait()

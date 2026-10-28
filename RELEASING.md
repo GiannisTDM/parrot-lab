@@ -13,7 +13,7 @@ Gatekeeper experience of a Developer-ID-signed and Apple-notarized release.
 On Apple Silicon macOS with Xcode command-line tools installed, run:
 
 ```sh
-cd mac/ParrotLab
+cd parrot-lab
 ./scripts/build-app.sh --release
 ```
 
@@ -23,8 +23,8 @@ locally, and produces:
 
 ```text
 ~/Applications/Parrot Lab.app
-mac/ParrotLab/dist/Parrot-Lab-macOS-arm64.zip
-mac/ParrotLab/dist/Parrot-Lab-macOS-arm64.zip.sha256
+dist/Parrot-Lab-macOS-arm64.zip
+dist/Parrot-Lab-macOS-arm64.zip.sha256
 ```
 
 Upload `Parrot-Lab-macOS-arm64.zip` as the GitHub Release asset. The adjacent
@@ -34,6 +34,11 @@ with it for testers who want to verify their download.
 Release compilation uses optimized per-file Swift compilation and all logical
 CPU cores by default. Set `PARROTLAB_BUILD_JOBS` to a positive integer to cap
 parallelism on another machine.
+
+Set `PARROTLAB_BUILD_ROOT` to an absolute scratch directory to isolate compiler
+caches. Release resources resolve from this repository root, including the
+existing B29 binary under `experimental/jumping-sumo/sumo/`; no parent research
+workspace is required.
 
 ### FFmpeg input and bundling
 

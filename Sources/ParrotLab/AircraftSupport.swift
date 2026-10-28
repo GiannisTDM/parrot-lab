@@ -16,12 +16,14 @@ enum ParrotProductModel: String, Equatable, Codable {
     case bebopDrone
     case bebop2
     case jumpingSumo
+    case anafi4K
 
     init(productID: UInt16) {
         switch productID {
         case 0x0901: self = .bebopDrone
         case 0x0902: self = .jumpingSumo
         case 0x090c: self = .bebop2
+        case 0x0914: self = .anafi4K
         default: self = .unknown
         }
     }
@@ -31,6 +33,7 @@ enum ParrotProductModel: String, Equatable, Codable {
         case .unknown: return nil
         case .bebopDrone: return 0x0901
         case .jumpingSumo: return 0x0902
+        case .anafi4K: return 0x0914
         case .bebop2: return 0x090c
         }
     }
@@ -41,6 +44,7 @@ enum ParrotProductModel: String, Equatable, Codable {
         case .bebopDrone: return "Bebop Drone"
         case .bebop2: return "Bebop 2"
         case .jumpingSumo: return "Jumping Sumo"
+        case .anafi4K: return "ANAFI 4K"
         }
     }
 
@@ -50,6 +54,7 @@ enum ParrotProductModel: String, Equatable, Codable {
         case .bebopDrone: return "BB1"
         case .bebop2: return "BB2"
         case .jumpingSumo: return "SUMO"
+        case .anafi4K: return "ANAFI"
         }
     }
 
@@ -68,6 +73,7 @@ struct ParrotProductCapabilities: Equatable {
         switch model {
         case .bebopDrone, .bebop2: return .arDrone3
         case .jumpingSumo: return .jumpingSumo
+        case .anafi4K: return .unknown // Owned by AnafiSession, never the Bebop transport.
         case .unknown: return .unknown
         }
     }
@@ -86,9 +92,11 @@ struct ParrotProductCapabilities: Equatable {
 }
 
 enum ParrotVideoSource: Equatable {
+    case nativeSC3ARStream1
     case directARStream1(ParrotVideoCodec)
     case directARStream2H264
     case skyControllerRestream
+    case anafiRTSP
 }
 
 enum ParrotSessionRouting {
@@ -96,6 +104,8 @@ enum ParrotSessionRouting {
         route: ARSDKConnectionRoute,
         product: ParrotProductModel
     ) -> ParrotVideoSource {
+        if route == .sumoSC3Native { return .nativeSC3ARStream1 }
+        if product == .anafi4K { return .anafiRTSP }
         if route == .skyController { return .skyControllerRestream }
         if product.capabilities.usesARStream1Video {
             return .directARStream1(product.capabilities.videoCodec)
@@ -170,6 +180,7 @@ enum ProductSupportSelfTest {
         ParrotProductModel(productID: 0x0901) == .bebopDrone &&
         ParrotProductModel(productID: 0x0902) == .jumpingSumo &&
         ParrotProductModel(productID: 0x090c) == .bebop2 &&
+        ParrotProductModel(productID: 0x0914) == .anafi4K &&
         ParrotProductModel(productID: 0xffff) == .unknown &&
         ParrotProductModel.bebopDrone.capabilities.supportsSharedARDrone3Commands &&
         ParrotProductModel.bebopDrone.capabilities.supportsBebopCalibration &&
@@ -184,6 +195,9 @@ enum ProductSupportSelfTest {
         ParrotProductModel.bebop2.capabilities.supportsBebopCalibration &&
         ParrotProductModel.bebop2.capabilities.supportsBB2DragonLab &&
         !ParrotProductModel.unknown.capabilities.supportsValidatedRFMod &&
+        !ParrotProductModel.anafi4K.capabilities.supportsBebopCalibration &&
+        !ParrotProductModel.anafi4K.capabilities.usesARStream1Video &&
+        ParrotSessionRouting.videoSource(route: .skyController, product: .anafi4K) == .anafiRTSP &&
         ParrotSessionRouting.videoSource(
             route: .directProduct,
             product: .jumpingSumo

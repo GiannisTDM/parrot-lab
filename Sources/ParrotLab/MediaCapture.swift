@@ -213,6 +213,7 @@ final class H264StreamRecorder {
         case idle
         case recording
         case finishing
+        case finalizing
     }
 
     private let stateLock = NSLock()
@@ -246,6 +247,12 @@ final class H264StreamRecorder {
         stateLock.lock()
         defer { stateLock.unlock() }
         return state != .idle
+    }
+
+    var diagnosticSummary: String {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return "raw-recorder state=\(state) queued=\(pendingBytes) bytes=\(bytesWritten) units=\(recordedAccessUnits)"
     }
 
     @discardableResult
@@ -341,23 +348,37 @@ final class H264StreamRecorder {
             .appendingPathComponent("parrotlab-recording-test-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let recorder = H264StreamRecorder()
+        var completions = 0
+        recorder.onFinished = { _ in completions += 1 }
         do {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            _ = try recorder.start(directory: directory)
             let accessUnit = H264AccessUnit(
                 nalUnits: [Data([0x67, 0x11]), Data([0x68, 0x22]), Data([0x61, 0x33, 0x44])],
                 rtpTimestamp: 90_000,
                 rtpHeaderExtensions: []
             )
-            recorder.observe(accessUnit)
-            recorder.stopAndWait()
+            for _ in 0..<5 {
+                _ = try recorder.start(directory: directory)
+                recorder.observe(accessUnit)
+                recorder.stop()
+                recorder.stopAndWait()
+                guard !recorder.isActive else { return false }
+            }
             let files = try FileManager.default.contentsOfDirectory(
                 at: directory,
                 includingPropertiesForKeys: nil
             ).filter { $0.pathExtension == "h264" }
-            guard files.count == 1,
-                  !files[0].lastPathComponent.contains("recording") else { return false }
-            return try Data(contentsOf: files[0]) == annexBData(for: accessUnit.nalUnits)
+            let deadline = Date().addingTimeInterval(1)
+            while completions < 5, Date() < deadline {
+                _ = RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.01))
+            }
+            guard files.count == 5, completions == 5,
+                  files.allSatisfy({ !$0.lastPathComponent.contains("recording") }) else { return false }
+            let expectedTail = annexBData(for: accessUnit.nalUnits)
+            return try files.allSatisfy {
+                let data = try Data(contentsOf: $0)
+                return data.count >= expectedTail.count && Data(data.suffix(expectedTail.count)) == expectedTail
+            }
         } catch {
             return false
         }
@@ -463,8 +484,7 @@ final class H264StreamRecorder {
             pendingChunks.removeAll(keepingCapacity: false)
             pendingHead = 0
             pendingBytes = 0
-            state = .idle
-            drainScheduled = false
+            state = .finalizing
             stateLock.unlock()
 
             do {
@@ -516,6 +536,10 @@ final class H264StreamRecorder {
                 bytesWritten: written,
                 errorDescription: errorDescription
             )
+            stateLock.lock()
+            state = .idle
+            drainScheduled = false
+            stateLock.unlock()
             DispatchQueue.main.async { [weak self] in self?.onFinished?(result) }
             return
         }

@@ -11,6 +11,7 @@ esac
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 PROJECT_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+WORKSPACE_DIR="$PROJECT_DIR"
 PACKAGE_SCRIPT="$SCRIPT_DIR/package-macos-release.sh"
 DIST_DIR="$PROJECT_DIR/dist"
 LEGACY_APP_DIR="$DIST_DIR/Parrot Lab.app"
@@ -25,6 +26,7 @@ trap '/bin/rm -rf "$STAGE_DIR"' EXIT HUP INT TERM
 
 cd "$PROJECT_DIR"
 BUILD_JOBS=${PARROTLAB_BUILD_JOBS:-$(/usr/sbin/sysctl -n hw.logicalcpu 2>/dev/null || printf '%s' 4)}
+BUILD_ROOT=${PARROTLAB_BUILD_ROOT:-"$PROJECT_DIR/.build"}
 case "$BUILD_JOBS" in
     ''|*[!0-9]*|0) printf '%s\n' "PARROTLAB_BUILD_JOBS must be a positive integer" >&2; exit 2 ;;
 esac
@@ -32,31 +34,29 @@ printf '%s\n' "Building optimized Parrot Lab release with $BUILD_JOBS parallel j
 # Swift's default Release whole-module optimizer kept this target effectively
 # single-core for many minutes. Per-file -O preserves an optimized binary while
 # allowing the independent source files to compile concurrently.
-SWIFT_BUILD_DIR="$PROJECT_DIR/.build"
-if [ -n "${PARROTLAB_SWIFT_SCRATCH_PATH:-}" ]; then
-    SWIFT_BUILD_DIR=$PARROTLAB_SWIFT_SCRATCH_PATH
-    swift build --scratch-path "$SWIFT_BUILD_DIR" -c release -j "$BUILD_JOBS" \
-        -Xswiftc -no-whole-module-optimization
-else
-    swift build -c release -j "$BUILD_JOBS" -Xswiftc -no-whole-module-optimization
-fi
+swift build --scratch-path "$BUILD_ROOT" -c release -j "$BUILD_JOBS" -Xswiftc -no-whole-module-optimization
 
 mkdir -p "$STAGE_APP/Contents/MacOS" "$STAGE_APP/Contents/Frameworks" \
     "$STAGE_APP/Contents/Resources/DeviceTools" "$INSTALL_DIR"
-COPYFILE_DISABLE=1 cp "$SWIFT_BUILD_DIR/release/ParrotLab" "$STAGE_APP/Contents/MacOS/ParrotLab"
+COPYFILE_DISABLE=1 cp "$BUILD_ROOT/release/ParrotLab" "$STAGE_APP/Contents/MacOS/ParrotLab"
 COPYFILE_DISABLE=1 cp "$PROJECT_DIR/Resources/Info.plist" "$STAGE_APP/Contents/Info.plist"
 COPYFILE_DISABLE=1 cp "$PROJECT_DIR/Resources/ParrotLabIcon.png" "$STAGE_APP/Contents/Resources/ParrotLabIcon.png"
 COPYFILE_DISABLE=1 cp "$PROJECT_DIR/Resources/ParrotLab.icns" "$STAGE_APP/Contents/Resources/ParrotLab.icns"
-COPYFILE_DISABLE=1 cp "$PROJECT_DIR/patched/dragon-prog-900p-4.4.2" "$STAGE_APP/Contents/Resources/DeviceTools/dragon-prog-900p-4.4.2"
-COPYFILE_DISABLE=1 cp "$PROJECT_DIR/patched/dragon-prog-900p-4.7.1" "$STAGE_APP/Contents/Resources/DeviceTools/dragon-prog-900p-4.7.1"
-COPYFILE_DISABLE=1 cp "$PROJECT_DIR/tools/parrotlab_dragon_video.sh" "$STAGE_APP/Contents/Resources/DeviceTools/parrotlab_dragon_video.sh"
-COPYFILE_DISABLE=1 cp "$PROJECT_DIR/tools/install_bebop2_persistent_telnet.sh" "$STAGE_APP/Contents/Resources/DeviceTools/install_bebop2_persistent_telnet.sh"
-COPYFILE_DISABLE=1 cp "$PROJECT_DIR/tools/parrot_rf_lab.sh" "$STAGE_APP/Contents/Resources/DeviceTools/parrot_rf_lab.sh"
-COPYFILE_DISABLE=1 cp "$PROJECT_DIR/tools/parrot_sumo_rf_lab.sh" "$STAGE_APP/Contents/Resources/DeviceTools/parrot_sumo_rf_lab.sh"
-COPYFILE_DISABLE=1 cp "$PROJECT_DIR/tools/start_sumo_b29.sh" "$STAGE_APP/Contents/Resources/DeviceTools/start_sumo_b29.sh"
-COPYFILE_DISABLE=1 cp "$PROJECT_DIR/tools/parrotlab_find_sc2_ip.sh" "$STAGE_APP/Contents/Resources/DeviceTools/parrotlab_find_sc2_ip.sh"
+COPYFILE_DISABLE=1 cp "$WORKSPACE_DIR/patched/dragon-prog-900p-4.4.2" "$STAGE_APP/Contents/Resources/DeviceTools/dragon-prog-900p-4.4.2"
+COPYFILE_DISABLE=1 cp "$WORKSPACE_DIR/patched/dragon-prog-900p-4.7.1" "$STAGE_APP/Contents/Resources/DeviceTools/dragon-prog-900p-4.7.1"
+COPYFILE_DISABLE=1 cp "$WORKSPACE_DIR/tools/parrotlab_dragon_video.sh" "$STAGE_APP/Contents/Resources/DeviceTools/parrotlab_dragon_video.sh"
+COPYFILE_DISABLE=1 cp "$WORKSPACE_DIR/tools/install_bebop2_persistent_telnet.sh" "$STAGE_APP/Contents/Resources/DeviceTools/install_bebop2_persistent_telnet.sh"
+COPYFILE_DISABLE=1 cp "$WORKSPACE_DIR/tools/parrot_rf_lab.sh" "$STAGE_APP/Contents/Resources/DeviceTools/parrot_rf_lab.sh"
+COPYFILE_DISABLE=1 cp "$WORKSPACE_DIR/tools/parrot_sumo_rf_lab.sh" "$STAGE_APP/Contents/Resources/DeviceTools/parrot_sumo_rf_lab.sh"
+COPYFILE_DISABLE=1 cp "$WORKSPACE_DIR/tools/start_sumo_b29.sh" "$STAGE_APP/Contents/Resources/DeviceTools/start_sumo_b29.sh"
+COPYFILE_DISABLE=1 cp "$WORKSPACE_DIR/tools/parrotlab_sumo_dragon_swap.sh" "$STAGE_APP/Contents/Resources/DeviceTools/parrotlab_sumo_dragon_swap.sh"
+COPYFILE_DISABLE=1 cp "$PROJECT_DIR/experimental/jumping-sumo/sumo/dragon-prog-B29" "$STAGE_APP/Contents/Resources/DeviceTools/parrotlab-sumo-B29.upload"
+COPYFILE_DISABLE=1 cp "$WORKSPACE_DIR/tools/parrotlab_find_sc2_ip.sh" "$STAGE_APP/Contents/Resources/DeviceTools/parrotlab_find_sc2_ip.sh"
 COPYFILE_DISABLE=1 cp "$PROJECT_DIR/sc2/install.sh" "$STAGE_APP/Contents/Resources/DeviceTools/install_sc2_apple_ncm.sh"
 COPYFILE_DISABLE=1 cp "$PROJECT_DIR/sc2/apple_mac_ncm.ko" "$STAGE_APP/Contents/Resources/DeviceTools/apple_mac_ncm.ko"
+/usr/bin/ditto --noextattr --noqtn "$PROJECT_DIR/Resources/SC3SumoVideo" "$STAGE_APP/Contents/Resources/DeviceTools/SC3SumoVideo"
+/usr/bin/ditto --noextattr --noqtn "$PROJECT_DIR/Resources/SC3RFLab" "$STAGE_APP/Contents/Resources/DeviceTools/SC3RFLab"
+/usr/bin/ditto --noextattr --noqtn "$PROJECT_DIR/Resources/SC3Maintenance" "$STAGE_APP/Contents/Resources/DeviceTools/SC3Maintenance"
 chmod 755 "$STAGE_APP/Contents/Resources/DeviceTools/dragon-prog-900p-4.4.2" \
     "$STAGE_APP/Contents/Resources/DeviceTools/dragon-prog-900p-4.7.1" \
     "$STAGE_APP/Contents/Resources/DeviceTools/parrotlab_dragon_video.sh" \
@@ -64,6 +64,7 @@ chmod 755 "$STAGE_APP/Contents/Resources/DeviceTools/dragon-prog-900p-4.4.2" \
     "$STAGE_APP/Contents/Resources/DeviceTools/parrot_rf_lab.sh" \
     "$STAGE_APP/Contents/Resources/DeviceTools/parrot_sumo_rf_lab.sh" \
     "$STAGE_APP/Contents/Resources/DeviceTools/start_sumo_b29.sh" \
+    "$STAGE_APP/Contents/Resources/DeviceTools/parrotlab_sumo_dragon_swap.sh" \
     "$STAGE_APP/Contents/Resources/DeviceTools/parrotlab_find_sc2_ip.sh" \
     "$STAGE_APP/Contents/Resources/DeviceTools/install_sc2_apple_ncm.sh"
 chmod 644 "$STAGE_APP/Contents/Resources/DeviceTools/apple_mac_ncm.ko"
